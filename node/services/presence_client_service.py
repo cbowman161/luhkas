@@ -51,10 +51,31 @@ def _get_lan_ip() -> str:
         return socket.gethostbyname(socket.gethostname())
 
 
+def _ensure_vault_pubkey(brain_url: str) -> None:
+    """Fetch vault's sync SSH public key and add it to authorized_keys if absent."""
+    try:
+        with urlopen(f"{brain_url}/admin/pubkey", timeout=5) as r:
+            data = json.loads(r.read())
+        pubkey = str(data.get("pubkey", "")).strip()
+        if not pubkey:
+            return
+        auth_keys = Path.home() / ".ssh" / "authorized_keys"
+        auth_keys.parent.mkdir(mode=0o700, exist_ok=True)
+        existing = auth_keys.read_text() if auth_keys.exists() else ""
+        if pubkey not in existing:
+            with open(auth_keys, "a") as f:
+                f.write(f"\n{pubkey}\n")
+            auth_keys.chmod(0o600)
+            print("[scout_presence] installed vault SSH public key", flush=True)
+    except Exception as exc:
+        print(f"[scout_presence] could not fetch vault pubkey: {exc}", flush=True)
+
+
 def _register_with_brain(config: dict, retries: int = 6) -> None:
     """Register this node with the brain, including our IP and service ports."""
     brain_url = config["brain_url"]
     node_id = config.get("node_id", "scout")
+    _ensure_vault_pubkey(brain_url)
     ip = _get_lan_ip()
     capabilities = _node_capabilities()
     payload = {

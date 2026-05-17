@@ -20,6 +20,15 @@ _SSH_OPTS = [
 
 _last_result: dict = {}
 _last_sync_at: float = 0.0
+_auto_synced: set[str] = set()  # nodes pushed this session; reset on vault restart
+
+
+def pubkey() -> str:
+    """Return the vault's node-sync SSH public key, or empty string if missing."""
+    try:
+        return (_SSH_KEY.parent / (_SSH_KEY.name + ".pub")).read_text().strip()
+    except Exception:
+        return ""
 
 
 def pull() -> dict:
@@ -55,7 +64,7 @@ def push_node(profile: dict) -> dict:
     dest = f"{user}@{host}:{node_dir}/"
     rsync = subprocess.run(
         [
-            "rsync", "-a", "--delete",
+            "rsync", "-a", "--delete", "--itemize-changes",
             "--exclude=__pycache__/",
             "--exclude=*.pyc",
             "--exclude=*.db",
@@ -72,8 +81,9 @@ def push_node(profile: dict) -> dict:
     if rsync.returncode != 0:
         return {"ok": False, "node_id": node_id, "error": rsync.stderr.strip()}
 
+    files_changed = bool(rsync.stdout.strip())
     restarted: list[str] = []
-    if services:
+    if files_changed and services:
         restart = subprocess.run(
             ["ssh"] + _SSH_OPTS + [f"{user}@{host}", f"systemctl --user restart {' '.join(services)}"],
             capture_output=True,
@@ -88,7 +98,13 @@ def push_node(profile: dict) -> dict:
             }
         restarted = services
 
-    return {"ok": True, "node_id": node_id, "host": host, "services_restarted": restarted}
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "host": host,
+        "files_changed": files_changed,
+        "services_restarted": restarted,
+    }
 
 
 def sync_all(node_id: str | None = None) -> dict:
@@ -123,6 +139,35 @@ def sync_all(node_id: str | None = None) -> dict:
     _last_result = result
     _last_sync_at = result["synced_at"]
     return result
+
+
+def auto_push_if_new(node_id: str) -> None:
+    """Push to node_id once per vault session (called on node registration).
+
+    Skips nodes already pushed this session and nodes with no sync profile.
+    Runs rsync but only restarts services if files actually changed.
+    """
+    if node_id in _auto_synced:
+        return
+    profile_path = _PROFILES_DIR / f"{node_id}.json"
+    if not profile_path.exists():
+        return
+    try:
+        profile = json.loads(profile_path.read_text())
+    except Exception:
+        return
+    if not profile.get("sync"):
+        return
+    _auto_synced.add(node_id)
+    result = push_node(profile)
+    changed = result.get("files_changed", False)
+    restarted = result.get("services_restarted", [])
+    status = "ok" if result.get("ok") else f"failed: {result.get('error')}"
+    print(
+        f"[sync] auto-push to {node_id}: {status}"
+        + (f" | {len(restarted)} service(s) restarted" if restarted else ""),
+        flush=True,
+    )
 
 
 def last_result() -> dict:

@@ -82,6 +82,15 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 self._send(200, last_result())
                 return
 
+            if path == "/admin/pubkey":
+                from sync_manager import pubkey
+                pk = pubkey()
+                if pk:
+                    self._send(200, {"ok": True, "pubkey": pk})
+                else:
+                    self._send(404, {"ok": False, "error": "no sync key found"})
+                return
+
             if path == "/alerts/pending":
                 from urllib.parse import parse_qs
                 qs = parse_qs(urlparse(self.path).query)
@@ -204,6 +213,12 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                     capabilities=payload.get("capabilities") or {},
                     modules=payload.get("modules") or {},
                 )
+                import threading as _t
+                _t.Thread(
+                    target=__import__("sync_manager").auto_push_if_new,
+                    args=(node_id,),
+                    daemon=True,
+                ).start()
                 self._send(200, {"ok": True, "node_id": node_id})
                 return
 
