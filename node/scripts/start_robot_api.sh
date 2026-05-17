@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "${HOME}/scout_runtime"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODE_DIR="$(dirname "$SCRIPT_DIR")"
+
 cd "${HOME}/hailo-apps"
 set +u
 source setup_env.sh
 set -u
-cd "${HOME}/scout_runtime"
+cd "$NODE_DIR"
 python3 services/robot_api.py

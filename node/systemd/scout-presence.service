@@ -6,12 +6,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=%h/scout_runtime
-Environment=VAULT_CHAT_URL=http://luhkas-vault.local:7000
+WorkingDirectory={NODE_DIR}
+Environment=VAULT_CHAT_URL={VAULT_URL}
 Environment=VAULT_CHAT_SOURCE=scout_presence
-Environment=SCOUT_PRESENCE_HOST=127.0.0.1
+Environment=SCOUT_PRESENCE_HOST=0.0.0.0
 Environment=SCOUT_PRESENCE_PORT=5002
-ExecStart=%h/scout_runtime/scripts/start_presence.sh
+Environment=LUHKAS_NODE_ID={NODE_ID}
+ExecStart={NODE_DIR}/scripts/start_presence.sh
 Restart=always
 RestartSec=2
 

@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=%h/scout_runtime
+WorkingDirectory={NODE_DIR}
 Environment=SCOUT_TRACKING_ENABLED=1
 Environment=SCOUT_TARGET_LABEL=person
 Environment=SCOUT_SCORE_THRESHOLD=0.45
@@ -37,7 +37,7 @@ Environment=SCOUT_VAULT_MEMORY_ENABLED=1
 Environment=SCOUT_VAULT_MEMORY_URL=http://luhkas-vault.local:7000
 Environment=SCOUT_TARGET_LOST_GRACE_SECONDS=1.5
 Environment=SCOUT_BYTETRACKER_MATCH_THRESH=0.75
-ExecStart=%h/scout_runtime/scripts/start_vision.sh
+ExecStart={NODE_DIR}/scripts/start_vision.sh
 Restart=always
 RestartSec=2
 
