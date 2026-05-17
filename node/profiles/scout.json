@@ -1,0 +1,9 @@
+{
+  "node_id": "scout",
+  "modules": [
+    "camera_node",
+    "pantilt_node",
+    "rover_node",
+    "light_node"
+  ]
+}

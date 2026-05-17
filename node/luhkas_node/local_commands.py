@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -22,20 +23,49 @@ _RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 if str(_RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_ROOT))
 
-_DEFAULT_PACKAGES = "camera_node,pantilt_node,rover_node,light_node"
-_KNOWN_NODE_PACKAGES = [
-    "camera_node",
-    "pantilt_node",
-    "rover_node",
-    "light_node",
-    "display_node",
-    "speech_node",
-]
-_PACKAGE_NAMES = [
-    name.strip()
-    for name in os.environ.get("LUHKAS_NODE_PACKAGES", _DEFAULT_PACKAGES).split(",")
-    if name.strip()
-]
+_PROFILES_DIR = _RUNTIME_ROOT / "profiles"
+_FALLBACK_PACKAGES = "camera_node,pantilt_node,rover_node,light_node"
+
+
+def _load_profile_modules(node_id: str) -> list[str]:
+    """Return the module list for *node_id* from its profile file.
+
+    Falls back to LUHKAS_NODE_PACKAGES env var, then the built-in default.
+    """
+    if node_id:
+        profile_path = _PROFILES_DIR / f"{node_id}.json"
+        if profile_path.exists():
+            try:
+                data = json.loads(profile_path.read_text())
+                modules = [m.strip() for m in data.get("modules", []) if m.strip()]
+                if modules:
+                    return modules
+            except Exception:
+                pass
+    return [
+        name.strip()
+        for name in os.environ.get("LUHKAS_NODE_PACKAGES", _FALLBACK_PACKAGES).split(",")
+        if name.strip()
+    ]
+
+
+def _all_known_modules() -> list[str]:
+    """Union of all modules declared across every profile in the profiles dir."""
+    modules: set[str] = set()
+    if _PROFILES_DIR.exists():
+        for path in _PROFILES_DIR.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                modules.update(m.strip() for m in data.get("modules", []) if m.strip())
+            except Exception:
+                pass
+    return sorted(modules)
+
+
+_NODE_ID = os.environ.get("LUHKAS_NODE_ID", "")
+_PACKAGE_NAMES: list[str] = _load_profile_modules(_NODE_ID)
+_KNOWN_NODE_PACKAGES: list[str] = _all_known_modules() or _PACKAGE_NAMES
+
 _handlers: dict[str, object] | None = None
 _module_status: dict[str, dict | None] | None = None
 
@@ -45,21 +75,16 @@ def _load_handlers() -> dict[str, object]:
     if _handlers is not None:
         return _handlers
     handlers = {}
-    status: dict[str, dict | None] = {name: None for name in _KNOWN_NODE_PACKAGES}
-    for package_name in sorted(set(_KNOWN_NODE_PACKAGES + _PACKAGE_NAMES)):
-        if package_name not in _PACKAGE_NAMES:
-            continue
+    status: dict[str, dict | None] = {name: None for name in _PACKAGE_NAMES}
+    for package_name in sorted(_PACKAGE_NAMES):
         try:
             module = importlib.import_module(f"{package_name}.commands")
-        except Exception as exc:
+        except Exception:
             status[package_name] = None
             continue
         caps = _module_capabilities(module)
-        status[package_name] = {
-            "available": True,
-            "commands": len(caps),
-        }
-        for command in _module_capabilities(module):
+        status[package_name] = {"available": True, "commands": len(caps)}
+        for command in caps:
             dispatch_type = command.get("dispatch_type")
             if dispatch_type and hasattr(module, "handle"):
                 handlers.setdefault(str(dispatch_type), module)
@@ -123,15 +148,10 @@ def capabilities() -> dict:
 
 def module_status() -> dict[str, dict | None]:
     _load_handlers()
-    return dict(_module_status or {name: None for name in _KNOWN_NODE_PACKAGES})
+    return dict(_module_status or {name: None for name in _PACKAGE_NAMES})
 
 
 def selftest() -> dict:
-    """Run a quick health check of each loaded *_node module.
-
-    For each module, calls `health()` if it exists, otherwise checks that
-    `capabilities()` succeeds. Returns a structured report.
-    """
     results: dict[str, dict] = {}
     for package_name, module in _load_handlers().items():
         pkg = str(getattr(module, "__package__", None) or package_name).split(".")[0]
