@@ -1,0 +1,96 @@
+[
+  {
+    "name": "show_updates",
+    "description": "Show unread updates from the event log.",
+    "subsystem": "event_log",
+    "action": "show_updates",
+    "mode": "direct",
+    "examples": [
+      "updates",
+      "notifications",
+      "any updates",
+      "show me updates",
+      "what changed",
+      "show notifications"
+    ]
+  },
+  {
+    "name": "list_jobs",
+    "description": "List known jobs and their current status.",
+    "subsystem": "job_manager",
+    "action": "list_jobs",
+    "mode": "direct",
+    "examples": [
+      "jobs",
+      "list jobs",
+      "active jobs",
+      "what is running"
+    ]
+  },
+  {
+    "name": "cpu_usage",
+    "description": "Get current CPU usage from the local machine.",
+    "subsystem": "system_agent",
+    "action": "dynamic_command",
+    "mode": "direct",
+    "command": "top -bn1 | grep 'Cpu(s)' || uptime",
+    "examples": [
+      "what is my cpu usage",
+      "how busy is my processor",
+      "show cpu load"
+    ]
+  },
+  {
+    "name": "memory_usage",
+    "description": "Get current RAM and memory usage from the local machine.",
+    "subsystem": "system_agent",
+    "action": "dynamic_command",
+    "mode": "direct",
+    "command": "free -h",
+    "examples": [
+      "what is my memory usage",
+      "show ram usage",
+      "how much memory am I using"
+    ]
+  },
+  {
+    "name": "disk_usage",
+    "description": "Get current disk usage for the working filesystem.",
+    "subsystem": "system_agent",
+    "action": "dynamic_command",
+    "mode": "direct",
+    "command": "df -h .",
+    "examples": [
+      "what is my disk usage",
+      "show storage usage",
+      "how much disk space is free"
+    ]
+  },
+  {
+    "name": "coding_task",
+    "description": "Create, modify, debug, or run code through the Code Monkey builder.",
+    "subsystem": "code_monkey",
+    "action": "coding_task",
+    "mode": "async",
+    "examples": [
+      "write a python script",
+      "modify the script",
+      "fix the code",
+      "debug this program",
+      "create a file"
+    ]
+  },
+  {
+    "name": "chat",
+    "description": "Answer general questions, explain concepts, or chat without tools.",
+    "subsystem": "chat_agent",
+    "action": "chat",
+    "mode": "direct",
+    "examples": [
+      "explain recursion",
+      "what is an operating system",
+      "hello",
+      "help me think through this"
+    ]
+  }
+]

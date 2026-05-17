@@ -1,0 +1,51 @@
+HARDWARE STACKS
+
+🧠 1. GPU “BRAIN PC” (central intelligence)
+🧩 CPU
+AMD Ryzen 7 7700 (8C / 16T, AM5)
+🎮 GPU
+NVIDIA GeForce RTX 3090 24GB GDDR6X
+24GB VRAM
+~936 GB/s memory bandwidth
+🧠 RAM
+96GB DDR5 (2×48GB or 4×24GB)
+6000 MT/s (CL30–32 ideal)
+💾 Storage
+1TB NVMe Gen4 SSD (OS + models)
+optional: +2TB NVMe Gen4 (recommended later)
+🔌 Power
+1000W 80+ Gold PSU (e.g., Corsair RM1000x)
+🧊 Cooling
+Noctua NH-D15 (air cooling, high-end silent)
+🧠 Role
+LLM inference (Ollama / vLLM)
+memory system (vector DB)
+reasoning / agent loops
+face identity + decision making
+🤖 2. ROBOT “EDGE BRAIN” (Pi-based version)
+🧠 Compute
+Raspberry Pi 5 (16GB RAM)
+⚡ AI Accelerator
+Raspberry Pi AI HAT+ 2 (Hailo-10H / 40 TOPS INT8 / 8GB on-board RAM)
+💾 Storage
+NVMe SSD via PCIe HAT (256GB–1TB recommended)
+📡 Connectivity
+Wi-Fi 6 / Bluetooth 5.0 (built-in Pi 5)
+optional Ethernet (recommended for dev)
+🎥 Vision
+CSI camera (Raspberry Pi Camera Module 3 or equivalent)
+optional dual camera setup for depth
+🔊 Audio
+I2S audio HAT (mic + speaker interface)
+or USB audio interface alternative
+⚙️ Robotics Base (RasProver platform)
+motor controller integrated chassis
+wheel encoders (if supported)
+IMU (usually onboard or add-on)
+🧠 Role
+real-time:
+object detection (YOLO / TFLite / Hailo models)
+tracking
+motor control
+wake word (optional)
+sends events to GPU brain

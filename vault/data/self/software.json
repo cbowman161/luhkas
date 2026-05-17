@@ -1,0 +1,10 @@
+{
+  "architecture": [
+    "Vault PC owns the unified chat/presence service.",
+    "The rover presence service proxies chat to the brain.",
+    "The brain routes messages, handles LLM inference, and calls rover APIs as needed.",
+    "Vision questions use a separate analyze_vision path.",
+    "Self-questions use a second LLM-selected self-route."
+  ],
+  "kind": "software"
+}

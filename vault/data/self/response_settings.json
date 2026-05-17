@@ -1,0 +1,11 @@
+{
+  "behavior": {
+    "overrides": []
+  },
+  "generation": {
+    "temperature": 0.2,
+    "top_p": 0.92,
+    "updated_at": 1778185597.5413153
+  },
+  "kind": "response_settings"
+}

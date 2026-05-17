@@ -1,0 +1,53 @@
+{
+  "first_seen": 1778870371.1278064,
+  "id": "vault_unknown_0005",
+  "identity": null,
+  "image_sha1s": [
+    "dfcec55e8d538e80a5657f2213190e4697516b11",
+    "5d00d4c9ed8c23e880feb4529c7b13eb02a700b3"
+  ],
+  "last_matched_by": "source_track",
+  "last_seen": 1778870526.87038,
+  "node_ids": [
+    "scout"
+  ],
+  "promoted": false,
+  "sample_count": 2,
+  "samples": [
+    {
+      "bbox": [
+        161,
+        116,
+        60,
+        60
+      ],
+      "confidence": 0.85,
+      "face_id": 231,
+      "image_sha1": "dfcec55e8d538e80a5657f2213190e4697516b11",
+      "node_id": "scout",
+      "observed_at": 1778870371.1354253,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0005/samples/1778870371127_dfcec55e8d53_1778870371135_231.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0005"
+    },
+    {
+      "bbox": [
+        215,
+        251,
+        37,
+        37
+      ],
+      "confidence": 0.85,
+      "face_id": 239,
+      "image_sha1": "5d00d4c9ed8c23e880feb4529c7b13eb02a700b3",
+      "node_id": "scout",
+      "observed_at": 1778870526.869276,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0005/samples/1778870526870_5d00d4c9ed8c_1778870526869_239.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0005"
+    }
+  ],
+  "source_keys": [
+    "scout:unknown_0005"
+  ]
+}

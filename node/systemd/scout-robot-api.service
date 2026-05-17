@@ -1,0 +1,17 @@
+[Unit]
+Description=Rover Robot API
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/scout_runtime
+Environment=SCOUT_TELEMETRY_LOG_ENABLED=1
+Environment=SCOUT_TELEMETRY_DB_PATH=/home/luhkas/scout_runtime/config/telemetry.db
+ExecStart=%h/scout_runtime/scripts/start_robot_api.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

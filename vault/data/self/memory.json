@@ -1,0 +1,9 @@
+{
+  "kind": "memory",
+  "systems": [
+    "person profiles under vault data/people",
+    "face reference records under vault data/face_references",
+    "explicit fact/preference memory",
+    "planned vector DB on the vault PC for long-term semantic memory"
+  ]
+}

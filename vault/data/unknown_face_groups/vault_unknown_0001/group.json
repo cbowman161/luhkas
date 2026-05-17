@@ -1,0 +1,172 @@
+{
+  "first_seen": 1778794953.2191737,
+  "id": "vault_unknown_0001",
+  "identity": null,
+  "image_sha1s": [
+    "4a464c77049bcd912bdc3a7cb25c4dc958dfeac0",
+    "c3a3a7fa5c0919f5dfeb65e96f8b4c6b6b985c66",
+    "c5b327d883718b52a3852619a12dd03f051e7b9b",
+    "d66b00c3bf9df529b695534697de5f7d88d9a9dd",
+    "571b55892f755de9bf7ea2904b8c338b171e4fc5",
+    "2175ece3fc4a5dce4314bb9dc5f6633c803271d3",
+    "909ae77d9bbb3d14ba654abc3ee4f9e6b1935c60",
+    "662178e2292622d3261d97a4c347587432f591d5",
+    "c56c33f9a5fdcc7155bdf6583ff9eebd9e84d2cd"
+  ],
+  "last_matched_by": "source_track",
+  "last_seen": 1778950050.496192,
+  "node_ids": [
+    "scout"
+  ],
+  "promoted": false,
+  "sample_count": 9,
+  "samples": [
+    {
+      "bbox": [
+        259,
+        298,
+        44,
+        44
+      ],
+      "confidence": 0.85,
+      "face_id": 12,
+      "image_sha1": "4a464c77049bcd912bdc3a7cb25c4dc958dfeac0",
+      "node_id": "scout",
+      "observed_at": 1778794953.1916564,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778794953219_4a464c77049b_1778794953191_12.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        495,
+        294,
+        116,
+        116
+      ],
+      "confidence": 0.85,
+      "face_id": 42,
+      "image_sha1": "c3a3a7fa5c0919f5dfeb65e96f8b4c6b6b985c66",
+      "node_id": "scout",
+      "observed_at": 1778804198.1232572,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778804198149_c3a3a7fa5c09_1778804198122_42.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        380,
+        96,
+        35,
+        35
+      ],
+      "confidence": 0.85,
+      "face_id": 141,
+      "image_sha1": "c5b327d883718b52a3852619a12dd03f051e7b9b",
+      "node_id": "scout",
+      "observed_at": 1778863727.6576273,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778863727685_c5b327d88371_1778863727657_141.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        302,
+        349,
+        66,
+        66
+      ],
+      "confidence": 0.85,
+      "face_id": 162,
+      "image_sha1": "d66b00c3bf9df529b695534697de5f7d88d9a9dd",
+      "node_id": "scout",
+      "observed_at": 1778865187.6937237,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778865187721_d66b00c3bf9d_1778865187693_162.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        301,
+        259,
+        55,
+        56
+      ],
+      "confidence": 0.85,
+      "face_id": 162,
+      "image_sha1": "571b55892f755de9bf7ea2904b8c338b171e4fc5",
+      "node_id": "scout",
+      "observed_at": 1778865189.7135184,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778865189742_571b55892f75_1778865189713_162.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        98,
+        239,
+        69,
+        69
+      ],
+      "confidence": 0.85,
+      "face_id": 169,
+      "image_sha1": "2175ece3fc4a5dce4314bb9dc5f6633c803271d3",
+      "node_id": "scout",
+      "observed_at": 1778865206.3075314,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778865206336_2175ece3fc4a_1778865206307_169.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        180,
+        278,
+        54,
+        54
+      ],
+      "confidence": 0.85,
+      "face_id": 170,
+      "image_sha1": "909ae77d9bbb3d14ba654abc3ee4f9e6b1935c60",
+      "node_id": "scout",
+      "observed_at": 1778865242.759602,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778865242798_909ae77d9bbb_1778865242759_170.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        207,
+        258,
+        75,
+        75
+      ],
+      "confidence": 0.85,
+      "face_id": 239,
+      "image_sha1": "662178e2292622d3261d97a4c347587432f591d5",
+      "node_id": "scout",
+      "observed_at": 1778870528.2898557,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778870528294_662178e22926_1778870528289_239.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    },
+    {
+      "bbox": [
+        221,
+        115,
+        35,
+        35
+      ],
+      "confidence": 0.85,
+      "face_id": 743,
+      "image_sha1": "c56c33f9a5fdcc7155bdf6583ff9eebd9e84d2cd",
+      "node_id": "scout",
+      "observed_at": 1778950050.4614086,
+      "path": "/home/vault/vault_v2/data/unknown_face_groups/vault_unknown_0001/samples/1778950050496_c56c33f9a5fd_1778950050461_743.jpg",
+      "perceptual_hash": null,
+      "source_track_id": "unknown_0001"
+    }
+  ],
+  "source_keys": [
+    "scout:unknown_0001"
+  ]
+}

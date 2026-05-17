@@ -1,0 +1,7 @@
+*.log
+*.log.*
+config/telemetry.db
+config/telemetry.db-shm
+config/telemetry.db-wal
+__pycache__/
+*.pyc

@@ -1,0 +1,15 @@
+[
+  {
+    "name": "implement_a_python_http_api_with_reminder_endpoint",
+    "display_name": "Reminder Orchestrator",
+    "description": "Implement a Python HTTP API with endpoints: create-reminder (POST), list-reminders (GET), delete-reminder (POST), and check-status (GET). Data fields: title (str), time (str), message (str), type (str). Persist reminders to src/data/ as JSON files. Background service will trigger notifications based on stored time data.",
+    "subsystem": "code_monkey_workspace",
+    "action": "run",
+    "examples": [
+      "Implement a Python HTTP API with endpoints: create-reminder (POST), list-reminders (GET), delete-reminder (POST), and check-status (GET). Data fields: title (str), time (str), message (str), type (str). Persist reminders to src/data/ as JSON files. Background service will trigger notifications based on stored time data."
+    ],
+    "source": "code_monkey",
+    "task_id": "969ba2e6-002f-463b-a87b-3d82f57bfc05",
+    "workspace": "code_monkey_data/tasks/969ba2e6-002f-463b-a87b-3d82f57bfc05"
+  }
+]

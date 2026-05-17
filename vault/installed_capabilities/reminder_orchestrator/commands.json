@@ -1,0 +1,56 @@
+{
+  "capability": "reminder_orchestrator",
+  "description": "Manages personal reminders",
+  "commands": [
+    {
+      "triggers": [
+        "create reminder {title}",
+        "add reminder {title}"
+      ],
+      "action": "create_reminder",
+      "args": {
+        "title": "string",
+        "time": "string",
+        "message": "string",
+        "type": "string"
+      },
+      "description": "create reminder"
+    },
+    {
+      "triggers": [
+        "list reminders",
+        "show reminders",
+        "my reminders"
+      ],
+      "action": "list_reminders",
+      "args": {},
+      "description": "list reminders"
+    },
+    {
+      "triggers": [
+        "delete reminder {title}",
+        "remove reminder {title}"
+      ],
+      "action": "delete_reminder",
+      "args": {
+        "title": "string"
+      },
+      "description": "delete reminder"
+    },
+    {
+      "triggers": [
+        "check status {title}"
+      ],
+      "action": "check_status",
+      "args": {
+        "title": "string"
+      },
+      "description": "check status"
+    }
+  ],
+  "background": {
+    "enabled": false,
+    "script": null,
+    "description": null
+  }
+}

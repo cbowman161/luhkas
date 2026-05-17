@@ -1,0 +1,32 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "verification": {
+        "failures": [
+          {
+            "command": "python3 -m unittest discover -s tests",
+            "error": "E.\n======================================================================\nERROR: test_public_api_lifecycle (test_api.TestPublicApi.test_public_api_lifecycle)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/tests/test_api.py\", line 19, in test_public_api_lifecycle\n    response = add('test', 'test')\n               ^^^^^^^^^^^^^^^^^^^\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/src/api.py\", line 30, in add\n    return _cm_success('add', data={'key': key, 'value': value})\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: _cm_success() missing 1 required positional argument: 'message'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (errors=1)",
+            "returncode": 1,
+            "status": "error",
+            "stderr": "E.\n======================================================================\nERROR: test_public_api_lifecycle (test_api.TestPublicApi.test_public_api_lifecycle)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/tests/test_api.py\", line 19, in test_public_api_lifecycle\n    response = add('test', 'test')\n               ^^^^^^^^^^^^^^^^^^^\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/src/api.py\", line 30, in add\n    return _cm_success('add', data={'key': key, 'value': value})\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: _cm_success() missing 1 required positional argument: 'message'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (errors=1)",
+            "stdout": ""
+          }
+        ],
+        "results": [
+          {
+            "command": "python3 -m unittest discover -s tests",
+            "error": "E.\n======================================================================\nERROR: test_public_api_lifecycle (test_api.TestPublicApi.test_public_api_lifecycle)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/tests/test_api.py\", line 19, in test_public_api_lifecycle\n    response = add('test', 'test')\n               ^^^^^^^^^^^^^^^^^^^\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/src/api.py\", line 30, in add\n    return _cm_success('add', data={'key': key, 'value': value})\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: _cm_success() missing 1 required positional argument: 'message'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (errors=1)",
+            "returncode": 1,
+            "status": "error",
+            "stderr": "E.\n======================================================================\nERROR: test_public_api_lifecycle (test_api.TestPublicApi.test_public_api_lifecycle)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/tests/test_api.py\", line 19, in test_public_api_lifecycle\n    response = add('test', 'test')\n               ^^^^^^^^^^^^^^^^^^^\n  File \"/home/luhkas/brain_v2/code_monkey_data/tasks/0952298c-e4d1-4240-b79a-0b0faca9d6ef/src/api.py\", line 30, in add\n    return _cm_success('add', data={'key': key, 'value': value})\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: _cm_success() missing 1 required positional argument: 'message'\n\n----------------------------------------------------------------------\nRan 2 tests in 0.000s\n\nFAILED (errors=1)",
+            "stdout": ""
+          }
+        ],
+        "status": "error",
+        "verification_mode": "test_command_only_with_cleanup_contract"
+      }
+    }
+  ],
+  "status": "error"
+}

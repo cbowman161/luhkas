@@ -1,0 +1,27 @@
+{
+  "capability_name": "local_capability_build_planner_add_list_notes",
+  "entrypoint": "src/api.py",
+  "files": [
+    {
+      "path": "src/api.py",
+      "purpose": "API implementation"
+    },
+    {
+      "path": "artifacts/README.md",
+      "purpose": "usage contract and test coverage guide"
+    },
+    {
+      "path": "tests/test_api.py",
+      "purpose": "non-interactive verification tests"
+    }
+  ],
+  "goal": "write a small Python API that stores notes in memory with add_note and list_notes functions",
+  "notes": "Implementation notes for add_note and list_notes functions in a Python API that stores notes in memory.",
+  "self_test_command": "",
+  "success_criteria": [
+    "test command exits with code 0",
+    "test suite exercises public API endpoints and JSON responses",
+    "implementation satisfies the user goal"
+  ],
+  "test_command": "python3 -m unittest discover -s tests"
+}

@@ -1,0 +1,12 @@
+{
+  "available_or_planned": [
+    "scout camera feed",
+    "object tracking memory",
+    "face detection and recognition",
+    "pose tracking",
+    "robot API health and motion state",
+    "planned microphone/speaker edge nodes",
+    "possible IMU and wheel encoder data from the robotics base"
+  ],
+  "kind": "sensors"
+}

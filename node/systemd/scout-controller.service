@@ -1,0 +1,12 @@
+[Unit]
+Description=Rover Gamepad Controller
+After=scout-robot-api.service
+
+[Service]
+Type=simple
+ExecStart=%h/scout_runtime/scripts/start_controller.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

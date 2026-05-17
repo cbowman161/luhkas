@@ -1,0 +1,19 @@
+[Unit]
+Description=Rover Unified Presence Proxy
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/scout_runtime
+Environment=VAULT_CHAT_URL=http://luhkas-vault.local:7000
+Environment=VAULT_CHAT_SOURCE=scout_presence
+Environment=SCOUT_PRESENCE_HOST=127.0.0.1
+Environment=SCOUT_PRESENCE_PORT=5002
+ExecStart=%h/scout_runtime/scripts/start_presence.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

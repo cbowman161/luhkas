@@ -1,0 +1,63 @@
+[0;1;32m●[0m luhkas-scout
+    State: [0;1;32mrunning[0m
+    Units: 202 loaded (incl. loaded aliases)
+     Jobs: 0 queued
+   Failed: 0 units
+    Since: Sat 2026-05-09 22:00:14 EDT; 1 day 9h ago
+  systemd: 257.9-1~deb13u1
+  Tainted: [0;1;38:5:185munmerged-bin[0m
+   CGroup: /user.slice/user-1000.slice/user@1000.service
+           ├─app.slice
+           │ ├─dconf.service
+           │ │ └─[0;38;5;245m1679 /usr/libexec/dconf-service[0m
+           │ ├─mpris-proxy.service
+           │ │ └─[0;38;5;245m1229 /usr/bin/mpris-proxy[0m
+           │ ├─scout-presence.service
+           │ │ ├─[0;38;5;245m196096 bash /home/luhkas/scout_runtime/scripts/start_presence.sh[0m
+           │ │ └─[0;38;5;245m196103 python3 services/presence_client_service.py[0m
+           │ ├─scout-robot-api.service
+           │ │ ├─[0;38;5;245m196085 bash /home/luhkas/scout_runtime/scripts/start_robot_api.sh[0m
+           │ │ └─[0;38;5;245m196091 python3 services/robot_api.py[0m
+           │ ├─scout-vision.service
+           │ │ ├─[0;38;5;245m196093 bash /home/luhkas/scout_runtime/scripts/start_vision.sh[0m
+           │ │ └─[0;38;5;245m196102 python3 services/vision_service.py[0m
+           │ ├─xdg-desktop-portal-gtk.service
+           │ │ └─[0;38;5;245m1662 /usr/libexec/xdg-desktop-portal-gtk[0m
+           │ └─xdg-desktop-portal-wlr.service
+           │   └─[0;38;5;245m1699 /usr/libexec/xdg-desktop-portal-wlr[0m
+           ├─init.scope
+           │ ├─[0;38;5;245m1119 /usr/lib/systemd/systemd --user[0m
+           │ └─[0;38;5;245m1154 "(sd-pam)"[0m
+           └─session.slice
+             ├─dbus.service
+             │ ├─[0;38;5;245m1184 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only[0m
+             │ └─[0;38;5;245m1664 /usr/libexec/feedbackd[0m
+             ├─filter-chain.service
+             │ └─[0;38;5;245m1190 /usr/bin/pipewire -c filter-chain.conf[0m
+             ├─gvfs-afc-volume-monitor.service
+             │ └─[0;38;5;245m1690 /usr/libexec/gvfs-afc-volume-monitor[0m
+             ├─gvfs-daemon.service
+             │ ├─[0;38;5;245m1606 /usr/libexec/gvfsd[0m
+             │ ├─[0;38;5;245m1613 /usr/libexec/gvfsd-fuse /run/user/1000/gvfs -f[0m
+             │ └─[0;38;5;245m1730 /usr/libexec/gvfsd-trash --spawner :1.20 /org/gtk/gvfs/exec_spaw/0[0m
+             ├─gvfs-goa-volume-monitor.service
+             │ └─[0;38;5;245m1698 /usr/libexec/gvfs-goa-volume-monitor[0m
+             ├─gvfs-gphoto2-volume-monitor.service
+             │ └─[0;38;5;245m1713 /usr/libexec/gvfs-gphoto2-volume-monitor[0m
+             ├─gvfs-mtp-volume-monitor.service
+             │ └─[0;38;5;245m1705 /usr/libexec/gvfs-mtp-volume-monitor[0m
+             ├─gvfs-udisks2-volume-monitor.service
+             │ └─[0;38;5;245m1670 /usr/libexec/gvfs-udisks2-volume-monitor[0m
+             ├─pipewire-pulse.service
+             │ └─[0;38;5;245m1200 /usr/bin/pipewire-pulse[0m
+             ├─pipewire.service
+             │ └─[0;38;5;245m1186 /usr/bin/pipewire[0m
+             ├─wireplumber.service
+             │ └─[0;38;5;245m1199 /usr/bin/wireplumber[0m
+             ├─xdg-desktop-portal.service
+             │ └─[0;38;5;245m1629 /usr/libexec/xdg-desktop-portal[0m
+             ├─xdg-document-portal.service
+             │ ├─[0;38;5;245m1641 /usr/libexec/xdg-document-portal[0m
+             │ └─[0;38;5;245m1656 fusermount3 -o rw,nosuid,nodev,fsname=portal,auto_unmount,subtype=portal -- /run/user/1000/doc[0m
+             └─xdg-permission-store.service
+               └─[0;38;5;245m1472 /usr/libexec/xdg-permission-store[0m

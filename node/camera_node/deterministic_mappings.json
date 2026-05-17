@@ -1,0 +1,56 @@
+{
+  "disable guard": {
+    "type": "local_media"
+  },
+  "enable guard": {
+    "type": "local_media"
+  },
+  "guard off": {
+    "type": "local_media"
+  },
+  "guard on": {
+    "type": "local_media"
+  },
+  "record a clip": {
+    "type": "local_media"
+  },
+  "record a video": {
+    "type": "local_media"
+  },
+  "record video": {
+    "type": "local_media"
+  },
+  "save a clip": {
+    "type": "local_media"
+  },
+  "save a snapshot": {
+    "type": "local_media"
+  },
+  "snapshot": {
+    "type": "local_media"
+  },
+  "start guard": {
+    "type": "local_media"
+  },
+  "start guarding": {
+    "type": "local_media"
+  },
+  "stop guard": {
+    "type": "local_media"
+  },
+  "stop guarding": {
+    "type": "local_media"
+  },
+  "take a photo": {
+    "type": "local_media"
+  },
+  "take a picture": {
+    "type": "local_media"
+  },
+  "take a video": {
+    "type": "local_media"
+  },
+  "video clip": {
+    "type": "local_media"
+  }
+}

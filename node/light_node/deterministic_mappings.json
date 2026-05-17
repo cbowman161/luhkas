@@ -1,0 +1,9 @@
+{
+  "brightness": {"type": "local_light"},
+  "lamp off": {"type": "local_light"},
+  "lamp on": {"type": "local_light"},
+  "light off": {"type": "local_light"},
+  "light on": {"type": "local_light"},
+  "turn off the light": {"type": "local_light"},
+  "turn on the light": {"type": "local_light"}
+}

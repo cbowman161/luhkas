@@ -1,0 +1,29 @@
+{
+  "actions": [
+    "route messages",
+    "answer general questions",
+    "answer self-questions through self-routes",
+    "inspect scout tracking state",
+    "learn a visible face/name",
+    "remember explicit facts and preferences",
+    "analyze the current scout snapshot with the vault GPU vision model",
+    "proxy a consistent presence across edge devices"
+  ],
+  "node_capabilities": [
+    {
+      "node": "scout",
+      "source": "GET /capabilities on the Scout vision service",
+      "description": "Scout exposes node-local deterministic commands through the existing capability surface. The vault should use these capabilities only when the user is interacting with Scout or explicitly targets Scout.",
+      "modules": [
+        "movement",
+        "media"
+      ],
+      "examples": [
+        "record a clip from Scout",
+        "go forward",
+        "look left"
+      ]
+    }
+  ],
+  "kind": "capabilities"
+}

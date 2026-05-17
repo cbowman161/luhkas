@@ -1,0 +1,27 @@
+{
+  "capability_name": "implement_a_python_http_api_with_reminder_endpoint",
+  "entrypoint": "src/api.py",
+  "files": [
+    {
+      "path": "src/api.py",
+      "purpose": "API implementation"
+    },
+    {
+      "path": "artifacts/README.md",
+      "purpose": "usage contract and test coverage guide"
+    },
+    {
+      "path": "tests/test_api.py",
+      "purpose": "non-interactive verification tests"
+    }
+  ],
+  "goal": "Implement a Python HTTP API with endpoints: create-reminder (POST), list-reminders (GET), delete-reminder (POST), and check-status (GET). Data fields: title (str), time (str), message (str), type (str). Persist reminders to src/data/ as JSON files. Background service will trigger notifications based on stored time data.",
+  "notes": "Deterministic API-first work order focusing on reminder management endpoints.",
+  "self_test_command": "",
+  "success_criteria": [
+    "test command exits with code 0",
+    "test suite exercises public API endpoints and JSON responses",
+    "implementation satisfies the user goal"
+  ],
+  "test_command": "python3 -m unittest discover -s tests"
+}

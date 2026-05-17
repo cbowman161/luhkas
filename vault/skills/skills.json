@@ -1,0 +1,17 @@
+[
+  {
+    "name": "snakegame",
+    "description": "A simple implementation of the popular arcade game where you control a snake that eats food pellets and grows in length, while avoiding running into itself or walls.",
+    "purpose": "play_the_classic_snake_video_game",
+    "filename": "skills/snake_game.py",
+    "examples": [
+      "Start playing with default settings",
+      "Try to beat your high score"
+    ],
+    "arguments": [],
+    "last_action": "patch_file",
+    "created_or_updated_at": "2026-05-04T17:28:40.961559",
+    "created_at": "2026-05-04T17:28:40.961565",
+    "updated_at": "2026-05-04T17:28:40.961567"
+  }
+]

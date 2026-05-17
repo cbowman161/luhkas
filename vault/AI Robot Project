@@ -1,0 +1,384 @@
+AI Robot Project
+
+- Architecture
+
+# 🧠 AI BRAIN BUILD ROADMAP (STEP-BY-STEP)
+
+---
+
+## =========================================
+
+## PHASE 0 — FOUNDATION (Get something running)
+
+## =========================================
+
+### Goal:
+
+Basic LLM + loop + interaction
+
+### Build:
+
+* Run local LLM (via Ollama or similar)
+* Simple loop:
+  input → LLM → output
+
+### Output:
+
+* CLI or basic interface where you can talk to it
+
+---
+
+## =========================================
+
+## PHASE 1 — MEMORY (make it persistent)
+
+## =========================================
+
+### Goal:
+
+It remembers things across time
+
+### Build:
+
+1. Event logger
+2. Vector database (Chroma / FAISS)
+3. Retrieval system
+
+### Features:
+
+* store interactions
+* retrieve relevant past info
+
+### Minimal functions:
+
+* store_event(event)
+* search_memory(query)
+
+---
+
+## =========================================
+
+## PHASE 2 — CONTEXT SYSTEM (make it scalable)
+
+## =========================================
+
+### Goal:
+
+Avoid context overflow
+
+### Build:
+
+* rolling summaries
+* structured memory
+
+### Add:
+
+* summarize_every_n_events()
+* store summaries separately
+
+### Result:
+
+* long conversations don’t break
+* system “remembers” efficiently
+
+---
+
+## =========================================
+
+## PHASE 3 — INTERNAL STATE (create a “mind”)
+
+## =========================================
+
+### Goal:
+
+Give it drives, mood, identity
+
+### Build:
+
+#### Drives:
+
+* curiosity
+* boredom
+* social
+* energy
+
+#### Mood:
+
+* derived from drives + events
+
+#### Beliefs:
+
+* preferences + confidence
+
+### Functions:
+
+* update_drives()
+* update_mood()
+* update_beliefs()
+
+---
+
+## =========================================
+
+## PHASE 4 — GOAL SYSTEM (autonomy begins)
+
+## =========================================
+
+### Goal:
+
+It decides what to do
+
+### Build:
+
+1. Goal generator (LLM prompt)
+2. Goal selector
+
+### Input:
+
+* drives
+* memory
+* current context
+
+### Output:
+
+* list of possible goals
+
+---
+
+## =========================================
+
+## PHASE 5 — PLANNING SYSTEM
+
+## =========================================
+
+### Goal:
+
+Turn goals into actions
+
+### Build:
+
+* planner that converts:
+  goal → step list
+
+### Example:
+
+"explore" → ["move", "scan", "store"]
+
+---
+
+## =========================================
+
+## PHASE 6 — ACTION SYSTEM (abstract for now)
+
+## =========================================
+
+### Goal:
+
+Execute behaviors (even if simulated)
+
+### Build:
+
+* action executor
+
+Examples:
+
+* speak()
+* move()
+* observe()
+
+👉 For now, just log actions
+
+---
+
+## =========================================
+
+## PHASE 7 — FEEDBACK LOOP (learning starts)
+
+## =========================================
+
+### Goal:
+
+It improves behavior
+
+### Build:
+
+* evaluate outcomes
+* assign reward / penalty
+
+### Update:
+
+* drives
+* beliefs
+
+---
+
+## =========================================
+
+## PHASE 8 — REFLECTION (major realism boost)
+
+## =========================================
+
+### Goal:
+
+It “thinks about itself”
+
+### Build:
+
+* periodic reflection prompt
+
+Example:
+"What did I learn?"
+
+Store:
+
+* insights
+* patterns
+
+---
+
+## =========================================
+
+## PHASE 9 — PERSONALITY (feels alive)
+
+## =========================================
+
+### Goal:
+
+Consistency + uniqueness
+
+### Add:
+
+* stable traits
+* speaking style
+* preferences
+
+---
+
+## =========================================
+
+## PHASE 10 — INITIATIVE (true autonomy)
+
+## =========================================
+
+### Goal:
+
+Acts without being prompted
+
+### Build:
+
+* idle detection
+* self-triggered goal generation
+
+---
+
+## =========================================
+
+## PHASE 11 — TIME + NARRATIVE
+
+## =========================================
+
+### Goal:
+
+Continuity over time
+
+### Add:
+
+* time awareness
+* daily summaries
+
+Example:
+"Today I explored and interacted more"
+
+---
+
+## =========================================
+
+## PHASE 12 — ADVANCED (optional but powerful)
+
+## =========================================
+
+* curiosity-driven exploration
+* skill tracking
+* social modeling (trust)
+* long-term goal evolution
+
+---
+
+## =========================================
+
+## CORE LOOP (FINAL SYSTEM)
+
+## =========================================
+
+while True:
+
+```
+perceive()                  # later connects to robot
+event = build_event()
+memory.store(event)
+
+update_internal_state()
+
+if no_goal:
+    goals = generate_goals()
+    goal = select_goal(goals)
+
+plan = create_plan(goal)
+execute(plan)
+
+feedback = evaluate()
+apply_feedback()
+
+if time_to_reflect:
+    reflect()
+```
+
+---
+
+## =========================================
+
+## BUILD ORDER (IMPORTANT)
+
+## =========================================
+
+1. LLM + loop
+2. Memory
+3. Context compression
+4. Internal state
+5. Goals
+6. Actions
+7. Feedback
+8. Reflection
+9. Autonomy
+
+---
+
+## =========================================
+
+## FINAL NOTE
+
+## =========================================
+
+You are NOT building:
+
+* a chatbot
+
+You ARE building:
+
+* a continuous agent system with:
+  memory
+  state
+  goals
+  behavior
+  feedback
+
+That’s what creates:
+→ autonomy
+→ personality
+→ “life-like” behavior
+
+
+
+- Current Phase
+
+Phase 0.5

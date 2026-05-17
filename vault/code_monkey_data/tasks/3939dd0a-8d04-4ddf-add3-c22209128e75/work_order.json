@@ -1,0 +1,27 @@
+{
+  "capability_name": "todo_api_builder",
+  "entrypoint": "src/api.py",
+  "files": [
+    {
+      "path": "src/api.py",
+      "purpose": "API implementation"
+    },
+    {
+      "path": "artifacts/README.md",
+      "purpose": "usage contract and test coverage guide"
+    },
+    {
+      "path": "tests/test_api.py",
+      "purpose": "non-interactive verification tests"
+    }
+  ],
+  "goal": "build a simple todo api",
+  "notes": "Implementation notes for a simple todo API: Use local files only, utilize Python standard library unless dependencies are declared later, generated files must stay inside the task workspace, tests must be non-interactive and deterministic.",
+  "self_test_command": "",
+  "success_criteria": [
+    "test command exits with code 0",
+    "test suite exercises public API endpoints and JSON responses",
+    "implementation satisfies the user goal"
+  ],
+  "test_command": "python3 -m unittest discover -s tests"
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=LUHKAS code_monkey async coder service
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/brain_v2
+ExecStart=/usr/bin/python3 -m code_monkey service --host 127.0.0.1 --port 8765 --workers 2
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=300
+Environment=PYTHONUNBUFFERED=1
+Environment=BRAIN_BACKGROUND_KEEP_ALIVE=5m
+
+[Install]
+WantedBy=default.target

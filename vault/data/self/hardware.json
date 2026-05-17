@@ -1,0 +1,30 @@
+{
+  "vault_pc": {
+    "cpu": "AMD Ryzen 7 7700, 8 cores / 16 threads",
+    "gpu": "NVIDIA GeForce RTX 3090 with 24GB GDDR6X VRAM",
+    "ram": "96GB DDR5",
+    "role": [
+      "LLM inference",
+      "vector memory",
+      "reasoning and agent loops",
+      "face identity and decision making",
+      "GPU vision analysis"
+    ],
+    "storage": "1TB NVMe Gen4 SSD for OS and models, optional 2TB NVMe later"
+  },
+  "kind": "hardware",
+  "scout_edge": {
+    "accelerator": "Raspberry Pi AI HAT+ 2, 40 TOPS class Hailo accelerator with 8GB GenAI board layer",
+    "audio": "planned I2S audio HAT or USB audio interface",
+    "base": "RasProver robotics base with motor controller, possible wheel encoders, and IMU",
+    "compute": "Raspberry Pi 5 with 16GB RAM",
+    "role": [
+      "real-time object detection",
+      "tracking",
+      "motor control",
+      "optional wake word",
+      "sending events to the vault PC"
+    ],
+    "vision": "CSI camera, with optional dual-camera depth later"
+  }
+}
