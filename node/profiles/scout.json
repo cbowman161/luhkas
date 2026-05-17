@@ -1,8 +1,7 @@
 {
   "node_id": "scout",
   "display": {
-    "has_display": false,
-    "type": "scout_camera"
+    "has_display": false
   },
   "services": {
     "vision": 5000,
