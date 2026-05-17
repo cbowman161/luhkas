@@ -160,7 +160,6 @@ def auto_push_if_new(node_id: str) -> None:
         return
     _auto_synced.add(node_id)
     result = push_node(profile)
-    changed = result.get("files_changed", False)
     restarted = result.get("services_restarted", [])
     status = "ok" if result.get("ok") else f"failed: {result.get('error')}"
     print(
@@ -168,6 +167,16 @@ def auto_push_if_new(node_id: str) -> None:
         + (f" | {len(restarted)} service(s) restarted" if restarted else ""),
         flush=True,
     )
+    global _last_result, _last_sync_at
+    import time as _time
+    _last_sync_at = _time.time()
+    _last_result = {
+        "ok": result.get("ok"),
+        "trigger": "auto",
+        "pull": None,
+        "nodes": {node_id: result},
+        "synced_at": _last_sync_at,
+    }
 
 
 def last_result() -> dict:

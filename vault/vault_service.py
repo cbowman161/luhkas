@@ -304,7 +304,8 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, fmt, *args):
-        print("[vault_service] " + fmt % args, flush=True)
+        client = self.address_string()
+        print(f"[vault_service] {client} " + fmt % args, flush=True)
 
     def _read_json(self):
         length = int(self.headers.get("content-length") or "0")
