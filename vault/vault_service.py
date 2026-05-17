@@ -77,6 +77,11 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 self._send(200, self.runtime.node_registry.health_summary())
                 return
 
+            if path == "/admin/sync":
+                from sync_manager import last_result
+                self._send(200, last_result())
+                return
+
             if path == "/alerts/pending":
                 from urllib.parse import parse_qs
                 qs = parse_qs(urlparse(self.path).query)
@@ -208,6 +213,25 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 if node_id:
                     self.runtime.node_registry.record_selftest(node_id, payload)
                 self._send(200, {"ok": True, "node_id": node_id})
+                return
+
+            if path == "/admin/sync":
+                payload = self._read_json()
+                node_id = str(payload.get("node_id") or "").strip() or None
+                import threading as _t
+                result_box: list[dict] = []
+
+                def _run():
+                    from sync_manager import sync_all
+                    result_box.append(sync_all(node_id=node_id))
+
+                t = _t.Thread(target=_run, daemon=True)
+                t.start()
+                t.join(timeout=180)
+                if result_box:
+                    self._send(200, result_box[0])
+                else:
+                    self._send(504, {"ok": False, "error": "sync timed out"})
                 return
 
             if path == "/guard/alert":

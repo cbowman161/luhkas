@@ -5,5 +5,15 @@
     "pantilt_node",
     "rover_node",
     "light_node"
-  ]
+  ],
+  "sync": {
+    "host": "luhkas-scout.local",
+    "user": "luhkas",
+    "node_dir": "luhkas/node",
+    "services": [
+      "scout-robot-api",
+      "scout-vision",
+      "scout-presence"
+    ]
+  }
 }
