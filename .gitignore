@@ -25,6 +25,14 @@ config/faces/
 config/people/
 data/deterministic_commands.json
 
+# Generated / task data
+vault/code_monkey_data/
+vault/data/unknown_face_groups/
+vault/.claude/
+
+# Stray files
+node/ystemctl*
+
 # Node / JS
 node_modules/
 
