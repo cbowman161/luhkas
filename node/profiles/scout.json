@@ -1,5 +1,14 @@
 {
   "node_id": "scout",
+  "display": {
+    "has_display": false,
+    "type": "scout_camera"
+  },
+  "services": {
+    "vision": 5000,
+    "robot_api": 5001,
+    "presence": 5002
+  },
   "modules": [
     "camera_node",
     "pantilt_node",

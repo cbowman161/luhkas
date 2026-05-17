@@ -71,23 +71,28 @@ def _ensure_vault_pubkey(brain_url: str) -> None:
         print(f"[scout_presence] could not fetch vault pubkey: {exc}", flush=True)
 
 
+def _load_profile(node_id: str) -> dict:
+    profile_path = Path(__file__).resolve().parents[1] / "profiles" / f"{node_id}.json"
+    try:
+        return json.loads(profile_path.read_text()) if profile_path.exists() else {}
+    except Exception:
+        return {}
+
+
 def _register_with_brain(config: dict, retries: int = 6) -> None:
     """Register this node with the brain, including our IP and service ports."""
     brain_url = config["brain_url"]
     node_id = config.get("node_id", "scout")
     _ensure_vault_pubkey(brain_url)
     ip = _get_lan_ip()
+    profile = _load_profile(node_id)
     capabilities = _node_capabilities()
     payload = {
         "node_id": node_id,
-        "node_name": f"luhkas-scout ({ip})",
+        "node_name": f"{node_id} ({ip})",
         "ip": ip,
-        "display": {"has_display": False, "type": "scout_camera"},
-        "services": {
-            "vision": 5000,
-            "robot_api": 5001,
-            "presence": 5002,
-        },
+        "display": profile.get("display") or {"has_display": False},
+        "services": profile.get("services") or {"presence": 5002},
         "capabilities": capabilities,
         "modules": capabilities.get("module_status") or {},
     }
