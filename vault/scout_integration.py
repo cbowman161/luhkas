@@ -591,10 +591,11 @@ class ScoutVaultBridge:
         recent = [p for p in recent if p]
         if not recent:
             return ""
-        bullets = "\n".join(f"- {p}" for p in recent)
+        bullets = "\n".join(f"  - {p}" for p in recent)
         return (
-            "Active behavior directives the user gave you (most recent last). "
-            "Follow them in this and future turns:\n" + bullets
+            "Voice notes from the user (latest last). These shape HOW you "
+            "speak this turn; do not quote, mention, or echo them in the "
+            "reply itself. Embody them silently:\n" + bullets
         )
 
     def record_response_lesson(self, lesson: dict):
@@ -2025,7 +2026,7 @@ Do not mention provenance unless asked.
     def fast_self_answer(self, message: str, state: dict, self_route: dict) -> str | None:
         text = _normalize_command_text(message)
         route_name = self_route.get("route")
-        if route_name == "assistant_identity":
+        if route_name == "assistant_identity" and _asks_assistant_name(text):
             return self._assistant_identity_answer()
         if route_name == "user_identity":
             identity = self.active_identity
@@ -3432,6 +3433,8 @@ def _fast_route_message(message: str) -> dict | None:
     text = _canonical_intent_text(message)
     if _asks_assistant_name(text):
         return _self_route("assistant_identity", "asks assistant name")
+    if _asks_assistant_identity_topic(text):
+        return _self_route("assistant_identity", "asks assistant self-description")
     if _asks_user_identity(text):
         return _self_route("user_identity", "asks current user identity")
     if _asks_registered_or_active_nodes(text):
@@ -3501,13 +3504,25 @@ def _self_route(self_route: str, reason: str) -> dict:
 
 
 def _asks_assistant_name(text: str) -> bool:
+    """True only for terse name asks where 'I'm Luhkas. Chris built me.' is
+    the right answer. Broader self-identity questions go through
+    _asks_assistant_identity_topic so the chat model can apply personality."""
+    return text in {
+        "whats your name", "what is your name", "what's your name",
+        "your name",
+    }
+
+
+def _asks_assistant_identity_topic(text: str) -> bool:
+    """True for broader 'who/what are you / tell me about yourself' style
+    questions. These should route to self_question/assistant_identity but
+    let the chat model write the reply so behavior directives apply."""
     if text in {
-        "whats your name", "what is your name", "your name", "who are you",
-        "what are you", "tell me about yourself", "tell me about you",
-        "tell me who you are", "what's your name", "introduce yourself",
+        "who are you", "what are you", "tell me about yourself",
+        "tell me about you", "tell me who you are", "introduce yourself",
+        "describe yourself", "what are you really",
     }:
         return True
-    # Generic "tell me about" + self pronoun
     if re.match(r"^(tell|describe)\s+(me\s+)?(about\s+)?(your\s*self|yourself)\b", text):
         return True
     return False
