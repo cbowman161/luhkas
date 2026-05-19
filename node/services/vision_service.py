@@ -935,21 +935,10 @@ class Handler(BaseHTTPRequestHandler):
             )
             self._json(identity_response, status=status)
             return
-        if _local_command_handle is not None:
-            local_response = None
-            try:
-                local_response = _local_command_handle(message)
-            except Exception as exc:
-                log.warning("local chat command failed: %s", exc)
-                local_response = {"ok": False, "message": "I could not run that local scout command.", "error": str(exc)}
-            if local_response is not None:
-                _chat_log_add(
-                    "assistant",
-                    local_response.get("tts") or local_response.get("message") or json.dumps(local_response),
-                    source="local_command",
-                )
-                self._json({"ok": True, "response": local_response})
-                return
+        # Chat responses go through Vault so deterministic actions and generated
+        # wording share the same ResponseComposer path. Node-local command
+        # modules still advertise capabilities and execute when Vault routes
+        # actions back to this service.
         try:
             import requests as _requests
             vault_payload = build_presence_payload(message, _chat_log_snapshot(), "scout")

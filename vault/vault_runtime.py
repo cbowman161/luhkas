@@ -16,7 +16,7 @@ from node_health_monitor import NodeHealthMonitor
 from node_registry import NodeRegistry
 from planner import Planner
 from router import Router
-from scout_integration import ScoutVaultBridge
+from scout_integration import ScoutVaultBridge, _sanitize_generated_response
 from skill_registry import SkillRegistry
 from tts_formatter import format_for_tts
 
@@ -285,6 +285,7 @@ class VaultRuntime:
         # Scout bridge stores the reply text in "response" and the input in "message"
         reply_text = result.get("response") or ""
         result["message"] = reply_text
+        result["response_composed"] = True
         active_id = result.get("active_identity")
         self.node_registry.update_activity(node_id, identity=active_id)
         return self._enrich(result, node_id)
@@ -455,7 +456,12 @@ class VaultRuntime:
     def _enrich(self, response: dict, node_id: str) -> dict:
         """Add tts, display, and has_display fields to every response."""
         message = response.get("message") or ""
-        if "tts" not in response:
+        if message and response.get("compose", True) and not response.get("response_composed"):
+            response["raw_message"] = message
+            response["message"] = self._compose_runtime_message(response, node_id)
+            response["response_composed"] = True
+            message = response["message"]
+        if response.get("response_composed") or "tts" not in response:
             response["tts"] = format_for_tts(message)
         has_display = self.node_registry.has_display(node_id)
         response["has_display"] = has_display
@@ -463,3 +469,39 @@ class VaultRuntime:
         if not has_display:
             response["message"] = response["tts"]
         return response
+
+    def _compose_runtime_message(self, response: dict, node_id: str) -> str:
+        message = str(response.get("message") or "")
+        if not message:
+            return message
+        scout = getattr(self, "scout", None)
+        composer = getattr(scout, "response_composer", None)
+        if composer is None:
+            return f"Fallback response: {message} (response composer unavailable)"
+        recent = []
+        try:
+            recent = [
+                str(turn.get("response") or "").strip()
+                for turn in scout.turns[-8:]
+                if str(turn.get("response") or "").strip()
+            ]
+        except Exception:
+            recent = []
+        return composer.compose(
+            response_type="runtime_direct",
+            user_message="",
+            facts={
+                "deterministic_answer": message,
+                "mode": response.get("mode"),
+                "node_id": node_id,
+                "deterministic": response.get("deterministic"),
+                "source": response.get("deterministic_source"),
+                "data": response.get("data"),
+            },
+            fallback=message,
+            contract=scout.response_contract("runtime_direct", {"ok": True}),
+            recent_responses=recent,
+            options={"num_predict": 90, "temperature": 0.62, "top_p": 0.9},
+            validator=lambda text: scout.response_policy_violation(text, {"ok": True}, "runtime_direct"),
+            sanitizer=_sanitize_generated_response,
+        )

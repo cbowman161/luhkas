@@ -16,6 +16,7 @@ import requests
 from config import DATA_DIR, FACE_REFERENCES_DIR, OLLAMA_VISION_MODEL, PEOPLE_DIR, ROOT_DIR, SCOUT_ROBOT_URL, SCOUT_URL
 from models import get_model, model_manifest
 from mood_engine import MoodEngine
+from response_composer import ResponseComposer
 
 try:
     from luhkas_node.wakeword import WAKEWORD_RESPONSE
@@ -284,6 +285,7 @@ class ScoutVaultBridge:
         self.skill_registry = None
         self.route_model = get_model("router")
         self.chat_model = get_model("chat")
+        self.response_composer = ResponseComposer(self.chat_model)
 
     def capabilities(self):
         scout_capabilities = self.scout_node_capabilities()
@@ -2203,14 +2205,19 @@ Rules:
 - Do not repeat the user's correction verbatim.
 """
         try:
-            return self.generate_guarded_response(
+            return self._compose_response(
                 "feedback_learned",
-                prompt,
+                message,
                 state,
+                {"feedback": feedback, "saved": result},
+                "Got it. I will use that next time.",
                 options={"num_predict": 90, "temperature": 0.45, "top_p": 0.9},
             )
         except Exception:
-            return "Got it. I will be more precise about the specific thing you asked for."
+            return self.response_composer.fallback(
+                "Got it. I will be more precise about the specific thing you asked for.",
+                "feedback response generation failed",
+            )
 
     def answer_self_question(self, message: str, state: dict, route: dict | None = None):
         self_route = (route or {}).get("self_route")
@@ -2263,14 +2270,23 @@ Do not invent missing hardware, software, sensors, people, or capabilities.
 Do not mention provenance unless asked.
 """
         try:
-            return self.generate_guarded_response(
+            return self._compose_response(
                 "self_question",
-                prompt,
+                message,
                 state,
+                {
+                    "deterministic_prompt": prompt,
+                    "self_route": self_route_name,
+                    "facts": facts,
+                },
+                "I couldn't answer that self-question cleanly.",
                 options={"num_predict": 100, "temperature": 0.5, "top_p": 0.9},
             )
         except Exception as exc:
-            return f"I cannot answer that self-question because the local chat model is unavailable: {exc}"
+            return self.response_composer.fallback(
+                f"I cannot answer that self-question because the local chat model is unavailable: {exc}",
+                "self-question generation failed",
+            )
 
     def fast_self_answer(self, message: str, state: dict, self_route: dict) -> str | None:
         text = _normalize_command_text(message)
@@ -2281,9 +2297,14 @@ Do not mention provenance unless asked.
             return self._assistant_status_answer(state, message)
         if route_name == "user_identity":
             identity = self.active_identity
-            if identity:
-                return f"You are {identity}."
-            return "I don't know who you are yet."
+            fallback = f"You are {identity}." if identity else "I don't know who you are yet."
+            return self._generated_fact_answer(
+                "identity_status",
+                message,
+                state,
+                {"deterministic_answer": fallback, "active_identity": identity},
+                fallback,
+            )
         if route_name == "capabilities" and _asks_skill_inventory(text):
             return self._registered_skills_answer()
         if route_name == "capabilities" and _asks_capability_inventory(text):
@@ -2291,23 +2312,37 @@ Do not mention provenance unless asked.
         if route_name == "personality":
             return self._personality_state_answer()
         if route_name == "software" and _asks_stored_knowledge_owner(text):
-            return "Stored knowledge belongs to Vault. Scout can witness and forward node state, but Vault owns memory, learning, and retrieval."
+            fallback = "Stored knowledge belongs to Vault. Scout can witness and forward node state, but Vault owns memory, learning, and retrieval."
+            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback}, fallback, required_terms=("Vault", "Scout"))
         if route_name == "software" and _asks_camera_action_owner(text):
-            return "Camera actions belong to Scout's camera_node. Vault can route the request, but Scout owns the camera behavior."
+            fallback = "Camera actions belong to Scout's camera_node. Vault can route the request, but Scout owns the camera behavior."
+            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback}, fallback, required_terms=("Vault", "Scout"))
         if route_name == "status" and _asks_registered_or_active_nodes(text):
             return self._registered_nodes_answer(state, message)
         if route_name == "status" and _asks_tracking_status(text):
             if not state.get("ok"):
-                return "I couldn't read Scout's live state."
-            return "Tracking is on." if state.get("tracking_enabled") else "Tracking is off."
+                fallback = "I couldn't read Scout's live state."
+            else:
+                fallback = "Tracking is on." if state.get("tracking_enabled") else "Tracking is off."
+            return self._generated_fact_answer(
+                "self_question",
+                message,
+                state,
+                {"deterministic_answer": fallback, "tracking_enabled": state.get("tracking_enabled")},
+                fallback,
+            )
         if route_name == "status" and _asks_pose_interval(text):
             interval = state.get("pose_interval_frames")
-            if interval is None:
-                return "I couldn't read the pose interval from Scout's live state."
-            return f"The pose interval is set to every {interval} frames."
+            fallback = (
+                "I couldn't read the pose interval from Scout's live state."
+                if interval is None
+                else f"The pose interval is set to every {interval} frames."
+            )
+            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback, "pose_interval_frames": interval}, fallback)
         if route_name == "goals" and _asks_why_here(text):
             role = self.identity_profile.get("role") or "the assistant Chris created"
-            return f"I'm here as {role}: to help with tasks, remember useful things, and work through the vault and connected nodes."
+            fallback = f"I'm here as {role}: to help with tasks, remember useful things, and work through the vault and connected nodes."
+            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback, "role": role}, fallback)
         if route_name == "hardware":
             return self._hardware_summary_answer()
         if route_name == "sensors":
@@ -2345,62 +2380,21 @@ Do not mention provenance unless asked.
             for turn in self.turns[-8:]
             if str(turn.get("response") or "").strip()
         ]
-        prompt = f"""Write the final user-facing answer from the facts below.
-Type: {response_type}
-User: {message}
-
-Facts:
-{json.dumps(facts, separators=(",", ":"), default=str)}
-
-Recent answers to avoid repeating exactly:
-{json.dumps(recent[-5:], separators=(",", ":"), default=str)}
-
-Rules:
-- Keep the same factual meaning as deterministic_answer when it is present.
-- Vary the phrasing; do not repeat any recent answer exactly.
-- One short sentence unless the facts require two.
-- First person when talking about yourself.
-- No emojis and no generic offer to help.
-"""
-        try:
-            text = self.generate_guarded_response(
-                response_type,
-                prompt,
-                state,
-                options=self.chat_options({"num_predict": 80, "temperature": 0.78, "top_p": 0.92}),
-            ).strip()
-            lowered = text.lower()
-            if text and text not in recent and all(term.lower() in lowered for term in required_terms):
-                return text
-        except Exception:
-            pass
-        return self._varied_fallback(fallback, recent)
+        return self.response_composer.compose(
+            response_type=response_type,
+            user_message=message,
+            facts=facts,
+            fallback=fallback,
+            contract=self.response_contract(response_type, state),
+            recent_responses=recent,
+            options=self.chat_options({"num_predict": 80, "temperature": 0.78, "top_p": 0.92}),
+            validator=lambda text: self.response_policy_violation(text, state, response_type),
+            sanitizer=_sanitize_generated_response,
+            required_terms=required_terms,
+        )
 
     def _varied_fallback(self, fallback: str, recent: list[str]) -> str:
-        base = str(fallback or "").strip()
-        variants = [base]
-        if base.startswith("Got it. The "):
-            variants.append(base.replace("Got it. The ", "Logged for this chat: the ", 1))
-            variants.append(base.replace("Got it. The ", "I have it: the ", 1))
-        elif base.startswith("The ") and " was " in base:
-            variants.append(base.replace("The ", "You gave me the ", 1).replace(" was ", ": ", 1))
-            variants.append(base.replace("The ", "I have the ", 1).replace(" was ", " as ", 1))
-        elif base.startswith("I'm Luhkas."):
-            variants.extend([
-                "I'm Luhkas; Scout is one body I can use, not a separate me.",
-                "Luhkas is me. Scout is just the body I am using here.",
-                "I'm Luhkas, with Scout as one connected body.",
-            ])
-        elif base.startswith("The live node registry"):
-            variants.append(base.replace("The live node registry currently shows", "Right now the live registry has", 1))
-            variants.append(base.replace("The live node registry currently shows", "I see", 1))
-        elif base.startswith("I'm using Scout"):
-            variants.append(base.replace("I'm using Scout", "Scout is the body I'm using", 1))
-            variants.append(base.replace("I'm using Scout", "From Scout's body, I'm", 1))
-        for variant in variants:
-            if variant and variant not in recent:
-                return variant
-        return base
+        return self.response_composer.varied_fallback(fallback, recent)
 
     def _assistant_identity_answer(self, state: dict | None = None, message: str = "") -> str:
         state = state or {"ok": True}
@@ -2463,15 +2457,27 @@ Rules:
             parts.append(f"Vault PC: {', '.join(vault_bits)}")
         if scout_bits:
             parts.append(f"Scout body: {', '.join(scout_bits)}")
-        return ". ".join(parts) + "." if parts else "I don't have my hardware sheet loaded."
+        fallback = ". ".join(parts) + "." if parts else "I don't have my hardware sheet loaded."
+        return self._generated_fact_answer(
+            "self_question",
+            "hardware summary",
+            {"ok": True},
+            {"deterministic_answer": fallback, "hardware_parts": parts},
+            fallback,
+        )
 
     def _sensors_summary_answer(self) -> str:
         rec = (self.self_knowledge_for_route("sensors").get("records", {}) or {}).get("sensors", {}) or {}
         items = rec.get("available_or_planned") or []
         live = [s for s in items if not str(s).lower().startswith("planned") and "possible" not in str(s).lower()]
-        if not live:
-            return "I don't have a sensor list loaded."
-        return "Sensors: " + ", ".join(live[:6]) + "."
+        fallback = "I don't have a sensor list loaded." if not live else "Sensors: " + ", ".join(live[:6]) + "."
+        return self._generated_fact_answer(
+            "self_question",
+            "sensors summary",
+            {"ok": True},
+            {"deterministic_answer": fallback, "sensors": live[:6]},
+            fallback,
+        )
 
     def _registered_nodes_answer(self, state: dict | None = None, message: str = "") -> str:
         snapshot = self.registered_nodes_snapshot()
@@ -2570,24 +2576,35 @@ Rules:
 
     def _registered_capabilities_answer(self) -> str:
         if self.capability_registry is None:
-            return "I couldn't read the capability registry."
+            fallback = "I couldn't read the capability registry."
+            return self._generated_fact_answer("self_question", "capabilities", {"ok": True}, {"deterministic_answer": fallback}, fallback)
         capabilities = self.capability_registry.list()
         if not capabilities:
-            return "The capability registry is empty right now."
+            fallback = "The capability registry is empty right now."
+            return self._generated_fact_answer("self_question", "capabilities", {"ok": True}, {"deterministic_answer": fallback}, fallback)
         names = [
             str(cap.get("display_name") or cap.get("name") or "unnamed").replace("_", " ")
             for cap in capabilities[:8]
         ]
         extra = len(capabilities) - len(names)
         suffix = f", plus {extra} more" if extra > 0 else ""
-        return f"The capability registry lists {len(capabilities)} capabilities: {', '.join(names)}{suffix}."
+        fallback = f"The capability registry lists {len(capabilities)} capabilities: {', '.join(names)}{suffix}."
+        return self._generated_fact_answer(
+            "self_question",
+            "capabilities",
+            {"ok": True},
+            {"deterministic_answer": fallback, "capability_count": len(capabilities), "capabilities": names},
+            fallback,
+        )
 
     def _registered_skills_answer(self) -> str:
         if self.skill_registry is None:
-            return "I couldn't read the skill registry."
+            fallback = "I couldn't read the skill registry."
+            return self._generated_fact_answer("self_question", "skills", {"ok": True}, {"deterministic_answer": fallback}, fallback)
         skills = self.skill_registry.list()
         if not skills:
-            return "The skill registry is empty right now."
+            fallback = "The skill registry is empty right now."
+            return self._generated_fact_answer("self_question", "skills", {"ok": True}, {"deterministic_answer": fallback}, fallback)
         names = [
             str(skill.get("name") or skill.get("display_name") or "unnamed").replace("_", " ")
             for skill in skills[:8]
@@ -2595,7 +2612,14 @@ Rules:
         extra = len(skills) - len(names)
         suffix = f", plus {extra} more" if extra > 0 else ""
         noun = "skill" if len(skills) == 1 else "skills"
-        return f"The skill registry lists {len(skills)} {noun}: {', '.join(names)}{suffix}."
+        fallback = f"The skill registry lists {len(skills)} {noun}: {', '.join(names)}{suffix}."
+        return self._generated_fact_answer(
+            "self_question",
+            "skills",
+            {"ok": True},
+            {"deterministic_answer": fallback, "skill_count": len(skills), "skills": names},
+            fallback,
+        )
 
     def answer_greeting(self, message: str, state: dict):
         return self.generate_response(
@@ -2622,6 +2646,35 @@ Rules:
             temperature=0.75,
         )
 
+    def _compose_response(
+        self,
+        response_type: str,
+        message: str,
+        state: dict,
+        facts: dict,
+        fallback: str,
+        *,
+        options: dict | None = None,
+        required_terms: tuple[str, ...] = (),
+    ) -> str:
+        recent = [
+            str(turn.get("response") or "").strip()
+            for turn in self.turns[-8:]
+            if str(turn.get("response") or "").strip()
+        ]
+        return self.response_composer.compose(
+            response_type=response_type,
+            user_message=message,
+            facts=facts,
+            fallback=fallback,
+            contract=self.response_contract(response_type, state),
+            recent_responses=recent,
+            options=self.chat_options(options),
+            validator=lambda text: self.response_policy_violation(text, state, response_type),
+            sanitizer=_sanitize_generated_response,
+            required_terms=required_terms,
+        )
+
     def generate_response(
         self,
         response_type: str,
@@ -2642,31 +2695,19 @@ Rules:
             "primary_user": self.identity_profile.get("primary_user"),
             "primary_user_title": self.identity_profile.get("primary_user_title"),
         }
-        prompt = f"""Write the final user-facing answer.
-Type: {response_type}
-User: {message}
-
-Facts only:
-{json.dumps({
-    "identity": compact_identity,
-    "route_facts": response_facts,
-    "rover_tracking_available": bool(state.get("ok")),
-    "active_identity": self.active_identity if state.get("ok") else None,
-}, separators=(",", ":"), default=str)}
-
-Rules: 1-2 short sentences. First person. No emojis. No customer-service closer.
-Do not invent facts, detections, actions, memories, feelings, or desires.
-Do not address the user by name/title unless identity_context permits it.
-"""
-        try:
-            return self.generate_guarded_response(
-                response_type,
-                prompt,
-                state,
-                options=self.chat_options({"num_predict": max_tokens, "temperature": temperature}),
-            )
-        except Exception as exc:
-            return f"My response model is unavailable: {exc}"
+        return self._compose_response(
+            response_type,
+            message,
+            state,
+            {
+                "identity": compact_identity,
+                "route_facts": response_facts,
+                "rover_tracking_available": bool(state.get("ok")),
+                "active_identity": self.active_identity if state.get("ok") else None,
+            },
+            "I could not generate that response cleanly.",
+            options={"num_predict": max_tokens, "temperature": temperature},
+        )
 
     def response_identity_context(self, state: dict):
         active_identity = self.active_identity if state.get("ok") else None
@@ -2698,23 +2739,22 @@ Do not address the user by name/title unless identity_context permits it.
         *,
         options: dict | None = None,
     ):
-        options = self.chat_options(options)
-        guarded_prompt = (
-            f"{prompt.rstrip()}\n\n"
-            f"Non-negotiable response contract:\n{self.response_contract(response_type, state)}\n"
+        return self.response_composer.compose(
+            response_type=response_type,
+            user_message="",
+            facts={"legacy_prompt": prompt},
+            fallback=self.cleanup_policy_failed_response(response_type, state, "model generation failed")
+            or "I could not generate that response cleanly.",
+            contract=self.response_contract(response_type, state),
+            recent_responses=[
+                str(turn.get("response") or "").strip()
+                for turn in self.turns[-8:]
+                if str(turn.get("response") or "").strip()
+            ],
+            options=self.chat_options(options),
+            validator=lambda text: self.response_policy_violation(text, state, response_type),
+            sanitizer=_sanitize_generated_response,
         )
-        text = self.chat_model.generate(guarded_prompt, options=options, think=False)
-        violation = self.response_policy_violation(text, state, response_type)
-        if not violation:
-            return text
-        sanitized = _sanitize_generated_response(text)
-        violation = self.response_policy_violation(sanitized, state, response_type)
-        if sanitized and not violation:
-            return sanitized
-        cleanup = self.cleanup_policy_failed_response(response_type, state, violation)
-        if cleanup:
-            return cleanup
-        raise RuntimeError(f"response failed policy check: {violation}")
 
     def cleanup_policy_failed_response(self, response_type: str, state: dict, violation: str):
         identity_context = self.response_identity_context(state)
@@ -2950,76 +2990,90 @@ Do not address the user by name/title unless identity_context permits it.
 
         if _has_any(text, ("follow me", "start following", "start tracking", "track me")):
             result = self._post_json(f"{self.scout_url}/tracking", {"enabled": True, "follow": True})
-            return _action_response("control_tracking", result, "Following is on.", "I could not turn following on.")
+            return self._compose_action_result(message, state, _action_response("control_tracking", result, "Following is on.", "I could not turn following on."))
 
         if _has_any(text, ("stop following", "stop tracking", "don't follow", "do not follow")):
             result = self._post_json(f"{self.scout_url}/tracking", {"enabled": False, "follow": False})
-            return _action_response("control_tracking", result, "Following is off.", "I could not turn following off.")
+            return self._compose_action_result(message, state, _action_response("control_tracking", result, "Following is off.", "I could not turn following off."))
 
         if _has_any(text, ("enable tracking", "start tracking", "track person", "track people")):
             result = self._post_json(f"{self.scout_url}/tracking", {"enabled": True})
-            return _action_response("control_tracking", result, "Tracking is on.", "I could not turn tracking on.")
+            return self._compose_action_result(message, state, _action_response("control_tracking", result, "Tracking is on.", "I could not turn tracking on."))
 
         if _has_any(text, ("disable tracking", "turn off tracking", "stop tracking")):
             result = self._post_json(f"{self.scout_url}/tracking", {"enabled": False})
-            return _action_response("control_tracking", result, "Tracking is off.", "I could not turn tracking off.")
+            return self._compose_action_result(message, state, _action_response("control_tracking", result, "Tracking is off.", "I could not turn tracking off."))
 
         if _has_any(text, ("search camera on", "enable search camera", "turn on search camera")):
             result = self._post_json(f"{self.scout_url}/settings", {"search_movement_enabled": True})
-            return _action_response("control_search_camera", result, "Search camera is on.", "I could not enable search camera.")
+            return self._compose_action_result(message, state, _action_response("control_search_camera", result, "Search camera is on.", "I could not enable search camera."))
 
         if _has_any(text, ("search camera off", "disable search camera", "turn off search camera")):
             result = self._post_json(f"{self.scout_url}/settings", {"search_movement_enabled": False})
-            return _action_response("control_search_camera", result, "Search camera is off.", "I could not disable search camera.")
+            return self._compose_action_result(message, state, _action_response("control_search_camera", result, "Search camera is off.", "I could not disable search camera."))
 
         if _has_any(text, ("guard on", "enable guard", "start guard", "start guarding")):
             result = self._post_json(f"{self.scout_url}/guard", {"enabled": True})
-            return _action_response("control_guard", result, "Guard mode is on.", "I could not enable guard mode.")
+            return self._compose_action_result(message, state, _action_response("control_guard", result, "Guard mode is on.", "I could not enable guard mode."))
 
         if _has_any(text, ("guard off", "disable guard", "stop guard", "stop guarding")):
             result = self._post_json(f"{self.scout_url}/guard", {"enabled": False})
-            return _action_response("control_guard", result, "Guard mode is off.", "I could not disable guard mode.")
+            return self._compose_action_result(message, state, _action_response("control_guard", result, "Guard mode is off.", "I could not disable guard mode."))
 
         if _has_any(text, ("center camera", "center the camera", "look straight", "look ahead", "look forward", "face forward", "reset camera")):
             result = self._post_json(f"{self.scout_url}/pantilt", {"center": True})
-            return _action_response("control_camera", result, "Centering camera.", "I could not center the camera.")
+            return self._compose_action_result(message, state, _action_response("control_camera", result, "Centering camera.", "I could not center the camera."))
 
         if _has_any(text, ("look left", "pan left", "turn camera left")):
             result = self._post_json(f"{self.scout_url}/pantilt", {"pan": -60, "tilt": 0})
-            return _action_response("control_camera", result, "Looking left.", "I could not move the camera left.")
+            return self._compose_action_result(message, state, _action_response("control_camera", result, "Looking left.", "I could not move the camera left."))
 
         if _has_any(text, ("look right", "pan right", "turn camera right")):
             result = self._post_json(f"{self.scout_url}/pantilt", {"pan": 60, "tilt": 0})
-            return _action_response("control_camera", result, "Looking right.", "I could not move the camera right.")
+            return self._compose_action_result(message, state, _action_response("control_camera", result, "Looking right.", "I could not move the camera right."))
 
         if _has_any(text, ("look up", "tilt up", "look higher")):
             result = self._post_json(f"{self.scout_url}/pantilt", {"pan": 0, "tilt": 40})
-            return _action_response("control_camera", result, "Looking up.", "I could not move the camera up.")
+            return self._compose_action_result(message, state, _action_response("control_camera", result, "Looking up.", "I could not move the camera up."))
 
         if _has_any(text, ("look down", "tilt down", "look lower")):
             result = self._post_json(f"{self.scout_url}/pantilt", {"pan": 0, "tilt": -40})
-            return _action_response("control_camera", result, "Looking down.", "I could not move the camera down.")
+            return self._compose_action_result(message, state, _action_response("control_camera", result, "Looking down.", "I could not move the camera down."))
 
         if _has_any(text, ("turn on the light", "light on", "lamp on")):
             result = self._post_json(f"{self.scout_url}/settings", {"camera_light_enabled": True})
-            return _action_response("control_light", result, "The camera light is on.", "I could not turn the light on.")
+            return self._compose_action_result(message, state, _action_response("control_light", result, "The camera light is on.", "I could not turn the light on."))
 
         if _has_any(text, ("turn off the light", "light off", "lamp off")):
             result = self._post_json(f"{self.scout_url}/settings", {"camera_light_enabled": False})
-            return _action_response("control_light", result, "The camera light is off.", "I could not turn the light off.")
+            return self._compose_action_result(message, state, _action_response("control_light", result, "The camera light is off.", "I could not turn the light off."))
 
         brightness = _extract_light_brightness(text)
         if brightness is not None:
             result = self._post_json(f"{self.scout_url}/settings", {"camera_light_brightness": brightness})
-            return _action_response("control_light", result, f"Light brightness is set to {brightness}.", "I could not set the light brightness.")
+            return self._compose_action_result(message, state, _action_response("control_light", result, f"Light brightness is set to {brightness}.", "I could not set the light brightness."))
 
         if _has_any(text, ("take a picture", "take a photo", "save a snapshot", "snapshot")):
-            return self.capture_snapshot()
+            return self._compose_action_result(message, state, self.capture_snapshot())
 
         if _has_any(text, ("record a clip", "save a clip", "video clip", "record video", "record a video", "take a video")):
-            return self.capture_clip()
+            return self._compose_action_result(message, state, self.capture_clip())
 
         return None
+
+    def _compose_action_result(self, user_message: str, state: dict, result: dict) -> dict:
+        fallback = str(result.get("message") or result.get("error") or "Done.").strip()
+        result = dict(result)
+        result["message"] = self._compose_response(
+            "scout_action",
+            user_message,
+            state,
+            {"deterministic_answer": fallback, "action_result": result},
+            fallback,
+            options={"num_predict": 60, "temperature": 0.65, "top_p": 0.9},
+        )
+        result["tts"] = result["message"]
+        return result
 
     def capture_snapshot(self):
         snapshot = self._get_bytes(f"{self.scout_url}/snapshot")

@@ -141,20 +141,23 @@ class CapabilityCommandsTest(unittest.TestCase):
     def test_presence_show_updates_uses_vault_capability_not_scout_routing(self) -> None:
         result = fake_runtime().handle_presence("show updates", node_id="scout", presence_context={})
 
-        self.assertEqual(result["message"], "No unread updates.")
+        self.assertIn("No unread updates.", result["message"])
+        self.assertTrue(result["message"].startswith("Fallback response:"))
         self.assertEqual(result["node_id"], "scout")
 
     def test_presence_exact_capability_name_runs_system_capability(self) -> None:
         result = fake_runtime().handle_presence("memory usage", node_id="scout", presence_context={})
 
-        self.assertEqual(result["message"], "Mem: 1G used")
+        self.assertIn("Mem: 1G used", result["message"])
+        self.assertTrue(result["message"].startswith("Fallback response:"))
         self.assertTrue(result["deterministic"])
         self.assertEqual(result["deterministic_source"], "capability:memory_usage")
 
     def test_presence_installed_command_agent_runs_before_scout_routing(self) -> None:
         result = fake_runtime().handle_presence("ping smoke", node_id="scout", presence_context={})
 
-        self.assertEqual(result["message"], "pong")
+        self.assertIn("pong", result["message"])
+        self.assertTrue(result["message"].startswith("Fallback response:"))
         self.assertEqual(result["deterministic_source"], "installed_capability_command")
 
     def test_presence_skill_name_routes_deterministically(self) -> None:
