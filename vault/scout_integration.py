@@ -2899,7 +2899,8 @@ Response context:
                 timeout=60,
             )
             if response.status_code == 200:
-                return {"ok": True, "answer": response.json().get("response", "").strip()}
+                answer = _sanitize_generated_response(response.json().get("response", "")).strip()
+                return {"ok": True, "answer": answer}
             return {"ok": False, "error": response.text}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -3342,6 +3343,9 @@ def _fast_route_message(message: str) -> dict | None:
         return _self_route("software", "asks node ownership boundary")
     if _asks_why_here(text):
         return _self_route("goals", "asks assistant purpose")
+    self_topic = _self_topic_from_text(text)
+    if self_topic is not None:
+        return _self_route(self_topic, f"asks assistant {self_topic}")
     if text.startswith("tell me ") or text.startswith("say "):
         return {
             "ok": True,
@@ -3351,6 +3355,28 @@ def _fast_route_message(message: str) -> dict | None:
             "attempts": 0,
             "deterministic": True,
         }
+    return None
+
+
+def _self_topic_from_text(text: str) -> str | None:
+    """Map messages that mention an assistant-self pronoun plus a topic keyword
+    to a specific self_question sub-route. Returns None if no clear match.
+
+    This catches phrasings the router LLM has been getting wrong, e.g.
+    "tell me about your hardware" routing as general_question and the chat
+    model then hallucinating fake specs.
+    """
+    has_self_pronoun = bool(
+        re.search(r"\b(your|yours|yourself|youre|you have|you got|you running|you using|you on)\b", text)
+    )
+    if not has_self_pronoun:
+        return None
+    if re.search(r"\b(hardware|hardware stack|gpu|cpu|ram|chassis|motor|motors|camera body|rover body|raspberry pi|hailo)\b", text):
+        return "hardware"
+    if re.search(r"\b(sensor|sensors|imu|accelerometer|gyro|gyroscope|magnetometer)\b", text):
+        return "sensors"
+    if re.search(r"\b(software|architecture|api|apis|model|models|inference|service|services|stack|routing|ollama|brain code)\b", text):
+        return "software"
     return None
 
 
@@ -3822,6 +3848,8 @@ def _sounds_like_customer_service(text: str):
         "need any help",
         "let me know if you need anything",
         "let me know if you have any other questions",
+        "let me know how i can help",
+        "let me know how i can assist",
         "feel free to ask",
         "happy to help",
         "glad to help",
@@ -3829,6 +3857,21 @@ def _sounds_like_customer_service(text: str):
         "thanks for asking",
         "whenever you need",
         "ready to roll out",
+        "i am here to help",
+        "i'm here to help",
+        "im here to help",
+        "i am here to assist",
+        "i'm here to assist",
+        "im here to assist",
+        "here to help you with",
+        "here to assist you with",
+        "would you like to talk about it",
+        "would you like me to",
+        "let's find a way forward",
+        "let's make this conversation",
+        "let us know how",
+        "your ai companion",
+        "your assistant",
     )
     return any(phrase in lowered for phrase in banned)
 
@@ -3876,13 +3919,17 @@ def _sanitize_generated_response(text: str):
         r"\s*(?:How can I assist(?: you)?(?: today| with that)?\??)\s*$",
         r"\s*(?:How can I help(?: you)?(?: today| with that)?\??)\s*$",
         r"\s*(?:Let me know if you (?:need anything|have any other questions)[.!]?)\s*$",
+        r"\s*(?:Let me know how I can (?:help|assist)(?: you)?[.!]?)\s*$",
         r"\s*(?:Feel free to ask[.!]?)\s*$",
         r"\s*(?:Happy to help[.!]?)\s*$",
         r"\s*(?:Thanks for asking[.!]?)\s*",
         r"\s*(?:Thank you for asking[.!]?)\s*",
         r"\s*(?:Still ready to .+)$",
         r"\s*(?:I'?m here to be (?:a )?helpful .+)$",
-        r"\s*(?:I'?m here to help.+)$",
+        r"\s*(?:I'?m here to (?:help|assist)(?: you)?(?: with .+)?[.!]?)\s*$",
+        r"\s*(?:I am here to (?:help|assist)(?: you)?(?: with .+)?[.!]?)\s*$",
+        r"\s*(?:Would you like (?:to|me to) .+\??)\s*$",
+        r"\s*(?:Let'?s (?:find|make|work) .+)$",
         r"\s*(?:I (?:can be|am|'m) (?:sarcastic|witty|dry|funny|condescending|rude).+)$",
     )
     for pattern in customer_service_patterns:
