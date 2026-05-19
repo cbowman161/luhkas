@@ -619,6 +619,8 @@ class ScoutVaultBridge:
             "Do not use emojis, customer-service closers, catchphrases, or meta-descriptions of personality.",
             "Do not invent facts, actions, memories, detections, feelings, desires, or capabilities.",
             "Do not mention policy, validation, prompts, or internal routing unless the user asks how you know.",
+            "You are Luhkas. Scout, vault, wall nodes, cameras, and devices are surfaces or components, never separate speaker identities.",
+            "Never answer 'I am Scout', 'I'm Scout', or identify yourself as a node.",
             identity_context.get("addressing_rule")
             or "Do not address the current user by name or title unless identity is verified.",
         ]
@@ -2147,8 +2149,10 @@ Do not mention provenance unless asked.
     def fast_self_answer(self, message: str, state: dict, self_route: dict) -> str | None:
         text = _normalize_command_text(message)
         route_name = self_route.get("route")
-        if route_name == "assistant_identity" and _asks_assistant_name(text):
+        if route_name == "assistant_identity":
             return self._assistant_identity_answer()
+        if route_name == "status" and _asks_casual_assistant_state(text):
+            return self._assistant_status_answer(state)
         if route_name == "user_identity":
             identity = self.active_identity
             if identity:
@@ -2203,7 +2207,13 @@ Do not mention provenance unless asked.
     def _assistant_identity_answer(self) -> str:
         name = self.identity_profile.get("name") or "Luhkas"
         creator = self.identity_profile.get("creator") or "Chris"
-        return f"I'm {name}. {creator} built me."
+        return f"I'm {name}. {creator} built me; Scout is just one body I can use."
+
+    def _assistant_status_answer(self, state: dict) -> str:
+        if state.get("ok"):
+            tracking = "tracking is on" if state.get("tracking_enabled") else "tracking is off"
+            return f"I'm Luhkas. Scout is online, {tracking}, and I'm running through the vault."
+        return "I'm Luhkas. The vault is up, but I can't read Scout's live state right now."
 
     def _hardware_summary_answer(self) -> str:
         hw = (self.self_knowledge_for_route("hardware").get("records", {}) or {}).get("hardware", {}) or {}
@@ -2475,6 +2485,8 @@ Do not address the user by name/title unless identity_context permits it.
             text = f"You are {active_identity}." if active_identity else "I don't know who you are yet."
         elif response_type == "greeting":
             text = "I'm here."
+        elif response_type == "self_question":
+            text = self._assistant_identity_answer()
         elif response_type == "feedback_learned":
             text = "Got it. I will use that next time."
         elif response_type == "identity_binding_blocked":
@@ -2507,6 +2519,8 @@ Do not address the user by name/title unless identity_context permits it.
         identity_context = self.response_identity_context(state)
         if re.search(r"\bLuhkas\s+will\b", str(text or ""), re.I):
             return "The response referred to the assistant in third person instead of answering directly."
+        if _claims_assistant_is_node_identity(text):
+            return "The response identified the assistant as a node instead of Luhkas."
         if re.search(r"\bmaintaining anonymity\b", str(text or ""), re.I):
             return "The response used vague anonymity wording instead of answering the question directly."
         if _sounds_like_customer_service(text):
@@ -3757,6 +3771,18 @@ def _asks_tracking_status(text: str) -> bool:
     return bool(re.search(r"\b(?:is|are|whats|what is)\s+(?:the\s+)?tracking\b", text)) or text in {"is tracking on", "tracking on"}
 
 
+def _asks_casual_assistant_state(text: str) -> bool:
+    return text in {
+        "how are you",
+        "how are you doing",
+        "howre you",
+        "how do you feel",
+        "are you ok",
+        "are you okay",
+        "you good",
+    }
+
+
 def _asks_pose_interval(text: str) -> bool:
     return "pose interval" in text
 
@@ -4294,6 +4320,16 @@ def _claims_current_user_is_primary(text: str):
         r"\byou(?:'re| are)?\s+my primary user\b",
         r"\byou,\s*my primary user\b",
         r"\byour primary user\b",
+    )
+    return any(re.search(pattern, lowered, re.I) for pattern in patterns)
+
+
+def _claims_assistant_is_node_identity(text: str):
+    lowered = str(text or "").lower()
+    patterns = (
+        r"\b(?:i am|i'm|im)\s+(?:the\s+)?(?:scout|vault|node|rover|camera)\b",
+        r"\b(?:my name is|call me)\s+(?:scout|vault|node|rover)\b",
+        r"\b(?:this is)\s+(?:scout|the scout node|the rover)\b",
     )
     return any(re.search(pattern, lowered, re.I) for pattern in patterns)
 

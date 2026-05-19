@@ -113,6 +113,20 @@ class PresenceContextTest(unittest.TestCase):
         self.assertEqual(voice_band(0.9), "high")
         self.assertEqual(voice_band(None), "unknown")
 
+    def test_node_identity_claims_are_rejected(self) -> None:
+        claims_assistant_is_node_identity = load_function("_claims_assistant_is_node_identity")
+
+        self.assertTrue(claims_assistant_is_node_identity("I am scout, active and ready."))
+        self.assertTrue(claims_assistant_is_node_identity("I'm the scout node."))
+        self.assertFalse(claims_assistant_is_node_identity("I'm Luhkas. Scout is one body I can use."))
+
+    def test_casual_assistant_state_is_detected(self) -> None:
+        asks_casual_assistant_state = load_function("_asks_casual_assistant_state")
+
+        self.assertTrue(asks_casual_assistant_state("how are you"))
+        self.assertTrue(asks_casual_assistant_state("are you okay"))
+        self.assertFalse(asks_casual_assistant_state("is tracking on"))
+
     def test_foreign_character_guard_exists_for_response_policy(self) -> None:
         has_excessive_foreign_chars = load_function("_has_excessive_foreign_chars")
 
