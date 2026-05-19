@@ -46,6 +46,11 @@ def _is_affirmative(text: str) -> bool:
     }
 
 
+def _is_plain_confirmation_denial(text: str) -> bool:
+    t = re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
+    return t in {"no", "nope", "nah", "negative", "not right", "wrong"}
+
+
 def _extract_correction(text: str) -> str | None:
     """Extract the corrected intent from denial phrases like 'No I meant X'."""
     t = text.lower().strip()
@@ -143,6 +148,77 @@ def _presence_conversation_context(presence_context: dict | None) -> dict:
         if full_chat:
             result["chat_context"] = full_chat
     return result
+
+
+def _conversation_user_turns(presence_context: dict | None, current_message: str | None = None) -> list[str]:
+    context = _presence_conversation_context(presence_context).get("chat_context") or []
+    turns = [
+        str(entry.get("text") or "").strip()
+        for entry in context
+        if entry.get("role") == "user" and str(entry.get("text") or "").strip()
+    ]
+    current = str(current_message or "").strip()
+    if current and turns and turns[-1] == current:
+        turns = turns[:-1]
+    return turns
+
+
+def _extract_context_phrase(text: str) -> tuple[str, str] | None:
+    cleaned = str(text or "").strip()
+    patterns = (
+        r"\b(?P<label>marker\s+word|test\s+phrase|test\s+word|code\s+word|marker|phrase|token)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
+        r"\bremember\s+(?:the\s+)?(?P<label>marker\s+word|test\s+phrase|test\s+word|code\s+word|marker|phrase|token)\s+(?:is|equals|as)\s+(?P<value>[^.?!]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            label = re.sub(r"\s+", " ", match.group("label").lower()).strip()
+            value = match.group("value").strip(" \"'")
+            if value:
+                return label, value
+    return None
+
+
+def _conversation_setup_answer(message: str) -> str | None:
+    phrase = _extract_context_phrase(message)
+    if not phrase:
+        return None
+    label, value = phrase
+    return f"Got it. The {label} is {value}."
+
+
+def _recent_conversation_answer(message: str, presence_context: dict | None) -> str | None:
+    text = _canonical_intent_text(message)
+    user_turns = _conversation_user_turns(presence_context, message)
+    if not user_turns:
+        return "I don't have earlier chat context for that in this session."
+
+    if (
+        re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|phrase|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
+        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker\s+word|test\s+phrase|test\s+word|marker|phrase|word)\b", text)
+    ):
+        for turn in reversed(user_turns):
+            phrase = _extract_context_phrase(turn)
+            if phrase:
+                label, value = phrase
+                return f"The {label} was {value}."
+        return "I don't see a marker word or test phrase in the recent chat context."
+
+    if re.search(r"\bwhat\s+did\s+i\s+(ask|say|tell)\s+immediately\s+before\s+this\b", text):
+        return f"You said: {user_turns[-1]}"
+
+    if re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell)\b", text):
+        return f"You said: {user_turns[-1]}"
+
+    if "why that word" in text:
+        for turn in reversed(user_turns):
+            phrase = _extract_context_phrase(turn)
+            if phrase:
+                label, value = phrase
+                return f"You used {value} as the {label}; I don't know a deeper reason unless you give me one."
+        return "I don't have enough recent context to know which word you mean."
+
+    return None
 
 
 SELF_ROUTE_OPTIONS = {
@@ -1093,7 +1169,12 @@ class ScoutVaultBridge:
         # Pending-confirmation flow: previous turn was waiting for yes/no on a route
         if self.turns:
             pending = self.turns[-1].get("pending_confirmation")
-            if pending is not None:
+            if pending is not None and (
+                _is_affirmative(message)
+                or _extract_correction(message)
+                or _presence_correction(presence_context)
+                or _is_plain_confirmation_denial(message)
+            ):
                 return self._handle_confirmation(message, pending, state, source, presence_context=presence_context)
 
         confirmed_message = _presence_confirmation(presence_context)
@@ -1153,6 +1234,29 @@ class ScoutVaultBridge:
                     self.turns.append(turn)
                     self.turns = self.turns[-30:]
                     return {"ok": True, **turn}
+
+        recent_answer = _recent_conversation_answer(message, presence_context)
+        if recent_answer is not None:
+            route = {
+                "ok": True,
+                "route": "general_question",
+                "confidence": 1.0,
+                "reason": "answers from recent chat context",
+                "attempts": 0,
+                "deterministic": True,
+            }
+            turn = {
+                "message": message,
+                "source": source,
+                "route": route,
+                "response": recent_answer,
+                "active_identity": self.active_identity,
+                "actions": actions,
+                "answer_provenance": self.build_answer_provenance(message, route, state),
+            }
+            self.turns.append(turn)
+            self.turns = self.turns[-30:]
+            return {"ok": True, **turn}
 
         feedback = self.classify_response_feedback(message)
         if feedback.get("ok") and feedback.get("is_feedback"):
@@ -1303,6 +1407,10 @@ class ScoutVaultBridge:
                  "identity_was_saved": False},
                 max_tokens=120,
             )
+
+        setup_answer = _conversation_setup_answer(message)
+        if setup_answer is not None and route.get("route") in {"general_question", "direction"}:
+            return setup_answer
 
         if route["route"] == "direction":
             if _looks_like_scout_action(message):
@@ -3645,17 +3753,22 @@ def _is_conversation_context_setup(text: str) -> bool:
     return bool(
         re.search(r"\b(test|marker|token|code word|password|phrase)\b", text)
         and re.search(r"\b(is|equals|was|remember)\b", text)
-        and re.search(r"\breply\s+with\b", text)
+        and (
+            re.search(r"\breply\s+with\b", text)
+            or _extract_context_phrase(text) is not None
+        )
     )
 
 
 def _asks_recent_conversation(text: str) -> bool:
     return bool(
-        re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell)\b", text)
-        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|word|phrase|thing|request)\b", text)
+        re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell|give)\b", text)
+        or re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|phrase|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
+        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|marker\s+word|test\s+phrase|test\s+word|word|phrase|thing|request)\b", text)
+        or re.search(r"\bwhat\s+did\s+i\s+(ask|say|tell)\s+immediately\s+before\s+this\b", text)
         or re.search(r"\b(what|which)\s+(was|were)\s+my\s+(last|previous)\s+(message|question|request)\b", text)
         or re.search(r"\bwhat\s+did\s+you\s+just\s+(say|tell\s+me|ask)\b", text)
-        or re.search(r"\bwhy\s+(not|did\s+you\s+say\s+that)\b", text)
+        or re.search(r"\bwhy\s+(not|that\s+word|did\s+you\s+say\s+that)\b", text)
     )
 
 
@@ -3978,10 +4091,10 @@ def _compact_scout_state(state: dict) -> dict:
 
 def _scout_state_explanation(state: dict) -> str:
     if not state.get("ok"):
-        return "Scout state is unavailable from the rover."
+        return "I can't read Scout's live body state right now."
     behavior = (state.get("behavior") or {}).get("state") or "unknown"
     target_state = state.get("target_state") or "none"
-    parts = [f"Scout is {behavior.lower()} with target state {target_state}."]
+    parts = [f"I'm using Scout in {behavior.lower()} mode with target state {target_state}."]
     if not state.get("tracking_enabled"):
         parts.append("Tracking is off.")
     if state.get("collision_blocked"):
