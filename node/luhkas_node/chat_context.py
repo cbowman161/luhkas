@@ -10,8 +10,9 @@ except Exception:
 
 
 def build_presence_payload(message: str, entries: list[dict], node_id: str) -> dict:
-    context = _recent_context(entries)
+    context = _chat_context(entries)
     clarification = _clarification(message, context)
+    reply_context = _reply_context(message, context)
     routing_intent = classify_request_target(message, node_id)
     payload = {
         "message": message,
@@ -33,12 +34,15 @@ def build_presence_payload(message: str, entries: list[dict], node_id: str) -> d
         payload["clarification"] = True
         payload["clarified_request"] = clarification["clarified_request"]
         payload["routing_feedback"] = clarification
+    if reply_context:
+        payload["reply_context"] = reply_context
+        payload["conversation_continuity"] = True
     return payload
 
 
-def _recent_context(entries: list[dict], limit: int = 8) -> list[dict]:
+def _chat_context(entries: list[dict]) -> list[dict]:
     result = []
-    for entry in entries[-limit:]:
+    for entry in entries:
         role = entry.get("role")
         text = entry.get("text")
         source = entry.get("source")
@@ -53,7 +57,9 @@ def _recent_context(entries: list[dict], limit: int = 8) -> list[dict]:
 
 
 def _clarification(message: str, context: list[dict]) -> dict | None:
-    if not _looks_like_correction(message):
+    correction = _looks_like_correction(message)
+    confirmation = _looks_like_confirmation(message)
+    if not correction and not confirmation:
         return None
     previous_assistant = None
     previous_user = None
@@ -68,6 +74,14 @@ def _clarification(message: str, context: list[dict]) -> dict | None:
         return None
     if not _looks_like_interpretation(previous_assistant):
         return None
+    if confirmation:
+        return {
+            "type": "route_confirmation",
+            "previous_user_message": previous_user,
+            "assistant_interpretation": previous_assistant,
+            "user_confirmation": message,
+            "clarified_request": previous_user,
+        }
     return {
         "type": "route_correction",
         "previous_user_message": previous_user,
@@ -91,6 +105,74 @@ def _looks_like_correction(message: str) -> bool:
         or text.startswith("that's not ")
         or text.startswith("that is not ")
     )
+
+
+def _reply_context(message: str, context: list[dict]) -> dict | None:
+    if not _looks_like_contextual_reply(message):
+        return None
+    previous_assistant = None
+    previous_user = None
+    for entry in reversed(context[:-1]):
+        if previous_assistant is None and entry.get("role") == "assistant":
+            previous_assistant = str(entry.get("text") or "")
+            continue
+        if previous_assistant is not None and entry.get("role") == "user":
+            previous_user = str(entry.get("text") or "")
+            break
+    if not previous_assistant:
+        return None
+    return {
+        "type": "reply_to_previous_assistant",
+        "current_user_message": message,
+        "previous_user_message": previous_user,
+        "previous_assistant_message": previous_assistant,
+    }
+
+
+def _looks_like_confirmation(message: str) -> bool:
+    text = " ".join(str(message).casefold().split())
+    return text in {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "correct",
+        "right",
+        "sure",
+        "ok",
+        "okay",
+        "sounds right",
+        "that's right",
+        "that is right",
+        "exactly",
+    }
+
+
+def _looks_like_contextual_reply(message: str) -> bool:
+    text = " ".join(str(message).casefold().split())
+    if not text:
+        return False
+    if _looks_like_confirmation(text) or _looks_like_correction(text):
+        return True
+    if len(text.split()) <= 5 and (
+        text.startswith("why")
+        or text.startswith("how")
+        or text.startswith("what do you mean")
+        or text in {"what?", "why?", "how?", "which one", "that one", "do it"}
+    ):
+        return True
+    references_previous = {
+        "that",
+        "this",
+        "it",
+        "they",
+        "them",
+        "those",
+        "one",
+        "not",
+    }
+    words = set(text.replace("?", "").replace(".", "").split())
+    return len(words) <= 8 and bool(words & references_previous)
 
 
 def _looks_like_interpretation(message: str) -> bool:

@@ -11,24 +11,44 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 
 # Runtime data
 *.db
 *.db-wal
 *.db-shm
 *.log
+*.log.*
 *.tmp
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 captures/
 config/unknown_faces/
 config/vault_faces/
 config/faces/
 config/people/
 data/deterministic_commands.json
+hailort*.log
 
 # Generated / task data
 vault/code_monkey_data/
+vault/logs/
+vault/projects/
+vault/vault_v2.db
+vault/data/nodes_registered.json
 vault/data/unknown_face_groups/
+vault/data/face_references/
+vault/data/people/
+vault/data/self/mood.json
+vault/data/self/style_state.json
 vault/.claude/
+node/captures/
+node/config/telemetry.db
+node/config/unknown_faces/
+node/config/vault_faces/
+node/luhkas_node/data/deterministic_commands.json
 
 # Stray files
 node/ystemctl*

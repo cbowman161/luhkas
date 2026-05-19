@@ -114,7 +114,7 @@ IDENTITY_PROMPT_COMPLETE_GRACE_SECONDS = float(os.environ.get("SCOUT_IDENTITY_PR
 gamepad_runtime: GamepadRuntime | None = None
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CAPTURE_DIR = Path(os.environ.get("SCOUT_CAPTURE_DIR", str(PROJECT_ROOT / "captures"))).expanduser()
-CHAT_LOG_MAX = int(os.environ.get("SCOUT_CHAT_LOG_MAX", "200"))
+CHAT_LOG_MAX = int(os.environ.get("SCOUT_CHAT_LOG_MAX", "0"))
 CHAT_LOG_PATH = Path(os.environ.get("SCOUT_CHAT_LOG_PATH", str(CAPTURE_DIR / "chat_session.jsonl"))).expanduser()
 if not CHAT_LOG_PATH.is_absolute():
     CHAT_LOG_PATH = PROJECT_ROOT / CHAT_LOG_PATH
@@ -952,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
         try:
             import requests as _requests
-            vault_payload = build_presence_payload(message, _chat_log_snapshot(12), "scout")
+            vault_payload = build_presence_payload(message, _chat_log_snapshot(), "scout")
             resp = _requests.post(
                 f"{_VAULT_CHAT_URL}/presence/message",
                 json=vault_payload,

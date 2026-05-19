@@ -1,0 +1,8 @@
+requests>=2.31
+numpy>=1.24
+opencv-python<=4.10.0.84
+pyserial>=3.5
+inputs>=0.5
+
+# Hailo Apps is installed separately on Scout at ~/hailo-apps and activated by
+# scripts/start_vision.sh and scripts/start_robot_api.sh.

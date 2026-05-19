@@ -15,6 +15,7 @@ import requests
 
 from config import DATA_DIR, FACE_REFERENCES_DIR, OLLAMA_VISION_MODEL, PEOPLE_DIR, ROOT_DIR, SCOUT_ROBOT_URL, SCOUT_URL
 from models import get_model, model_manifest
+from mood_engine import MoodEngine
 
 try:
     from luhkas_node.wakeword import WAKEWORD_RESPONSE
@@ -87,10 +88,22 @@ def _presence_correction(presence_context: dict | None) -> str | None:
         return None
     feedback = presence_context.get("routing_feedback")
     if isinstance(feedback, dict):
+        if feedback.get("type") == "route_confirmation":
+            return None
         correction = str(feedback.get("user_correction") or "").strip()
         if correction:
             return _extract_correction(correction) or correction
     return None
+
+
+def _presence_confirmation(presence_context: dict | None) -> str | None:
+    if not isinstance(presence_context, dict):
+        return None
+    feedback = presence_context.get("routing_feedback")
+    if not isinstance(feedback, dict) or feedback.get("type") != "route_confirmation":
+        return None
+    previous = str(feedback.get("previous_user_message") or "").strip()
+    return previous or None
 
 
 def _corrected_route_input(original_message: str, correction: str, presence_context: dict | None = None) -> str:
@@ -99,6 +112,37 @@ def _corrected_route_input(original_message: str, correction: str, presence_cont
         if clarified:
             return clarified
     return f"{original_message}\nCorrection from user: {correction}"
+
+
+def _presence_conversation_context(presence_context: dict | None) -> dict:
+    if not isinstance(presence_context, dict):
+        return {}
+    result = {}
+    reply_context = presence_context.get("reply_context")
+    if isinstance(reply_context, dict):
+        result["reply_context"] = {
+            key: reply_context.get(key)
+            for key in (
+                "type",
+                "current_user_message",
+                "previous_user_message",
+                "previous_assistant_message",
+            )
+            if reply_context.get(key)
+        }
+    chat_context = presence_context.get("chat_context")
+    if isinstance(chat_context, list):
+        full_chat = []
+        for entry in chat_context:
+            if not isinstance(entry, dict):
+                continue
+            role = entry.get("role")
+            text = str(entry.get("text") or "").strip()
+            if role in {"user", "assistant", "error"} and text:
+                full_chat.append({"role": role, "text": text})
+        if full_chat:
+            result["chat_context"] = full_chat
+    return result
 
 
 SELF_ROUTE_OPTIONS = {
@@ -148,6 +192,8 @@ class ScoutVaultBridge:
         self.self_dir.mkdir(parents=True, exist_ok=True)
         self.identity_profile = self._load_identity_profile()
         self._ensure_self_records()
+        self.mood_engine = MoodEngine(self.self_dir)
+        self.mood_engine.import_legacy_response_settings(self.response_settings())
         self.active_identity = None
         self.turns = []
         # Per-node session store — keyed by node_id
@@ -223,7 +269,7 @@ class ScoutVaultBridge:
         }
         route_map = {
             "assistant_identity": ["identity"],
-            "personality": ["personality"],
+            "personality": ["personality", "mood", "style_state"],
             "hardware": ["hardware"],
             "software": ["software"],
             "status": ["status", "software"],
@@ -526,10 +572,12 @@ class ScoutVaultBridge:
         return {"ok": True, "path": str(path), "settings": settings}
 
     def response_context(self, state: dict | None = None):
+        identity_context = self.response_identity_context(state or {})
         return {
             "response_lessons": self.response_lessons(),
             "response_settings": self.response_settings(),
-            "identity_context": self.response_identity_context(state or {}),
+            "identity_context": identity_context,
+            "voice_state": self.mood_engine.voice_state(identity_context),
         }
 
     def chat_options(self, base: dict | None = None):
@@ -574,29 +622,14 @@ class ScoutVaultBridge:
             identity_context.get("addressing_rule")
             or "Do not address the current user by name or title unless identity is verified.",
         ]
-        directive_block = self._behavior_directive_block()
+        directive_block = self._behavior_directive_block(identity_context)
         if directive_block:
             lines.append(directive_block)
         return "\n".join(lines)
 
-    def _behavior_directive_block(self) -> str:
-        """Surface the most recent user behavior directives so the chat model
-        actually applies them, instead of just persisting them to disk."""
-        overrides = (self.response_settings().get("behavior") or {}).get("overrides") or []
-        recent = [
-            str(o.get("preference") or "").strip()
-            for o in overrides[-5:]
-            if isinstance(o, dict) and o.get("preference")
-        ]
-        recent = [p for p in recent if p]
-        if not recent:
-            return ""
-        bullets = "\n".join(f"  - {p}" for p in recent)
-        return (
-            "Voice notes from the user (latest last). These shape HOW you "
-            "speak this turn; do not quote, mention, or echo them in the "
-            "reply itself. Embody them silently:\n" + bullets
-        )
+    def _behavior_directive_block(self, identity_context: dict) -> str:
+        """Inject resolved voice state, not raw and possibly contradictory notes."""
+        return "\n".join(self.mood_engine.voice_contract_lines(identity_context))
 
     def record_response_lesson(self, lesson: dict):
         lessons = self.response_lessons()
@@ -616,6 +649,9 @@ class ScoutVaultBridge:
         entry.setdefault("created_at", time.time())
         overrides.append(entry)
         behavior["overrides"] = overrides[-100:]
+        style_state = self.mood_engine.apply_style_update(entry)
+        behavior["resolved"] = style_state.get("resolved", {})
+        behavior["style_state_path"] = str(self.mood_engine.style_path)
         return self.write_response_settings(settings)
 
     def record_temperature_update(self, temperature):
@@ -900,6 +936,11 @@ class ScoutVaultBridge:
                         presence_context=presence_context,
                     )
                     self._ensure_result_provenance(result, message)
+                    identity_context = self.response_identity_context({"ok": True})
+                    self.mood_engine.record_interaction(
+                        result or {},
+                        identity_verified=bool(identity_context.get("may_address_primary_user")),
+                    )
             finally:
                 # Save context back
                 session.active_identity = self.active_identity
@@ -1053,6 +1094,64 @@ class ScoutVaultBridge:
             if pending is not None:
                 return self._handle_confirmation(message, pending, state, source, presence_context=presence_context)
 
+        confirmed_message = _presence_confirmation(presence_context)
+        if confirmed_message:
+            confirmed_route = self.route_message(confirmed_message, state)
+            confirmed_route.update(_presence_route_context(presence_context))
+            if confirmed_route.get("ok"):
+                response = self._dispatch_route(
+                    confirmed_message,
+                    confirmed_route,
+                    state,
+                    actions,
+                    source=source,
+                    presence_context=presence_context,
+                )
+                turn = {
+                    "message": message,
+                    "source": source,
+                    "route": confirmed_route,
+                    "response": response,
+                    "active_identity": self.active_identity,
+                    "actions": actions,
+                    "routing_feedback": presence_context.get("routing_feedback") if isinstance(presence_context, dict) else None,
+                    "answer_provenance": self.build_answer_provenance(confirmed_message, confirmed_route, state),
+                }
+                self.turns.append(turn)
+                self.turns = self.turns[-30:]
+                return {"ok": True, **turn}
+
+        correction = _presence_correction(presence_context)
+        if correction and isinstance(presence_context, dict):
+            feedback_context = presence_context.get("routing_feedback")
+            if isinstance(feedback_context, dict):
+                original_message = str(feedback_context.get("previous_user_message") or "").strip() or message
+                corrected_input = _corrected_route_input(original_message, correction, presence_context)
+                corrected_route = self.route_message(corrected_input, state)
+                corrected_route.update(_presence_route_context(presence_context))
+                if corrected_route.get("ok"):
+                    response = self._dispatch_route(
+                        original_message,
+                        corrected_route,
+                        state,
+                        actions,
+                        source=source,
+                        presence_context=presence_context,
+                    )
+                    turn = {
+                        "message": message,
+                        "source": source,
+                        "route": corrected_route,
+                        "response": response,
+                        "active_identity": self.active_identity,
+                        "actions": actions,
+                        "routing_feedback": feedback_context,
+                        "answer_provenance": self.build_answer_provenance(original_message, corrected_route, state),
+                    }
+                    self.turns.append(turn)
+                    self.turns = self.turns[-30:]
+                    return {"ok": True, **turn}
+
         feedback = self.classify_response_feedback(message)
         if feedback.get("ok") and feedback.get("is_feedback"):
             feedback_kind = feedback.get("kind", "response_lesson")
@@ -1136,7 +1235,7 @@ class ScoutVaultBridge:
             self.turns = self.turns[-30:]
             return {"ok": True, **turn}
 
-        response = self._dispatch_route(message, route, state, actions, source=source)
+        response = self._dispatch_route(message, route, state, actions, source=source, presence_context=presence_context)
         turn = {
             "message": message,
             "source": source,
@@ -1150,7 +1249,15 @@ class ScoutVaultBridge:
         self.turns = self.turns[-30:]
         return {"ok": True, **turn}
 
-    def _dispatch_route(self, message: str, route: dict, state: dict, actions: list, source: str | None = None) -> str:
+    def _dispatch_route(
+        self,
+        message: str,
+        route: dict,
+        state: dict,
+        actions: list,
+        source: str | None = None,
+        presence_context: dict | None = None,
+    ) -> str:
         """Execute the appropriate handler for an already-determined route."""
         if not route.get("ok"):
             return self.generate_response(
@@ -1242,7 +1349,7 @@ class ScoutVaultBridge:
                 max_tokens=120,
             )
 
-        return self.answer_with_context(message, state)
+        return self.answer_with_context(message, state, presence_context=presence_context)
 
     def _handle_confirmation(
         self,
@@ -1261,7 +1368,14 @@ class ScoutVaultBridge:
         if _is_affirmative(message):
             _dr.learn(original_message, inferred_route)
             original_source = pending.get("source") or source
-            response = self._dispatch_route(original_message, inferred_route, state, actions, source=original_source)
+            response = self._dispatch_route(
+                original_message,
+                inferred_route,
+                state,
+                actions,
+                source=original_source,
+                presence_context=presence_context,
+            )
             turn = {
                 "message": message,
                 "source": source,
@@ -1283,7 +1397,14 @@ class ScoutVaultBridge:
             if corrected_route.get("ok"):
                 if isinstance(presence_context, dict) and presence_context.get("clarification"):
                     _dr.learn(original_message, corrected_route)
-                    response = self._dispatch_route(original_message, corrected_route, state, actions, source=source)
+                    response = self._dispatch_route(
+                        original_message,
+                        corrected_route,
+                        state,
+                        actions,
+                        source=source,
+                        presence_context=presence_context,
+                    )
                     turn = {
                         "message": message,
                         "source": source,
@@ -2037,6 +2158,8 @@ Do not mention provenance unless asked.
             return self._registered_skills_answer()
         if route_name == "capabilities" and _asks_capability_inventory(text):
             return self._registered_capabilities_answer()
+        if route_name == "personality":
+            return self._personality_state_answer()
         if route_name == "software" and _asks_stored_knowledge_owner(text):
             return "Stored knowledge belongs to Vault. Scout can witness and forward node state, but Vault owns memory, learning, and retrieval."
         if route_name == "software" and _asks_camera_action_owner(text):
@@ -2060,6 +2183,22 @@ Do not mention provenance unless asked.
         if route_name == "sensors":
             return self._sensors_summary_answer()
         return None
+
+    def _personality_state_answer(self) -> str:
+        identity_context = self.response_identity_context({"ok": True})
+        state = self.mood_engine.voice_state(identity_context)
+        voice = state.get("voice") or {}
+        mood = state.get("mood") or {}
+        style = self.mood_engine.style_state().get("resolved") or {}
+        audience = "verified" if state.get("verified_primary_user") else "unverified"
+        return (
+            "Personality state: "
+            f"audience {audience}; dry wit {_voice_band(voice.get('sarcasm'))}; "
+            f"warmth {_voice_band(voice.get('warmth'))}; brevity {_voice_band(voice.get('brevity'))}; "
+            f"directness {_voice_band(voice.get('directness'))}. "
+            f"Mood: patience {_voice_band(mood.get('patience'))}, irritation {_voice_band(mood.get('irritation'))}; "
+            f"style baseline rudeness {_voice_band(style.get('rudeness'))}, capped for the current audience."
+        )
 
     def _assistant_identity_answer(self) -> str:
         name = self.identity_profile.get("name") or "Luhkas"
@@ -2360,6 +2499,11 @@ Do not address the user by name/title unless identity_context permits it.
     def response_policy_violation(self, text: str, state: dict, response_type: str):
         if _contains_emoji(text):
             return "The response used an emoji, but emojis are not allowed."
+        if _has_excessive_foreign_chars(text):
+            return (
+                "The response contained substantial non-English text. "
+                "Reply in English."
+            )
         identity_context = self.response_identity_context(state)
         if re.search(r"\bLuhkas\s+will\b", str(text or ""), re.I):
             return "The response referred to the assistant in third person instead of answering directly."
@@ -2404,13 +2548,14 @@ Do not address the user by name/title unless identity_context permits it.
                 )
         return None
 
-    def answer_with_context(self, message: str, state: dict):
+    def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
         self_description = _identity_sentence(identity_name, identity_role)
         active_identity_context = self.active_identity if state.get("ok") else "unverified_scout_tracking_unavailable"
         identity_context = self.response_identity_context(state)
         response_context = self.response_context(state)
+        conversation_context = _presence_conversation_context(presence_context)
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -2420,12 +2565,14 @@ Context:
 {json.dumps({
     "identity_context": identity_context,
     "response_lessons": response_context.get("response_lessons", [])[-5:],
+    "conversation_context": conversation_context,
     "tracking_available": bool(state.get("ok")),
     "active_identity": active_identity_context or "unknown",
     "tracking_memory": state.get("object_memory", [])[:4],
 }, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts.
+If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
 """
@@ -3431,6 +3578,24 @@ def _asks_about_previous_answer_source(message: str) -> bool:
 
 def _fast_route_message(message: str) -> dict | None:
     text = _canonical_intent_text(message)
+    if _is_conversation_context_setup(text):
+        return {
+            "ok": True,
+            "route": "general_question",
+            "confidence": 0.96,
+            "reason": "sets up conversational context",
+            "attempts": 0,
+            "deterministic": True,
+        }
+    if _asks_recent_conversation(text):
+        return {
+            "ok": True,
+            "route": "general_question",
+            "confidence": 0.96,
+            "reason": "asks about recent conversation context",
+            "attempts": 0,
+            "deterministic": True,
+        }
     if _asks_assistant_name(text):
         return _self_route("assistant_identity", "asks assistant name")
     if _asks_assistant_identity_topic(text):
@@ -3462,6 +3627,24 @@ def _fast_route_message(message: str) -> dict | None:
     return None
 
 
+def _is_conversation_context_setup(text: str) -> bool:
+    return bool(
+        re.search(r"\b(test|marker|token|code word|password|phrase)\b", text)
+        and re.search(r"\b(is|equals|was|remember)\b", text)
+        and re.search(r"\breply\s+with\b", text)
+    )
+
+
+def _asks_recent_conversation(text: str) -> bool:
+    return bool(
+        re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell)\b", text)
+        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|word|phrase|thing|request)\b", text)
+        or re.search(r"\b(what|which)\s+(was|were)\s+my\s+(last|previous)\s+(message|question|request)\b", text)
+        or re.search(r"\bwhat\s+did\s+you\s+just\s+(say|tell\s+me|ask)\b", text)
+        or re.search(r"\bwhy\s+(not|did\s+you\s+say\s+that)\b", text)
+    )
+
+
 def _self_topic_from_text(text: str) -> str | None:
     """Map messages that mention an assistant-self pronoun plus a topic keyword
     to a specific self_question sub-route. Returns None if no clear match.
@@ -3479,9 +3662,28 @@ def _self_topic_from_text(text: str) -> str | None:
         return "hardware"
     if re.search(r"\b(sensor|sensors|imu|accelerometer|gyro|gyroscope|magnetometer)\b", text):
         return "sensors"
+    if re.search(r"\b(personality|mood|temperament|tone|voice|style|sarcasm|rudeness|warmth)\b", text):
+        return "personality"
     if re.search(r"\b(software|architecture|api|apis|model|models|inference|service|services|stack|routing|ollama|brain code)\b", text):
         return "software"
     return None
+
+
+def _voice_band(value) -> str:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    value = max(0.0, min(1.0, value))
+    if value < 0.20:
+        return "very low"
+    if value < 0.40:
+        return "low"
+    if value < 0.60:
+        return "medium"
+    if value < 0.80:
+        return "medium-high"
+    return "high"
 
 
 def _self_route(self_route: str, reason: str) -> dict:
@@ -3656,6 +3858,8 @@ def _asks_for_clip(message: str) -> bool:
 
 def _looks_like_scout_action(message: str) -> bool:
     text = _normalize_command_text(message)
+    if _self_topic_from_text(text) == "personality":
+        return False
     if _extract_light_brightness(text) is not None:
         return True
     return _has_any(text, (
@@ -4163,6 +4367,22 @@ def _sanitize_generated_response(text: str):
     for pattern in customer_service_patterns:
         text = re.sub(pattern, "", text, flags=re.I).strip()
     return text
+
+
+def _has_excessive_foreign_chars(text: str) -> bool:
+    text = str(text or "")
+    if not text:
+        return False
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 8:
+        return False
+    non_ascii_letters = [ch for ch in letters if ord(ch) > 127]
+    return (len(non_ascii_letters) / max(1, len(letters))) > 0.25
+
+
+# Backward-compatible alias for a typo seen in a deployed runtime.
+def hasexcessiveforeignchars(text: str) -> bool:
+    return _has_excessive_foreign_chars(text)
 
 
 def _addresses_or_asserts_user_identity(text: str, term: str, response_type: str):
