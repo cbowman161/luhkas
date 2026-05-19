@@ -4122,6 +4122,21 @@ def _sanitize_generated_response(text: str):
     text = _strip_emoji(text).strip()
     if not text:
         return text
+    # Strip chat-template tokens that occasionally leak from qwen3 at sampling
+    text = re.sub(r"<\|[^|>]+\|>\s*", "", text)
+    # Strip a leading word that contains at least one non-ASCII char,
+    # followed by punctuation or whitespace — qwen3:8b occasionally emits
+    # Russian, Hebrew, Polish, Turkish, etc. tokens at the very start of a
+    # reply before settling into English.
+    text = re.sub(
+        r"^[A-Za-z']*[^\x00-\x7F][^\s,.;:!?]*[\s,.;:!?]+\s*",
+        "",
+        text,
+        count=1,
+    )
+    text = text.strip()
+    if not text:
+        return text
     customer_service_patterns = (
         r"\s*(?:How can I assist(?: you)?(?: today| with that)?\??)\s*$",
         r"\s*(?:How can I help(?: you)?(?: today| with that)?\??)\s*$",
@@ -4132,7 +4147,7 @@ def _sanitize_generated_response(text: str):
         r"\s*(?:Let me know if you would like .+)$",
         r"\s*(?:Would you like me to .+\??)\s*$",
         r"\s*(?:Is there anything (?:specific|else) .+)$",
-        r"\s*(?:Ready to (?:help|assist|move|follow|go)\b.+)$",
+        r"\s*(?:Ready to (?:help|assist)\b.+)$",
         r"\s*(?:Feel free to ask[.!]?)\s*$",
         r"\s*(?:Happy to help[.!]?)\s*$",
         r"\s*(?:Thanks for asking[.!]?)\s*",
