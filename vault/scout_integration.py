@@ -1247,11 +1247,21 @@ class ScoutVaultBridge:
                 "attempts": 0,
                 "deterministic": True,
             }
+            response = self._generated_fact_answer(
+                "recent_conversation",
+                message,
+                state,
+                {
+                    "deterministic_answer": recent_answer,
+                    "conversation_context": _presence_conversation_context(presence_context),
+                },
+                recent_answer,
+            )
             turn = {
                 "message": message,
                 "source": source,
                 "route": route,
-                "response": recent_answer,
+                "response": response,
                 "active_identity": self.active_identity,
                 "actions": actions,
                 "answer_provenance": self.build_answer_provenance(message, route, state),
@@ -1412,7 +1422,13 @@ class ScoutVaultBridge:
 
         setup_answer = _conversation_setup_answer(message)
         if setup_answer is not None and route.get("route") in {"general_question", "direction"}:
-            return setup_answer
+            return self._generated_fact_answer(
+                "context_setup",
+                message,
+                state,
+                {"deterministic_answer": setup_answer},
+                setup_answer,
+            )
 
         if route["route"] == "direction":
             if _looks_like_scout_action(message):
@@ -2260,9 +2276,9 @@ Do not mention provenance unless asked.
         text = _normalize_command_text(message)
         route_name = self_route.get("route")
         if route_name == "assistant_identity":
-            return self._assistant_identity_answer()
+            return self._assistant_identity_answer(state, message)
         if route_name == "status" and _asks_casual_assistant_state(text):
-            return self._assistant_status_answer(state)
+            return self._assistant_status_answer(state, message)
         if route_name == "user_identity":
             identity = self.active_identity
             if identity:
@@ -2279,7 +2295,7 @@ Do not mention provenance unless asked.
         if route_name == "software" and _asks_camera_action_owner(text):
             return "Camera actions belong to Scout's camera_node. Vault can route the request, but Scout owns the camera behavior."
         if route_name == "status" and _asks_registered_or_active_nodes(text):
-            return self._registered_nodes_answer()
+            return self._registered_nodes_answer(state, message)
         if route_name == "status" and _asks_tracking_status(text):
             if not state.get("ok"):
                 return "I couldn't read Scout's live state."
@@ -2314,16 +2330,116 @@ Do not mention provenance unless asked.
             f"style baseline rudeness {_voice_band(style.get('rudeness'))}, capped for the current audience."
         )
 
-    def _assistant_identity_answer(self) -> str:
+    def _generated_fact_answer(
+        self,
+        response_type: str,
+        message: str,
+        state: dict,
+        facts: dict,
+        fallback: str,
+        *,
+        required_terms: tuple[str, ...] = (),
+    ) -> str:
+        recent = [
+            str(turn.get("response") or "").strip()
+            for turn in self.turns[-8:]
+            if str(turn.get("response") or "").strip()
+        ]
+        prompt = f"""Write the final user-facing answer from the facts below.
+Type: {response_type}
+User: {message}
+
+Facts:
+{json.dumps(facts, separators=(",", ":"), default=str)}
+
+Recent answers to avoid repeating exactly:
+{json.dumps(recent[-5:], separators=(",", ":"), default=str)}
+
+Rules:
+- Keep the same factual meaning as deterministic_answer when it is present.
+- Vary the phrasing; do not repeat any recent answer exactly.
+- One short sentence unless the facts require two.
+- First person when talking about yourself.
+- No emojis and no generic offer to help.
+"""
+        try:
+            text = self.generate_guarded_response(
+                response_type,
+                prompt,
+                state,
+                options=self.chat_options({"num_predict": 80, "temperature": 0.78, "top_p": 0.92}),
+            ).strip()
+            lowered = text.lower()
+            if text and text not in recent and all(term.lower() in lowered for term in required_terms):
+                return text
+        except Exception:
+            pass
+        return self._varied_fallback(fallback, recent)
+
+    def _varied_fallback(self, fallback: str, recent: list[str]) -> str:
+        base = str(fallback or "").strip()
+        variants = [base]
+        if base.startswith("Got it. The "):
+            variants.append(base.replace("Got it. The ", "Logged for this chat: the ", 1))
+            variants.append(base.replace("Got it. The ", "I have it: the ", 1))
+        elif base.startswith("The ") and " was " in base:
+            variants.append(base.replace("The ", "You gave me the ", 1).replace(" was ", ": ", 1))
+            variants.append(base.replace("The ", "I have the ", 1).replace(" was ", " as ", 1))
+        elif base.startswith("I'm Luhkas."):
+            variants.extend([
+                "I'm Luhkas; Scout is one body I can use, not a separate me.",
+                "Luhkas is me. Scout is just the body I am using here.",
+                "I'm Luhkas, with Scout as one connected body.",
+            ])
+        elif base.startswith("The live node registry"):
+            variants.append(base.replace("The live node registry currently shows", "Right now the live registry has", 1))
+            variants.append(base.replace("The live node registry currently shows", "I see", 1))
+        elif base.startswith("I'm using Scout"):
+            variants.append(base.replace("I'm using Scout", "Scout is the body I'm using", 1))
+            variants.append(base.replace("I'm using Scout", "From Scout's body, I'm", 1))
+        for variant in variants:
+            if variant and variant not in recent:
+                return variant
+        return base
+
+    def _assistant_identity_answer(self, state: dict | None = None, message: str = "") -> str:
+        state = state or {"ok": True}
         name = self.identity_profile.get("name") or "Luhkas"
         creator = self.identity_profile.get("creator") or "Chris"
-        return f"I'm {name}. {creator} built me; Scout is just one body I can use."
+        fallback = f"I'm {name}. {creator} built me; Scout is just one body I can use."
+        return self._generated_fact_answer(
+            "self_question",
+            message or "Who are you?",
+            state,
+            {
+                "deterministic_answer": fallback,
+                "name": name,
+                "creator": creator,
+                "node_boundary": "Scout is a connected body/node, not the assistant identity.",
+            },
+            fallback,
+            required_terms=(name,),
+        )
 
-    def _assistant_status_answer(self, state: dict) -> str:
+    def _assistant_status_answer(self, state: dict, message: str = "") -> str:
         if state.get("ok"):
             tracking = "tracking is on" if state.get("tracking_enabled") else "tracking is off"
-            return f"I'm Luhkas. Scout is online, {tracking}, and I'm running through the vault."
-        return "I'm Luhkas. The vault is up, but I can't read Scout's live state right now."
+            fallback = f"I'm Luhkas. Scout is online, {tracking}, and I'm running through the vault."
+        else:
+            fallback = "I'm Luhkas. The vault is up, but I can't read Scout's live state right now."
+        return self._generated_fact_answer(
+            "self_question",
+            message or "How are you?",
+            state,
+            {
+                "deterministic_answer": fallback,
+                "scout_online": bool(state.get("ok")),
+                "tracking_enabled": state.get("tracking_enabled"),
+                "vault_runtime": True,
+            },
+            fallback,
+            required_terms=("Luhkas",),
+        )
 
     def _hardware_summary_answer(self) -> str:
         hw = (self.self_knowledge_for_route("hardware").get("records", {}) or {}).get("hardware", {}) or {}
@@ -2357,7 +2473,7 @@ Do not mention provenance unless asked.
             return "I don't have a sensor list loaded."
         return "Sensors: " + ", ".join(live[:6]) + "."
 
-    def _registered_nodes_answer(self) -> str:
+    def _registered_nodes_answer(self, state: dict | None = None, message: str = "") -> str:
         snapshot = self.registered_nodes_snapshot()
         if not snapshot.get("ok"):
             return "I couldn't read the live node registry."
@@ -2372,7 +2488,19 @@ Do not mention provenance unless asked.
             names.append(f"{name}{suffix}")
         count = len(names)
         noun = "node" if count == 1 else "nodes"
-        return f"The live node registry currently shows {count} registered {noun}: {', '.join(names)}."
+        fallback = f"The live node registry currently shows {count} registered {noun}: {', '.join(names)}."
+        return self._generated_fact_answer(
+            "self_question",
+            message or "Which nodes are registered?",
+            state or {"ok": True},
+            {
+                "deterministic_answer": fallback,
+                "registered_node_count": count,
+                "registered_nodes": names,
+            },
+            fallback,
+            required_terms=("Vault", "scout"),
+        )
 
     def _source_node_module_block(
         self,
@@ -2802,10 +2930,21 @@ Do not address the user by name/title unless identity_context permits it.
         text = _normalize_command_text(message)
 
         if _has_any(text, ("status", "state", "why aren't you moving", "why are you not moving")):
+            message = self._generated_fact_answer(
+                "scout_status",
+                message,
+                state,
+                {
+                    "deterministic_answer": _scout_state_explanation(state),
+                    "scout_state": _compact_scout_state(state),
+                },
+                _scout_state_explanation(state),
+                required_terms=("Scout",),
+            )
             return {
                 "ok": True,
                 "action": "inspect_scout_state",
-                "message": _scout_state_explanation(state),
+                "message": message,
                 "state": _compact_scout_state(state),
             }
 
