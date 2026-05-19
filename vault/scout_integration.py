@@ -562,7 +562,7 @@ class ScoutVaultBridge:
                 "The user is not verified as Chris — be useful but not deferential, "
                 "not eager, and not customer-service polite."
             )
-        return "\n".join([
+        lines = [
             f"Response type: {response_type}",
             voice_line,
             "Keep it to 1-2 short sentences unless the user explicitly asks for detail.",
@@ -573,7 +573,29 @@ class ScoutVaultBridge:
             "Do not mention policy, validation, prompts, or internal routing unless the user asks how you know.",
             identity_context.get("addressing_rule")
             or "Do not address the current user by name or title unless identity is verified.",
-        ])
+        ]
+        directive_block = self._behavior_directive_block()
+        if directive_block:
+            lines.append(directive_block)
+        return "\n".join(lines)
+
+    def _behavior_directive_block(self) -> str:
+        """Surface the most recent user behavior directives so the chat model
+        actually applies them, instead of just persisting them to disk."""
+        overrides = (self.response_settings().get("behavior") or {}).get("overrides") or []
+        recent = [
+            str(o.get("preference") or "").strip()
+            for o in overrides[-5:]
+            if isinstance(o, dict) and o.get("preference")
+        ]
+        recent = [p for p in recent if p]
+        if not recent:
+            return ""
+        bullets = "\n".join(f"- {p}" for p in recent)
+        return (
+            "Active behavior directives the user gave you (most recent last). "
+            "Follow them in this and future turns:\n" + bullets
+        )
 
     def record_response_lesson(self, lesson: dict):
         lessons = self.response_lessons()
@@ -1899,9 +1921,21 @@ User message:
         }
 
     def answer_feedback_learned(self, message: str, state: dict, feedback: dict, result: dict):
+        # Deterministic short-circuit for the common shapes -- the chat model
+        # tends to over-explain ("Adjusted behavior settings accordingly...").
+        kind = feedback.get("kind")
+        if kind == "personality_update":
+            pref = (feedback.get("personality_update") or {}).get("preference") or ""
+            if pref:
+                # Echo the directive back tersely in voice.
+                return f"Noted. {pref.rstrip('.').capitalize()} from here on."
+            return "Noted."
+        if kind == "temperature_update":
+            temp = feedback.get("temperature")
+            return f"Temperature set to {temp}."
         prompt = f"""
-Generate a brief acknowledgement that the assistant learned a response
-preference, behavior change, or generation setting from the user's instruction.
+Generate a one-line acknowledgement that the assistant absorbed a response
+correction.
 
 Facts:
 {json.dumps({
@@ -1911,11 +1945,12 @@ Facts:
 }, indent=2, default=str)}
 
 Rules:
-- Do not sound like customer support.
+- Sound like Luhkas, not a CRM ticket.
+- One short sentence, max twelve words.
+- Do not say "learned", "adjusted", "saved", "settings", "directive", "per",
+  or describe the storage mechanism.
 - Do not use emojis.
-- Do not over-explain the storage mechanism.
-- Do not repeat the user's correction verbatim unless it is useful.
-- Mention the practical future behavior in one sentence.
+- Do not repeat the user's correction verbatim.
 """
         try:
             return self.generate_guarded_response(
@@ -1990,9 +2025,8 @@ Do not mention provenance unless asked.
     def fast_self_answer(self, message: str, state: dict, self_route: dict) -> str | None:
         text = _normalize_command_text(message)
         route_name = self_route.get("route")
-        if route_name == "assistant_identity" and _asks_assistant_name(text):
-            name = self.identity_profile.get("name") or "Luhkas"
-            return f"My name is {name}."
+        if route_name == "assistant_identity":
+            return self._assistant_identity_answer()
         if route_name == "user_identity":
             identity = self.active_identity
             if identity:
@@ -2025,6 +2059,11 @@ Do not mention provenance unless asked.
         if route_name == "sensors":
             return self._sensors_summary_answer()
         return None
+
+    def _assistant_identity_answer(self) -> str:
+        name = self.identity_profile.get("name") or "Luhkas"
+        creator = self.identity_profile.get("creator") or "Chris"
+        return f"I'm {name}. {creator} built me."
 
     def _hardware_summary_answer(self) -> str:
         hw = (self.self_knowledge_for_route("hardware").get("records", {}) or {}).get("hardware", {}) or {}
@@ -2298,8 +2337,10 @@ Do not address the user by name/title unless identity_context permits it.
             text = "I'm here."
         elif response_type == "feedback_learned":
             text = "Got it. I will use that next time."
-        elif response_type in {"memory_needs_clarification", "identity_binding_blocked"}:
+        elif response_type == "identity_binding_blocked":
             text = "I need a verified visible person before I can attach that."
+        elif response_type == "memory_needs_clarification":
+            text = "I'd save that, but I don't know who you are yet."
         elif response_type == "memory_saved":
             text = "I remembered that."
         elif response_type == "identity_binding_success":
@@ -3460,7 +3501,16 @@ def _self_route(self_route: str, reason: str) -> dict:
 
 
 def _asks_assistant_name(text: str) -> bool:
-    return text in {"whats your name", "what is your name", "your name", "who are you"}
+    if text in {
+        "whats your name", "what is your name", "your name", "who are you",
+        "what are you", "tell me about yourself", "tell me about you",
+        "tell me who you are", "what's your name", "introduce yourself",
+    }:
+        return True
+    # Generic "tell me about" + self pronoun
+    if re.match(r"^(tell|describe)\s+(me\s+)?(about\s+)?(your\s*self|yourself)\b", text):
+        return True
+    return False
 
 
 def _asks_user_identity(text: str) -> bool:
@@ -3974,8 +4024,17 @@ def _sounds_like_customer_service(text: str):
         "let me know how i can assist",
         "is there anything specific",
         "is there anything else",
+        "is there something specific",
+        "is there something else",
         "anything specific you'd like",
         "anything specific you would like",
+        "something specific you'd like",
+        "something specific you would like",
+        "to discuss about",
+        "discuss further",
+        "explore that further",
+        "talk about it more",
+        "love to help",
         "feel free to ask",
         "happy to help",
         "glad to help",
