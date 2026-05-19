@@ -16,8 +16,20 @@ from config import DATA_DIR
 
 NODES_FILE = DATA_DIR / "nodes.json"
 REGISTERED_FILE = DATA_DIR / "nodes_registered.json"
+VAULT_NODE_ID = "vault"
+_SYNTHETIC_NODE_ID_PREFIXES = ("batch", "final", "postfix", "temp", "test")
 
 _DEFAULTS: dict = {
+    "vault": {
+        "name": "Vault",
+        "has_display": True,
+        "display": {
+            "type": "vault_runtime",
+            "can_show_code": True,
+            "can_open_browser": True,
+            "can_show_images": True,
+        },
+    },
     "cli": {
         "name": "CLI Terminal",
         "has_display": True,
@@ -43,6 +55,7 @@ class NodeRegistry:
         self._alerts: dict = {}      # node_id -> list[dict]  (pending push alerts)
         self._load()
         self._load_registered()
+        self._sanitize_registered()
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -67,6 +80,42 @@ class NodeRegistry:
                     self._registered = data
             except Exception:
                 pass
+        self._registered.setdefault(VAULT_NODE_ID, self._vault_registration())
+
+    def _vault_registration(self) -> dict:
+        return {
+            "display": dict(_DEFAULTS[VAULT_NODE_ID]["display"]),
+            "node_name": "Vault",
+            "ip": "",
+            "services": {"runtime": 7000},
+            "capabilities": {},
+            "modules": {},
+            "registered_at": None,
+            "intrinsic": True,
+        }
+
+    def _is_synthetic_node_id(self, node_id: str) -> bool:
+        lowered = str(node_id or "").strip().lower()
+        return lowered.startswith(_SYNTHETIC_NODE_ID_PREFIXES)
+
+    def _sanitize_registered(self):
+        cleaned = {}
+        changed = False
+        for node_id, cfg in self._registered.items():
+            clean_id = str(node_id or "").strip()
+            if not clean_id or self._is_synthetic_node_id(clean_id):
+                changed = True
+                continue
+            cleaned[clean_id] = cfg if isinstance(cfg, dict) else {}
+        if VAULT_NODE_ID not in cleaned:
+            cleaned[VAULT_NODE_ID] = self._vault_registration()
+            changed = True
+        if cleaned.get(VAULT_NODE_ID, {}).get("intrinsic") is not True:
+            cleaned[VAULT_NODE_ID] = {**self._vault_registration(), **cleaned.get(VAULT_NODE_ID, {}), "intrinsic": True}
+            changed = True
+        if changed or cleaned != self._registered:
+            self._registered = cleaned
+            self._save_registered()
 
     def _save_registered(self):
         try:
@@ -82,6 +131,9 @@ class NodeRegistry:
                  ip: str = "", services: dict | None = None,
                  capabilities: dict | None = None, modules: dict | None = None) -> None:
         """Record a live node's display capabilities and network address."""
+        node_id = str(node_id or "").strip()
+        if not node_id or self._is_synthetic_node_id(node_id):
+            return
         capabilities = capabilities if isinstance(capabilities, dict) else {}
         modules = modules if isinstance(modules, dict) else capabilities.get("module_status")
         if not isinstance(modules, dict):
@@ -107,6 +159,9 @@ class NodeRegistry:
 
     def update_capabilities(self, node_id: str, capabilities: dict | None = None,
                             modules: dict | None = None) -> None:
+        node_id = str(node_id or "").strip()
+        if not node_id or self._is_synthetic_node_id(node_id):
+            return
         capabilities = capabilities if isinstance(capabilities, dict) else {}
         modules = modules if isinstance(modules, dict) else capabilities.get("module_status")
         if not isinstance(modules, dict):

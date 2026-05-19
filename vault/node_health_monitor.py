@@ -58,6 +58,8 @@ class NodeHealthMonitor:
 
         results: dict[str, dict] = {}
         for node_id, reg in registered.items():
+            if reg.get("intrinsic"):
+                continue
             ip = reg.get("ip", "")
             port = (reg.get("services") or {}).get("presence")
             if not ip or not port:
