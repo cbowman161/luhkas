@@ -551,10 +551,23 @@ class ScoutVaultBridge:
 
     def response_contract(self, response_type: str, state: dict):
         identity_context = self.response_identity_context(state)
+        if identity_context.get("may_address_primary_user"):
+            voice_line = (
+                "Answer as Luhkas in first person: direct, dry, occasionally warm. "
+                "The user is Chris — familiar territory, you may be informal."
+            )
+        else:
+            voice_line = (
+                "Answer as Luhkas in first person: direct, dry, slightly clipped. "
+                "The user is not verified as Chris — be useful but not deferential, "
+                "not eager, and not customer-service polite."
+            )
         return "\n".join([
             f"Response type: {response_type}",
-            "Answer as Luhkas in first person: direct, warm, concise, and alive.",
+            voice_line,
             "Keep it to 1-2 short sentences unless the user explicitly asks for detail.",
+            "Have a point of view. Avoid empty acknowledgements, filler, and 'ready to help' phrasing.",
+            "If you have facts, cite a specific one rather than gesturing vaguely.",
             "Do not use emojis, customer-service closers, catchphrases, or meta-descriptions of personality.",
             "Do not invent facts, actions, memories, detections, feelings, desires, or capabilities.",
             "Do not mention policy, validation, prompts, or internal routing unless the user asks how you know.",
@@ -1682,6 +1695,17 @@ Invalid previous response:
                 "reason": "explicit temperature setting",
                 "attempts": 0,
             }
+        direct_personality = _extract_direct_personality_update(message)
+        if direct_personality is not None:
+            return {
+                "ok": True,
+                "is_feedback": True,
+                "kind": "personality_update",
+                "personality_update": direct_personality,
+                "confidence": 1.0,
+                "reason": "explicit tone/behavior directive",
+                "attempts": 0,
+            }
         direct_lesson = _extract_direct_response_lesson(message, self.recent_turns_for_feedback(limit=1))
         if direct_lesson is not None:
             return {
@@ -1996,7 +2020,43 @@ Do not mention provenance unless asked.
         if route_name == "goals" and _asks_why_here(text):
             role = self.identity_profile.get("role") or "the assistant Chris created"
             return f"I'm here as {role}: to help with tasks, remember useful things, and work through the vault and connected nodes."
+        if route_name == "hardware":
+            return self._hardware_summary_answer()
+        if route_name == "sensors":
+            return self._sensors_summary_answer()
         return None
+
+    def _hardware_summary_answer(self) -> str:
+        hw = (self.self_knowledge_for_route("hardware").get("records", {}) or {}).get("hardware", {}) or {}
+        vault = hw.get("vault_pc", {}) or {}
+        scout = hw.get("scout_edge", {}) or {}
+        vault_bits = []
+        gpu = (vault.get("gpu") or "")
+        if "3090" in gpu:
+            vault_bits.append("RTX 3090")
+        elif gpu:
+            vault_bits.append(gpu.split(",")[0].replace("NVIDIA GeForce ", "").strip())
+        if vault.get("ram"):
+            vault_bits.append(vault["ram"])
+        scout_bits = []
+        if scout.get("compute"):
+            scout_bits.append(scout["compute"])
+        if scout.get("accelerator") and "Hailo" in scout["accelerator"]:
+            scout_bits.append("Hailo HAT+")
+        parts = []
+        if vault_bits:
+            parts.append(f"Vault PC: {', '.join(vault_bits)}")
+        if scout_bits:
+            parts.append(f"Scout body: {', '.join(scout_bits)}")
+        return ". ".join(parts) + "." if parts else "I don't have my hardware sheet loaded."
+
+    def _sensors_summary_answer(self) -> str:
+        rec = (self.self_knowledge_for_route("sensors").get("records", {}) or {}).get("sensors", {}) or {}
+        items = rec.get("available_or_planned") or []
+        live = [s for s in items if not str(s).lower().startswith("planned") and "possible" not in str(s).lower()]
+        if not live:
+            return "I don't have a sensor list loaded."
+        return "Sensors: " + ", ".join(live[:6]) + "."
 
     def _registered_nodes_answer(self) -> str:
         snapshot = self.registered_nodes_snapshot()
@@ -3723,6 +3783,66 @@ def _asks_to_remember(message: str):
     return "remember" in message.lower()
 
 
+_TONE_WORDS = {
+    # base adjectives
+    "rude", "polite", "formal", "casual", "warm", "cold", "sarcastic",
+    "witty", "funny", "dry", "sharp", "kind", "nice", "terse", "chatty",
+    "brief", "verbose", "condescending", "playful", "stern", "serious",
+    "professional", "blunt", "direct", "snarky", "deferential", "harsh",
+    "soft", "concise", "wordy", "edgy", "loud", "quiet",
+    # -er comparatives
+    "warmer", "colder", "sharper", "blunter", "quieter", "louder",
+    "ruder", "politer", "kinder", "nicer", "softer", "harsher",
+    "snarkier", "drier", "wittier", "funnier", "sterner", "terser",
+    "edgier",
+    # -ly adverbs
+    "bluntly", "directly", "warmly", "coldly", "sharply", "sarcastically",
+    "snarkily", "kindly", "softly", "harshly", "tersely", "dryly",
+}
+
+_PERSONALITY_PREFIX_RE = re.compile(
+    r"^\s*(?:be|act|sound|talk|speak|reply|respond)\b", re.I,
+)
+_PERSONALITY_NEG_RE = re.compile(
+    r"^\s*(?:tone\s+it\s+(?:down|up)|stop\s+being|don'?t\s+be|quit\s+being)\b",
+    re.I,
+)
+_PERSONALITY_COMPARATIVE_RE = re.compile(
+    r"\b(?:more|less|too|bit|little|lot|way|much)\s+(\w+)\b", re.I,
+)
+
+
+def _extract_direct_personality_update(message: str):
+    """Detect short tone/behavior directives like 'be less rude', 'tone it down',
+    'speak more bluntly', 'be a bit warmer'. Returns None for anything that
+    looks more like a task-precision lesson or an unrelated request.
+    """
+    text = str(message or "").strip()
+    if not text or len(text.split()) > 12:
+        return None
+    lowered = text.lower()
+    words = re.findall(r"[a-z']+", lowered)
+    tone_word_mentioned = any(w in _TONE_WORDS for w in words)
+    matches_neg = bool(_PERSONALITY_NEG_RE.search(text))
+    matches_prefix = bool(_PERSONALITY_PREFIX_RE.search(text))
+    comparative_match = _PERSONALITY_COMPARATIVE_RE.search(text)
+    comparative_word = (comparative_match.group(1) or "").lower() if comparative_match else None
+    accept = (
+        matches_neg
+        or (matches_prefix and tone_word_mentioned)
+        or (comparative_word in _TONE_WORDS if comparative_word else False)
+    )
+    if not accept:
+        return None
+    return {
+        "preference": text[:200],
+        "applies_when": "future conversational turns",
+        "avoid": "",
+        "prefer": text[:200],
+        "source_message": message,
+    }
+
+
 def _extract_temperature_setting(message: str):
     match = re.search(
         r"\b(?:set|change|make|turn)\s+(?:your\s+)?(?:response\s+)?temperature\s+(?:to\s+)?(?P<value>[01](?:\.\d+)?|\.\d+)\b",
@@ -3869,8 +3989,15 @@ def _sounds_like_customer_service(text: str):
         "i am here to assist",
         "i'm here to assist",
         "im here to assist",
-        "here to help you with",
-        "here to assist you with",
+        "here to help",
+        "here to assist",
+        "ready to assist",
+        "ready to help",
+        "i am ready",
+        "i'm ready",
+        "let me know if you'd like",
+        "let me know if you would like",
+        "would you like me to",
         "would you like to talk about it",
         "would you like me to",
         "let's find a way forward",
@@ -3927,7 +4054,11 @@ def _sanitize_generated_response(text: str):
         r"\s*(?:Let me know if you (?:need anything|have any other questions)[.!]?)\s*$",
         r"\s*(?:Let me know how I can (?:help|assist)(?: you)?[.!]?)\s*$",
         r"\s*(?:Let me know if there'?s anything .+)$",
+        r"\s*(?:Let me know if you'?d like .+)$",
+        r"\s*(?:Let me know if you would like .+)$",
+        r"\s*(?:Would you like me to .+\??)\s*$",
         r"\s*(?:Is there anything (?:specific|else) .+)$",
+        r"\s*(?:Ready to (?:help|assist|move|follow|go)\b.+)$",
         r"\s*(?:Feel free to ask[.!]?)\s*$",
         r"\s*(?:Happy to help[.!]?)\s*$",
         r"\s*(?:Thanks for asking[.!]?)\s*",

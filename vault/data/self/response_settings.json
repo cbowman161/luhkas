@@ -3,9 +3,9 @@
     "overrides": []
   },
   "generation": {
-    "temperature": 0.4,
+    "temperature": 0.35,
     "top_p": 0.92,
-    "updated_at": 1779149500.0
+    "updated_at": 1779150500.0
   },
   "kind": "response_settings"
 }
