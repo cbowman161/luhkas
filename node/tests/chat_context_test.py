@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.modules.pop("luhkas_node", None)
 
 from luhkas_node.chat_context import build_presence_payload
 

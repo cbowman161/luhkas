@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 import threading
 
@@ -43,6 +45,30 @@ RUN_COMMANDS = {
     "execute",
     "execute it",
 }
+
+
+def _command_text(text: str) -> str:
+    import re
+    return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
+
+
+def _item_aliases(item: dict) -> set[str]:
+    aliases = set()
+    for key in ("name", "display_name"):
+        value = item.get(key)
+        if value:
+            normalized = _command_text(str(value).replace("_", " "))
+            aliases.add(normalized)
+            aliases.add(_command_text(value))
+    for example in item.get("examples") or []:
+        if example:
+            aliases.add(_command_text(str(example).replace("_", " ")))
+    return {alias for alias in aliases if alias}
+
+
+def _matches_named_item(text: str, item: dict) -> bool:
+    aliases = _item_aliases(item)
+    return text in aliases
 
 
 class VaultRuntime:
@@ -246,6 +272,10 @@ class VaultRuntime:
                 capabilities=presence_context.get("node_capabilities") or {},
                 modules=presence_context.get("modules") or {},
             )
+        direct = self._handle_deterministic_presence_command(message, node_id)
+        if direct is not None:
+            self.node_registry.update_activity(node_id, identity=None)
+            return direct
         result = self.scout.handle_message(
             message,
             source=node_id,
@@ -258,6 +288,129 @@ class VaultRuntime:
         active_id = result.get("active_identity")
         self.node_registry.update_activity(node_id, identity=active_id)
         return self._enrich(result, node_id)
+
+    def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
+        """Run known capability/skill commands before Scout chat routing.
+
+        Presence messages normally go through ScoutVaultBridge, but the vault
+        owns capabilities, skills, jobs, and updates. This mirrors the zero-LLM
+        command surface used by handle() so phrases like "show updates" never
+        fall through to vision analysis.
+        """
+        text = _command_text(message)
+        if not text:
+            return None
+
+        pending = self.blackboard.get_pending_decision()
+        if pending and pending.get("type") in {
+            "existing_skill",
+            "modify_skill_details",
+            "skill_evolution",
+            "capability_evolution",
+            "run_skill_args",
+            "code_monkey_pick_review",
+            "code_monkey_overlap_decision",
+            "code_monkey_requirements",
+            "code_monkey_review",
+        }:
+            return self.handle(message, node_id=node_id)
+
+        if text in {
+            "updates", "status", "progress", "whats the status", "any updates",
+            "notifications", "show notifications", "check notifications",
+            "show updates", "get updates", "check updates",
+        }:
+            return self._remember_active(self.router.show_updates(self.active_task_id))
+
+        if text in {"jobs", "list jobs", "show jobs", "my jobs", "active jobs"}:
+            return self._remember_active(self.router.show_jobs(self.active_task_id))
+
+        if text in {"code monkey", "code monkey health", "coder health", "coder status"}:
+            return self._remember_active(self.router.show_code_monkey_health(self.active_task_id))
+
+        command_response = self.command_agent.handle(message)
+        if command_response is not None:
+            command_response["active_task_id"] = self.active_task_id
+            command_response["deterministic"] = True
+            command_response["deterministic_source"] = "installed_capability_command"
+            return self._remember_active(command_response)
+
+        capability_response = self._handle_named_capability_command(text)
+        if capability_response is not None:
+            return self._remember_active(capability_response)
+
+        skill_response = self._handle_named_skill_command(text, message)
+        if skill_response is not None:
+            return self._remember_active(skill_response)
+
+        return None
+
+    def _handle_named_capability_command(self, text: str) -> dict | None:
+        for capability in self.registry.list():
+            if not _matches_named_item(text, capability):
+                continue
+            subsystem = capability.get("subsystem")
+            action = capability.get("action")
+            if subsystem == "event_log":
+                return self.router.show_updates(self.active_task_id)
+            if subsystem == "job_manager":
+                return self.router.show_jobs(self.active_task_id)
+            if subsystem == "system_agent":
+                result = self.router.system_agent.run_direct(action, capability=capability)
+                return {
+                    "mode": "direct",
+                    "message": result.get("message", ""),
+                    "data": result,
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": f"capability:{capability.get('name')}",
+                }
+            if subsystem == "code_monkey":
+                return self.router.start_code_monkey_requirements(
+                    user_input=capability.get("description") or capability.get("name"),
+                    active_task_id=self.active_task_id,
+                )
+            if subsystem == "chat_agent":
+                return None
+            return {
+                "mode": "direct",
+                "message": f"Capability `{capability.get('name')}` is registered, but I do not have a deterministic executor for subsystem `{subsystem}`.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": f"capability:{capability.get('name')}",
+            }
+        return None
+
+    def _handle_named_skill_command(self, text: str, message: str) -> dict | None:
+        run_prefix = None
+        for prefix in ("run ", "execute ", "start ", "use "):
+            if text.startswith(prefix):
+                run_prefix = prefix
+                break
+        target = text[len(run_prefix):].strip() if run_prefix else text
+        for skill in self.skill_registry.list():
+            if not _matches_named_item(target, skill):
+                continue
+            pending = {
+                "type": "existing_skill",
+                "skill": skill.get("name"),
+                "filename": skill.get("filename"),
+                "description": skill.get("description"),
+                "original_request": message,
+                "active_task_id": self.active_task_id,
+            }
+            self.router.set_last_skill(skill.get("name"), skill.get("filename"))
+            if run_prefix:
+                return self.router.run_pending_skill(pending, self.active_task_id)
+            return self.router.confirm_existing_skill(
+                {
+                    "skill": skill.get("name"),
+                    "action": "confirm_existing_skill",
+                },
+                message,
+                self.active_task_id,
+            )
+        return None
 
     def handle_presence_message(self, message, source=None):
         return self.scout.handle_message(message, source=source)
