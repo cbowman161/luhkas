@@ -34,6 +34,7 @@ def load_function(name: str):
                     "_presence_conversation_context",
                     "_conversation_user_turns",
                     "_extract_context_phrase",
+                    "_asks_recent_conversation",
                 )
                 if dep in function_nodes and dep != name
             ]
@@ -100,12 +101,14 @@ class PresenceContextTest(unittest.TestCase):
     def test_context_setup_detects_plain_marker_phrase(self) -> None:
         is_conversation_context_setup = load_function("_is_conversation_context_setup")
         conversation_setup_answer = load_function("_conversation_setup_answer")
+        recent_conversation_answer = load_function("_recent_conversation_answer")
 
         self.assertTrue(is_conversation_context_setup("the test phrase is blue comet"))
         self.assertEqual(
             conversation_setup_answer("The test phrase is blue comet."),
             "Got it. The test phrase is blue comet.",
         )
+        self.assertIsNone(recent_conversation_answer("The test phrase is blue comet.", {}))
 
     def test_recent_conversation_answer_uses_chat_context(self) -> None:
         recent_conversation_answer = load_function("_recent_conversation_answer")
@@ -147,10 +150,12 @@ class PresenceContextTest(unittest.TestCase):
 
     def test_node_identity_claims_are_rejected(self) -> None:
         claims_assistant_is_node_identity = load_function("_claims_assistant_is_node_identity")
+        asks_assistant_identity_topic = load_function("_asks_assistant_identity_topic")
 
         self.assertTrue(claims_assistant_is_node_identity("I am scout, active and ready."))
         self.assertTrue(claims_assistant_is_node_identity("I'm the scout node."))
         self.assertFalse(claims_assistant_is_node_identity("I'm Luhkas. Scout is one body I can use."))
+        self.assertTrue(asks_assistant_identity_topic("are you scout"))
 
     def test_casual_assistant_state_is_detected(self) -> None:
         asks_casual_assistant_state = load_function("_asks_casual_assistant_state")

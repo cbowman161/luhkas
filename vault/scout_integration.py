@@ -189,6 +189,8 @@ def _conversation_setup_answer(message: str) -> str | None:
 
 def _recent_conversation_answer(message: str, presence_context: dict | None) -> str | None:
     text = _canonical_intent_text(message)
+    if not _asks_recent_conversation(text):
+        return None
     user_turns = _conversation_user_turns(presence_context, message)
     if not user_turns:
         return "I don't have earlier chat context for that in this session."
@@ -1235,7 +1237,7 @@ class ScoutVaultBridge:
                     self.turns = self.turns[-30:]
                     return {"ok": True, **turn}
 
-        recent_answer = _recent_conversation_answer(message, presence_context)
+        recent_answer = _recent_conversation_answer(message, presence_context) if _asks_recent_conversation(_canonical_intent_text(message)) else None
         if recent_answer is not None:
             route = {
                 "ok": True,
@@ -3849,8 +3851,11 @@ def _asks_assistant_identity_topic(text: str) -> bool:
     if text in {
         "who are you", "what are you", "tell me about yourself",
         "tell me about you", "tell me who you are", "introduce yourself",
-        "describe yourself", "what are you really",
+        "describe yourself", "what are you really", "are you scout",
+        "are you luhkas", "are you scout or luhkas",
     }:
+        return True
+    if re.match(r"^are\s+you\s+(the\s+)?(scout|luhkas|vault)\b", text):
         return True
     if re.match(r"^(tell|describe)\s+(me\s+)?(about\s+)?(your\s*self|yourself)\b", text):
         return True
