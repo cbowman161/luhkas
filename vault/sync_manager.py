@@ -65,10 +65,27 @@ def push_node(profile: dict) -> dict:
     rsync = subprocess.run(
         [
             "rsync", "-a", "--delete", "--itemize-changes",
+            # Build artifacts and editor cruft (never canonical)
             "--exclude=__pycache__/",
             "--exclude=*.pyc",
-            "--exclude=*.db",
             "--exclude=._*",
+            "--exclude=.DS_Store",
+            # Logs (runtime, per-node)
+            "--exclude=*.log",
+            "--exclude=*.log.*",
+            # Runtime data that lives only on the node — must be preserved
+            # across syncs, never replaced from the vault's canonical tree.
+            "--exclude=captures/",
+            "--exclude=config/faces/",
+            "--exclude=config/people/",
+            "--exclude=config/vault_faces/",
+            "--exclude=config/unknown_faces/",
+            "--exclude=config/brain_faces/",
+            "--exclude=config/telemetry.db",
+            "--exclude=config/telemetry.db-shm",
+            "--exclude=config/telemetry.db-wal",
+            "--exclude=luhkas_node/data/",
+            # Node-specific deterministic-command overrides (carried per-node).
             "--exclude=data/deterministic_commands.json",
             "-e", "ssh " + " ".join(_SSH_OPTS),
             str(_NODE_DIR) + "/",
@@ -105,6 +122,44 @@ def push_node(profile: dict) -> dict:
         "files_changed": files_changed,
         "services_restarted": restarted,
     }
+
+
+def push_all(node_id: str | None = None) -> dict:
+    """Rsync node/ to every node with a sync profile, without pulling from git.
+
+    Intended for the periodic auto-sync timer: cheap to run (rsync no-ops when
+    nothing has changed, and push_node only restarts services when files
+    actually changed). Pass *node_id* to limit to a single node.
+    """
+    global _last_result, _last_sync_at
+
+    nodes: dict[str, dict] = {}
+
+    for profile_path in sorted(p for p in _PROFILES_DIR.glob("*.json") if not p.name.startswith(".")):
+        try:
+            profile = json.loads(profile_path.read_text())
+        except Exception as exc:
+            nodes[profile_path.stem] = {"ok": False, "error": f"bad profile: {exc}"}
+            continue
+
+        nid = profile.get("node_id", profile_path.stem)
+        if node_id and nid != node_id:
+            continue
+        if not profile.get("sync"):
+            continue
+
+        nodes[nid] = push_node(profile)
+
+    all_nodes_ok = all(v.get("ok") for v in nodes.values()) if nodes else True
+    result = {
+        "ok": all_nodes_ok,
+        "pull": None,
+        "nodes": nodes,
+        "synced_at": time.time(),
+    }
+    _last_result = result
+    _last_sync_at = result["synced_at"]
+    return result
 
 
 def sync_all(node_id: str | None = None) -> dict:
