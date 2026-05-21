@@ -9,10 +9,93 @@ import time
 from pathlib import Path
 
 from code_monkey_client import CodeMonkeyClient
+from models import get_model
 from safety_policy import SafetyPolicy
 
 
 DEFAULT_STORE = Path(__file__).parent / "data" / "learned_capabilities" / "capabilities.json"
+
+SYSTEM_TOPICS = (
+    "cpu", "memory", "gpu", "disk", "uptime", "os", "hostname",
+    "python", "process", "network", "service", "temperature",
+)
+SYSTEM_ASPECTS = ("usage", "hardware", "status", "version")
+
+_CLASSIFIER_PROMPT = """You classify whether a user request is asking about a Linux server's runtime state.
+
+Output strict JSON: {"topic": <topic_or_none>, "aspect": <aspect_or_none>}
+
+Topics:
+- cpu: processors, cores, threads
+- memory: RAM, swap
+- gpu: graphics cards
+- disk: storage, filesystems, volumes
+- uptime: how long the system has been up
+- os: kernel, distro, OS version
+- hostname: machine name
+- python: Python interpreter
+- process: running processes, tasks (NOT "how long it's been running")
+- network: interfaces, IPs, network state
+- service: systemd services
+- temperature: thermals, sensors
+- none: NOT a Linux-server-state question (identity, chitchat, memory recall, math, gibberish, scout/camera/robot actions)
+
+Aspects:
+- usage: live percent or current activity
+- hardware: specs, capacity, models
+- status: current state, what's running
+- version: which version is installed
+- none
+
+Examples:
+INPUT: "cpu usage"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+INPUT: "what processes are running"
+OUTPUT: {"topic": "process", "aspect": "status"}
+
+INPUT: "how long has the box been up"
+OUTPUT: {"topic": "uptime", "aspect": "status"}
+
+INPUT: "how much ram is installed"
+OUTPUT: {"topic": "memory", "aspect": "hardware"}
+
+INPUT: "tell me a joke"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "what is my favorite color"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "remember that my code is 4321"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "what's eating my disk"
+OUTPUT: {"topic": "disk", "aspect": "usage"}
+
+INPUT: "what's my current CPU usage?"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+INPUT: "what's my CPU?"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+INPUT: "show me processor load"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+INPUT: "how busy is the box right now"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+INPUT: "what cpu does this machine have"
+OUTPUT: {"topic": "cpu", "aspect": "hardware"}
+
+INPUT: "tell me about the cpu model"
+OUTPUT: {"topic": "cpu", "aspect": "hardware"}
+
+INPUT: "look at me"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+Now classify:
+INPUT: %s
+OUTPUT:"""
 
 
 def normalize_text(text: str) -> str:
@@ -80,6 +163,51 @@ class LearnedCapabilityStore:
         self.save(data)
         return dict(saved)
 
+    def remember_alias(self, new_text: str, source_cap: dict) -> dict | None:
+        """Save a new phrasing as an alias entry that reuses an existing capability's
+        execution recipe. Returns the stored capability dict, or None if invalid."""
+        key = normalize_text(new_text)
+        if not key:
+            return None
+        data = self.load()
+        caps = data.setdefault("capabilities", {})
+        existing = caps.get(key) if isinstance(caps.get(key), dict) else None
+        examples = list((existing or {}).get("examples") or [])
+        examples.append({
+            "input": str(new_text),
+            "normalized_input": key,
+            "confirmed_at": time.time(),
+            "source": "concept_match",
+            "intent": source_cap.get("intent"),
+            "confidence": source_cap.get("confidence"),
+        })
+        saved = {
+            **(existing or source_cap),
+            "name": source_cap.get("name") or source_cap.get("intent"),
+            "intent": source_cap.get("intent"),
+            "description": source_cap.get("description"),
+            "route": source_cap.get("route"),
+            "target": source_cap.get("target"),
+            "confidence": source_cap.get("confidence"),
+            "reason": source_cap.get("reason"),
+            "inferred": source_cap.get("inferred"),
+            "execution": source_cap.get("execution"),
+            "response": source_cap.get("response"),
+            "code_monkey_task": source_cap.get("code_monkey_task"),
+            "confirmed_by": "concept_match",
+            "input": str(new_text),
+            "normalized_input": key,
+            "confirmed": True,
+            "alias_of": source_cap.get("normalized_input"),
+            "created_at": (existing or {}).get("created_at") or time.time(),
+            "updated_at": time.time(),
+            "hits": int((existing or {}).get("hits") or 0),
+            "examples": examples[-20:],
+        }
+        caps[key] = saved
+        self.save(data)
+        return dict(saved)
+
     def forget(self, text: str) -> bool:
         key = normalize_text(text)
         if not key:
@@ -137,11 +265,78 @@ class LearnedCapabilityStore:
 class LearnedCapabilityEngine:
     """Confirm, execute, and persist safe non-Scout deterministic recipes."""
 
-    def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None):
+    def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None, model=None):
         self.store = store or LearnedCapabilityStore()
         self.safety = SafetyPolicy()
         self.scripts_dir = self.store.path.parent / "scripts"
         self.code_monkey = code_monkey_client if code_monkey_client is not None else CodeMonkeyClient(timeout=3)
+        self.model = model if model is not None else get_model("router")
+        self._inference_cache: dict = {}
+
+    def _infer_topic_and_aspect(self, text: str) -> tuple[str | None, str | None]:
+        """Classify a request semantically into (topic, aspect) using the router LLM.
+
+        Memoized per normalized input so each unique phrasing only hits the LLM once.
+        Returns (None, None) when the input is not a system-state request.
+        """
+        key = normalize_text(text)
+        if not key:
+            return None, None
+        if key in self._inference_cache:
+            return self._inference_cache[key]
+        result = self._llm_classify(text)
+        self._inference_cache[key] = result
+        return result
+
+    def _llm_classify(self, text: str) -> tuple[str | None, str | None]:
+        if self.model is None:
+            return None, None
+        prompt = _CLASSIFIER_PROMPT % json.dumps(str(text or ""))
+        try:
+            raw = self.model.generate(prompt, think=False, timeout=10)
+        except Exception:
+            return None, None
+        parsed = self._parse_json_object(raw)
+        if not isinstance(parsed, dict):
+            return None, None
+        topic = parsed.get("topic")
+        aspect = parsed.get("aspect")
+        if isinstance(topic, str):
+            topic = topic.strip().lower() or None
+        else:
+            topic = None
+        if isinstance(aspect, str):
+            aspect = aspect.strip().lower() or None
+        else:
+            aspect = None
+        if topic == "none":
+            topic = None
+        if aspect == "none":
+            aspect = None
+        if topic and topic not in SYSTEM_TOPICS:
+            topic = None
+        if aspect and aspect not in SYSTEM_ASPECTS:
+            aspect = None
+        if topic is None:
+            return None, None
+        return topic, aspect
+
+    @staticmethod
+    def _parse_json_object(raw: str) -> dict | None:
+        if not raw:
+            return None
+        text = raw.strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        match = re.search(r"\{[\s\S]*?\}", text)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
 
     def is_scout_specific(self, text: str) -> bool:
         normalized = normalize_text(text)
@@ -155,6 +350,65 @@ class LearnedCapabilityEngine:
     def lookup(self, text: str) -> dict | None:
         return self.store.lookup(text)
 
+    def lookup_by_concept(self, text: str) -> dict | None:
+        """Find an existing capability whose inferred (topic, aspect) matches the
+        LLM-classified concept of *text*. Falls back to parsing the intent name
+        (vault_<topic>_<aspect>) for legacy capabilities that pre-date LLM
+        classification. Returns None if no inference or no match."""
+        topic, aspect = self._infer_topic_and_aspect(text)
+        if topic is None:
+            return None
+        data = self.store.load()
+        caps = (data.get("capabilities") or {}).values()
+        topic_aspect_matches = []
+        topic_only_matches = []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                continue
+            if (cap.get("execution") or {}).get("type") not in {"bash", "python_script"}:
+                continue
+            cap_topic, cap_aspect = self._cap_concept(cap)
+            if cap_topic != topic:
+                continue
+            if cap_aspect == aspect:
+                topic_aspect_matches.append(cap)
+            else:
+                topic_only_matches.append(cap)
+        candidates = topic_aspect_matches or topic_only_matches
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda c: (int(c.get("hits") or 0), float(c.get("updated_at") or 0)),
+            reverse=True,
+        )
+        return dict(candidates[0])
+
+    @staticmethod
+    def _cap_concept(cap: dict) -> tuple[str | None, str | None]:
+        inferred = cap.get("inferred") or {}
+        topic = inferred.get("topic")
+        aspect = inferred.get("aspect")
+        if topic and topic in SYSTEM_TOPICS:
+            return topic, (aspect if aspect in SYSTEM_ASPECTS else None)
+        intent = str(cap.get("intent") or "")
+        match = re.match(r"vault_([a-z]+)(?:_([a-z]+))?$", intent)
+        if not match:
+            return None, None
+        parsed_topic = match.group(1)
+        parsed_aspect = match.group(2)
+        if parsed_topic not in SYSTEM_TOPICS:
+            # Allow common single-word legacy intents that ARE a topic on their own.
+            legacy_topic_only = {"uptime", "hostname"}
+            if parsed_topic in legacy_topic_only:
+                return parsed_topic, "status"
+            return None, None
+        if parsed_aspect and parsed_aspect not in SYSTEM_ASPECTS:
+            parsed_aspect = None
+        return parsed_topic, parsed_aspect
+
+    def record_alias(self, new_text: str, source_cap: dict) -> dict | None:
+        return self.store.remember_alias(new_text, source_cap)
+
     def propose(self, text: str) -> dict | None:
         if self.is_scout_specific(text):
             return None
@@ -164,16 +418,17 @@ class LearnedCapabilityEngine:
         return self._propose_code_monkey_recipe(normalized)
 
     def propose_correction(self, correction: str, previous_proposal: dict | None = None) -> dict | None:
-        normalized = normalize_text(correction)
+        new_topic, new_aspect = self._infer_topic_and_aspect(correction)
         previous_inferred = (previous_proposal or {}).get("inferred") or {}
-        topic = previous_inferred.get("topic")
-        explicit_topic = self._infer_system_topic(normalized)
-        if explicit_topic and explicit_topic != topic:
-            return self.propose(correction)
-        if topic and self._has_system_aspect(normalized):
-            aspect = self._infer_system_aspect(normalized, topic=topic)
-            return self._code_monkey_recipe_proposal(topic, aspect)
-        return self.propose(correction)
+        previous_topic = previous_inferred.get("topic")
+        if new_topic is None:
+            if previous_topic is None:
+                return None
+            return self._code_monkey_recipe_proposal(previous_topic, new_aspect or previous_inferred.get("aspect") or "usage")
+        safe = self.safety.classify_capability_request(normalize_text(correction))
+        if not safe.get("allowed"):
+            return None
+        return self._code_monkey_recipe_proposal(new_topic, new_aspect or self._default_aspect_for(new_topic))
 
     def correction_updates_previous_request(self, proposal: dict, previous_proposal: dict | None = None) -> bool:
         inferred = proposal.get("inferred") or {}
@@ -185,14 +440,20 @@ class LearnedCapabilityEngine:
         )
 
     def _propose_code_monkey_recipe(self, normalized: str) -> dict | None:
-        topic = self._infer_system_topic(normalized)
+        topic, aspect = self._infer_topic_and_aspect(normalized)
         if topic is None:
             return None
         safe = self.safety.classify_capability_request(normalized)
         if not safe.get("allowed"):
             return None
-        aspect = self._infer_system_aspect(normalized, topic=topic)
-        return self._code_monkey_recipe_proposal(topic, aspect)
+        return self._code_monkey_recipe_proposal(topic, aspect or self._default_aspect_for(topic))
+
+    def _default_aspect_for(self, topic: str | None) -> str:
+        if topic in {"python", "os"}:
+            return "version"
+        if topic in {"hostname", "network", "service", "process", "temperature", "uptime"}:
+            return "status"
+        return "usage"
 
     def _code_monkey_recipe_proposal(self, topic: str, aspect: str) -> dict:
         description = self._describe_inferred_system_info(topic, aspect)
@@ -212,47 +473,6 @@ class LearnedCapabilityEngine:
             },
             "queue_code_monkey": False,
         }
-
-    def _infer_system_topic(self, normalized: str) -> str | None:
-        topics = {
-            "cpu": r"\b(cpu|processor|cores|threads)\b",
-            "memory": r"\b(memory|ram|swap)\b",
-            "gpu": r"\b(gpu|graphics|nvidia)\b",
-            "disk": r"\b(disk|storage|filesystem|space|volume|partition)\b",
-            "uptime": r"\b(uptime|running|been up|how long.*up)\b",
-            "os": r"\b(kernel|linux|os|operating system|distro|distribution)\b",
-            "hostname": r"\b(hostname|host name|machine name)\b",
-            "python": r"\b(python|interpreter|executable)\b",
-            "process": r"\b(process|processes|tasks|top)\b",
-            "network": r"\b(network|ip|address|interface|interfaces)\b",
-            "service": r"\b(service|services|systemd|unit|units)\b",
-            "temperature": r"\b(temperature|temp|thermal|sensors)\b",
-        }
-        for topic, pattern in topics.items():
-            if re.search(pattern, normalized):
-                return topic
-        return None
-
-    def _infer_system_aspect(self, normalized: str, topic: str | None = None) -> str:
-        if topic in {"python", "os"}:
-            return "version"
-        if topic in {"hostname", "network", "service", "process", "temperature", "uptime"}:
-            return "status"
-        if re.search(r"\b(hardware|physical|installed|capacity|total|stick|sticks|dimm|dimms|module|modules)\b", normalized):
-            return "hardware"
-        if re.search(r"\b(status|usage|use|used|available|free|percent|percentage|right now|currently)\b", normalized):
-            return "usage"
-        if topic == "cpu":
-            return "hardware"
-        return "usage"
-
-    def _has_system_aspect(self, normalized: str) -> bool:
-        return bool(
-            re.search(
-                r"\b(hardware|physical|installed|capacity|total|stick|sticks|dimm|dimms|module|modules|status|usage|use|used|available|free|percent|percentage|right now|currently|version|path|running|address|interfaces)\b",
-                normalized,
-            )
-        )
 
     def _describe_inferred_system_info(self, topic: str, aspect: str) -> str:
         topic_names = {

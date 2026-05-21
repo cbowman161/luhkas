@@ -581,8 +581,18 @@ class VaultRuntime:
     def _handle_learned_capability_request(self, message: str, node_id: str) -> dict | None:
         engine = self._learned_engine()
         learned = engine.lookup(message)
+        alias_source = None
+        if learned is None:
+            concept = engine.lookup_by_concept(message)
+            if concept is not None:
+                learned = concept
+                alias_source = concept
         if learned is not None:
             result = engine.execute_capability(learned)
+            if result.get("ok") and alias_source is not None:
+                stored_alias = engine.record_alias(message, alias_source)
+                if stored_alias is not None:
+                    learned = stored_alias
             summary = engine.summarize_result(message, learned, result)
             summary = f"Learned command. {summary}"
             return self._remember_active(self._attach_learned_capability_update({
@@ -591,6 +601,7 @@ class VaultRuntime:
                 "data": {
                     "learned_capability": learned,
                     "execution_result": result,
+                    "alias_recorded": bool(alias_source) and result.get("ok"),
                 },
                 "active_task_id": self.active_task_id,
                 "deterministic": True,
