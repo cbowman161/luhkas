@@ -32,6 +32,17 @@ class CodeMonkeyClient:
             raise RuntimeError("Code Monkey did not return a task_id.")
         return task_id
 
+    def generate_learned_command_recipe(self, user_input, proposal):
+        payload = {
+            "input": user_input,
+            "intent": (proposal or {}).get("intent"),
+            "description": (proposal or {}).get("description"),
+            "target": (proposal or {}).get("target"),
+            "confidence": (proposal or {}).get("confidence"),
+            "inferred": (proposal or {}).get("inferred"),
+        }
+        return self._request("POST", "/learned-command-recipe", payload)
+
     def continue_task(self, active_task_id, followup):
         previous = self.safe_status(active_task_id)
         goal = (
@@ -60,7 +71,7 @@ class CodeMonkeyClient:
     def unread_updates(self):
         response = self._request(
             "GET",
-            "/board?unread=true&mark_read=false&limit=50",
+            "/board?unread=true&mark_read=true&limit=50",
         )
         return response.get("notifications") or []
 

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "vault"))
 sys.modules.setdefault("requests", types.SimpleNamespace())
 
 from command_agent import CommandAgent
+from router import Router
 from vault_runtime import VaultRuntime
 
 
@@ -116,6 +117,58 @@ class FakeRouter:
         return {"mode": "direct", "message": "started coding task", "active_task_id": active_task_id}
 
 
+class FakeCodeMonkeyUpdates:
+    def unread_updates(self):
+        return [
+            {
+                "state": "test_failed",
+                "message": "Verification failed after repairs",
+                "task_id": "task-1",
+                "goal": "Generate a deterministic learned-command recipe for Luhkas Vault.\n\nConfirmed user input: What is your RAM hardware brand?\nIntent: vault_system_info",
+            },
+            {
+                "state": "verified",
+                "message": "Tests passed",
+                "task_id": "task-2",
+                "goal": "Generate a deterministic learned-command recipe for Luhkas Vault.\n\nConfirmed user input: How much disk space does the vault have left?\nIntent: vault_disk_status",
+            },
+            {
+                "state": "building",
+                "message": "Building files",
+                "task_id": "task-3",
+                "goal": "Overwrite existing skill 'snakegame'. Original request: build a playable Snake game with pygame. Modification request: add tests.",
+            },
+            {
+                "state": "queued",
+                "message": "Queued",
+                "task_id": "task-4",
+                "goal": "Complete self-contained specification a developer can implement without further questions",
+            },
+            {
+                "state": "build_failed",
+                "message": "File generation failed",
+                "task_id": "task-5",
+                "goal": "Confirmed user input: What is the vault hostname?",
+            },
+        ]
+
+
+class FakeEventLog:
+    def unread(self):
+        return []
+
+    def mark_read(self, ids):
+        self.marked = ids
+
+
+class FakeBlackboardForRouter:
+    def __init__(self):
+        self.values = {}
+
+    def set(self, key, value):
+        self.values[key] = value
+
+
 class FakeCommandAgent:
     def handle(self, message):
         if message == "ping smoke":
@@ -141,9 +194,81 @@ class CapabilityCommandsTest(unittest.TestCase):
     def test_presence_show_updates_uses_vault_capability_not_scout_routing(self) -> None:
         result = fake_runtime().handle_presence("show updates", node_id="scout", presence_context={})
 
-        self.assertIn("No unread updates.", result["message"])
-        self.assertTrue(result["message"].startswith("Fallback response:"))
+        self.assertEqual(result["message"], "No unread updates.")
+        self.assertTrue(result["deterministic"])
+        self.assertEqual(result["deterministic_source"], "code_monkey_updates")
+        self.assertFalse(result["compose"])
+        self.assertTrue(result["response_composed"])
         self.assertEqual(result["node_id"], "scout")
+
+    def test_presence_updates_aliases_are_deterministic_runtime_commands(self) -> None:
+        for user_input in ("updates", "notification", "notifications", "check notifications", "any updates"):
+            with self.subTest(user_input=user_input):
+                result = fake_runtime().handle_presence(user_input, node_id="scout", presence_context={})
+
+                self.assertEqual(result["message"], "No unread updates.")
+                self.assertTrue(result["deterministic"])
+                self.assertEqual(result["deterministic_source"], "code_monkey_updates")
+                self.assertFalse(result["compose"])
+
+    def test_presence_job_aliases_are_deterministic_runtime_commands(self) -> None:
+        for user_input in ("jobs", "tasks", "queue", "show jobs", "active jobs"):
+            with self.subTest(user_input=user_input):
+                result = fake_runtime().handle_presence(user_input, node_id="scout", presence_context={})
+
+                self.assertEqual(result["message"], "No jobs yet.")
+                self.assertTrue(result["deterministic"])
+                self.assertEqual(result["deterministic_source"], "code_monkey_jobs")
+                self.assertFalse(result["compose"])
+
+    def test_presence_code_monkey_health_is_deterministic_runtime_command(self) -> None:
+        result = fake_runtime().handle_presence("code monkey status", node_id="scout", presence_context={})
+
+        self.assertEqual(result["message"], "Code Monkey service: ok")
+        self.assertTrue(result["deterministic"])
+        self.assertEqual(result["deterministic_source"], "code_monkey_health")
+        self.assertFalse(result["compose"])
+
+    def test_presence_deterministic_commands_remember_the_presence_node(self) -> None:
+        runtime = fake_runtime()
+        delattr(runtime, "_current_node_id")
+
+        result = runtime.handle_presence("updates", node_id="scout", presence_context={})
+
+        self.assertEqual(result["node_id"], "scout")
+        self.assertIn("scout", runtime._node_task_ids)
+
+    def test_cli_updates_and_jobs_are_deterministic_runtime_commands(self) -> None:
+        runtime = fake_runtime()
+
+        updates = runtime.handle("What's the status?", node_id="cli")
+        jobs = runtime.handle("jobs", node_id="cli")
+
+        self.assertEqual(updates["message"], "No unread updates.")
+        self.assertEqual(updates["deterministic_source"], "code_monkey_updates")
+        self.assertFalse(updates["compose"])
+        self.assertEqual(jobs["message"], "No jobs yet.")
+        self.assertEqual(jobs["deterministic_source"], "code_monkey_jobs")
+        self.assertFalse(jobs["compose"])
+
+    def test_router_notifications_are_spoken_concise_summaries(self) -> None:
+        router = Router.__new__(Router)
+        router.code_monkey = FakeCodeMonkeyUpdates()
+        router.event_log = FakeEventLog()
+        router.blackboard = FakeBlackboardForRouter()
+
+        result = router.show_updates()
+        message = result["message"]
+
+        self.assertIn("5 unread notifications.", message)
+        self.assertIn("Code Monkey:", message)
+        self.assertIn("Tests failed: What is your RAM hardware brand?", message)
+        self.assertIn("Passed: How much disk space does the vault have left?", message)
+        self.assertIn("1 more notification hidden.", message)
+        self.assertIn("Say review for details.", message)
+        self.assertNotIn("Generate a deterministic learned-command recipe", message)
+        self.assertNotIn("Return an API-first capability", message)
+        self.assertLess(len(message), 520)
 
     def test_presence_exact_capability_name_runs_system_capability(self) -> None:
         result = fake_runtime().handle_presence("memory usage", node_id="scout", presence_context={})

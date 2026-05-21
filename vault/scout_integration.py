@@ -180,12 +180,55 @@ def _extract_context_phrase(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _extract_context_fact(text: str) -> tuple[str, str, str | None] | None:
+    cleaned = str(text or "").strip()
+    patterns = (
+        r"\bremember\s+for\s+this\s+chat\s+that\s+(?:the\s+)?(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
+        r"\bremember\s+that\s+my\s+(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
+        r"\bmy\s+(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
+        r"\bi\s+(?P<key>like|prefer)\s+(?P<value>[^.?!]+)",
+        r"\bremember\s+(?P<person>Chris)\s+(?P<key>likes|prefers|uses|has)\s+(?P<value>[^.?!]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if not match:
+            continue
+        key = re.sub(r"\s+", " ", match.group("key").lower()).strip()
+        value = match.group("value").strip(" \"'")
+        person = match.groupdict().get("person")
+        if key and value:
+            return key, value, person
+    return None
+
+
 def _conversation_setup_answer(message: str) -> str | None:
     phrase = _extract_context_phrase(message)
-    if not phrase:
-        return None
-    label, value = phrase
-    return f"Got it. The {label} is {value}."
+    if phrase:
+        label, value = phrase
+        return f"Got it. The {label} is {value}."
+    fact = _extract_context_fact(message)
+    if fact:
+        key, value, person = fact
+        if person:
+            return f"I remember {person} {key} {value}."
+        if key in {"like", "prefer"}:
+            verb = "like" if key == "like" else "prefer"
+            return f"I remember you {verb} {value}."
+        return f"I remember your {key} is {value}."
+    return None
+
+
+def _matching_context_fact(user_turns: list[str], key_pattern: str, person: str | None = None) -> tuple[str, str, str | None] | None:
+    for turn in reversed(user_turns):
+        fact = _extract_context_fact(turn)
+        if not fact:
+            continue
+        key, value, fact_person = fact
+        if person and (fact_person or "").lower() != person.lower():
+            continue
+        if re.search(key_pattern, key, re.I):
+            return key, value, fact_person
+    return None
 
 
 def _recent_conversation_answer(message: str, presence_context: dict | None) -> str | None:
@@ -207,11 +250,52 @@ def _recent_conversation_answer(message: str, presence_context: dict | None) -> 
                 return f"The {label} was {value}."
         return "I don't see a marker word or test phrase in the recent chat context."
 
+    if re.search(r"\bwhat\s+(?:.*\s+)?code\s+did\s+i\s+(give|tell)\s+you\b", text):
+        fact = _matching_context_fact(user_turns, r"\bcode\b")
+        if fact:
+            key, value, _person = fact
+            return f"Your {key} is {value}."
+        return "I don't see a code in the recent chat context."
+
+    if re.search(r"\bwhat\s+is\s+my\s+favorite\s+color\b", text):
+        fact = _matching_context_fact(user_turns, r"\bfavorite color\b")
+        if fact:
+            _key, value, _person = fact
+            return f"Your favorite color is {value}."
+        return "I don't see your favorite color in the recent chat context."
+
+    if re.search(r"\bwhat\s+kind\s+of\s+art\s+did\s+i\s+say\s+i\s+(like|prefer)\b", text):
+        fact = _matching_context_fact(user_turns, r"\b(like|prefer)\b")
+        if fact:
+            _key, value, _person = fact
+            return f"You said you like {value}."
+        return "I don't see an art preference in the recent chat context."
+
+    if re.search(r"\bwhat\s+does\s+chris\s+(like|prefer|use|have)\b", text):
+        fact = _matching_context_fact(user_turns, r"\b(likes|prefers|uses|has)\b", person="Chris")
+        if fact:
+            key, value, person = fact
+            return f"{person} {key} {value}."
+        return "I don't see that preference for Chris in the recent chat context."
+
     if re.search(r"\bwhat\s+did\s+i\s+(ask|say|tell)\s+immediately\s+before\s+this\b", text):
         return f"You said: {user_turns[-1]}"
 
+    if re.search(r"\bwhat\s+was\s+my\s+(last|previous)\s+(question|request|message)\b", text):
+        if "question" in text:
+            for turn in reversed(user_turns):
+                if "?" in turn:
+                    return f"Your previous question was: {turn}"
+        return f"Your previous message was: {user_turns[-1]}"
+
     if re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell)\b", text):
         return f"You said: {user_turns[-1]}"
+
+    if re.search(r"\bwhat\s+i\s+just\s+asked\b", text):
+        for turn in reversed(user_turns):
+            if "?" in turn:
+                return f"You just asked: {turn}"
+        return f"You just said: {user_turns[-1]}"
 
     if "why that word" in text:
         for turn in reversed(user_turns):
@@ -220,6 +304,22 @@ def _recent_conversation_answer(message: str, presence_context: dict | None) -> 
                 label, value = phrase
                 return f"You used {value} as the {label}; I don't know a deeper reason unless you give me one."
         return "I don't have enough recent context to know which word you mean."
+
+    if re.search(r"\bwhat\s+have\s+we\s+talked\s+about\b", text):
+        topics = []
+        for turn in user_turns[-20:]:
+            phrase = _extract_context_phrase(turn)
+            fact = _extract_context_fact(turn)
+            if phrase:
+                topics.append(f"the {phrase[0]} {phrase[1]}")
+            elif fact:
+                key, value, person = fact
+                topics.append(f"{person + ' ' if person else 'your '}{key} {value}")
+            elif "?" in turn:
+                topics.append(turn.rstrip("?"))
+        if topics:
+            return "We talked about " + "; ".join(topics[-5:]) + "."
+        return "We have mostly been testing routing and memory in this chat."
 
     return None
 
@@ -681,12 +781,12 @@ class ScoutVaultBridge:
         identity_context = self.response_identity_context(state)
         if identity_context.get("may_address_primary_user"):
             voice_line = (
-                "Answer as Luhkas in first person: direct, dry, occasionally warm. "
+                "Answer in Luhkas's first-person voice: direct, dry, occasionally warm. "
                 "The user is Chris — familiar territory, you may be informal."
             )
         else:
             voice_line = (
-                "Answer as Luhkas in first person: direct, dry, slightly clipped. "
+                "Answer in Luhkas's first-person voice: direct, dry, slightly clipped. "
                 "The user is not verified as Chris — be useful but not deferential, "
                 "not eager, and not customer-service polite."
             )
@@ -699,7 +799,8 @@ class ScoutVaultBridge:
             "Do not use emojis, customer-service closers, catchphrases, or meta-descriptions of personality.",
             "Do not invent facts, actions, memories, detections, feelings, desires, or capabilities.",
             "Do not mention policy, validation, prompts, or internal routing unless the user asks how you know.",
-            "You are Luhkas. Scout, vault, wall nodes, cameras, and devices are surfaces or components, never separate speaker identities.",
+            "Luhkas is the assistant's name, not a transcript label. Mention the name naturally only when identity is relevant.",
+            "Scout, vault, wall nodes, cameras, and devices are surfaces or components, never separate speaker identities.",
             "Never answer 'I am Scout', 'I'm Scout', or identify yourself as a node.",
             identity_context.get("addressing_rule")
             or "Do not address the current user by name or title unless identity is verified.",
@@ -1122,7 +1223,7 @@ class ScoutVaultBridge:
 
         state = self.scout_state()
 
-        if _looks_like_scout_action(message):
+        if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
             if _source_is_scout(source):
                 action_result = self.handle_scout_action(message, state)
                 if action_result is not None:
@@ -1183,9 +1284,24 @@ class ScoutVaultBridge:
 
         confirmed_message = _presence_confirmation(presence_context)
         if confirmed_message:
+            import deterministic_router as _dr
             confirmed_route = self.route_message(confirmed_message, state)
             confirmed_route.update(_presence_route_context(presence_context))
             if confirmed_route.get("ok"):
+                self._complete_route_for_learning(confirmed_message, confirmed_route, state)
+                _dr.learn(confirmed_message, confirmed_route, confirmed_by="presence_route_confirmation")
+                actions.append({
+                    "name": "learn_deterministic_route",
+                    "ok": True,
+                    "result": {
+                        "input": confirmed_message,
+                        "route": confirmed_route.get("route"),
+                        "self_route": (confirmed_route.get("self_route") or {}).get("route")
+                        if isinstance(confirmed_route.get("self_route"), dict)
+                        else None,
+                        "confidence": confirmed_route.get("confidence"),
+                    },
+                })
                 response = self._dispatch_route(
                     confirmed_message,
                     confirmed_route,
@@ -1217,14 +1333,8 @@ class ScoutVaultBridge:
                 corrected_route = self.route_message(corrected_input, state)
                 corrected_route.update(_presence_route_context(presence_context))
                 if corrected_route.get("ok"):
-                    response = self._dispatch_route(
-                        original_message,
-                        corrected_route,
-                        state,
-                        actions,
-                        source=source,
-                        presence_context=presence_context,
-                    )
+                    corrected_desc = _route_description(corrected_route, correction)
+                    response = f"I think you mean {corrected_desc}. Is that right?"
                     turn = {
                         "message": message,
                         "source": source,
@@ -1233,7 +1343,14 @@ class ScoutVaultBridge:
                         "active_identity": self.active_identity,
                         "actions": actions,
                         "routing_feedback": feedback_context,
-                        "answer_provenance": self.build_answer_provenance(original_message, corrected_route, state),
+                        "pending_confirmation": {
+                            "original_message": original_message,
+                            "source": source,
+                            "inferred_route": corrected_route,
+                            "route_description": corrected_desc,
+                            "route_correction": correction,
+                            "corrected_route_input": corrected_input,
+                        },
                     }
                     self.turns.append(turn)
                     self.turns = self.turns[-30:]
@@ -1249,16 +1366,7 @@ class ScoutVaultBridge:
                 "attempts": 0,
                 "deterministic": True,
             }
-            response = self._generated_fact_answer(
-                "recent_conversation",
-                message,
-                state,
-                {
-                    "deterministic_answer": recent_answer,
-                    "conversation_context": _presence_conversation_context(presence_context),
-                },
-                recent_answer,
-            )
+            response = recent_answer
             turn = {
                 "message": message,
                 "source": source,
@@ -1267,6 +1375,30 @@ class ScoutVaultBridge:
                 "active_identity": self.active_identity,
                 "actions": actions,
                 "answer_provenance": self.build_answer_provenance(message, route, state),
+            }
+            self.turns.append(turn)
+            self.turns = self.turns[-30:]
+            return {"ok": True, **turn}
+
+        fast_route = _fast_route_message(message)
+        if fast_route is not None and fast_route.get("deterministic"):
+            fast_route.update(_presence_route_context(presence_context))
+            response = self._dispatch_route(
+                message,
+                fast_route,
+                state,
+                actions,
+                source=source,
+                presence_context=presence_context,
+            )
+            turn = {
+                "message": message,
+                "source": source,
+                "route": fast_route,
+                "response": response,
+                "active_identity": self.active_identity,
+                "actions": actions,
+                "answer_provenance": self.build_answer_provenance(message, fast_route, state),
             }
             self.turns.append(turn)
             self.turns = self.turns[-30:]
@@ -1422,18 +1554,20 @@ class ScoutVaultBridge:
                 max_tokens=120,
             )
 
+        standalone_confirmation = _standalone_confirmation_answer(message)
+        if standalone_confirmation is not None:
+            return standalone_confirmation
+
         setup_answer = _conversation_setup_answer(message)
         if setup_answer is not None and route.get("route") in {"general_question", "direction"}:
-            return self._generated_fact_answer(
-                "context_setup",
-                message,
-                state,
-                {"deterministic_answer": setup_answer},
-                setup_answer,
-            )
+            return setup_answer
+
+        personality_preference = _personality_preference_answer(message)
+        if personality_preference is not None and route.get("route") in {"general_question", "direction"}:
+            return personality_preference
 
         if route["route"] == "direction":
-            if _looks_like_scout_action(message):
+            if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
                 if not _targets_scout_action(message, source):
                     return "That command needs a camera or Scout hardware on the node you are talking to. Say it with 'from Scout' if you want Scout to do it."
                 action_result = self.handle_scout_action(message, state)
@@ -1460,7 +1594,13 @@ class ScoutVaultBridge:
             return self.answer_greeting(message, state)
 
         if route.get("route") == "self_question":
-            return self.answer_self_question(message, state, route)
+            return self.answer_self_question(
+                message,
+                state,
+                route,
+                source=source,
+                presence_context=presence_context,
+            )
 
         if route["route"] == "direction" and _asks_to_remember(message):
             parsed = _parse_simple_memory(message)
@@ -1496,7 +1636,20 @@ class ScoutVaultBridge:
         inferred_route = pending["inferred_route"]
 
         if _is_affirmative(message):
+            self._complete_route_for_learning(original_message, inferred_route, state)
             _dr.learn(original_message, inferred_route)
+            actions.append({
+                "name": "learn_deterministic_route",
+                "ok": True,
+                "result": {
+                    "input": original_message,
+                    "route": inferred_route.get("route"),
+                    "self_route": (inferred_route.get("self_route") or {}).get("route")
+                    if isinstance(inferred_route.get("self_route"), dict)
+                    else None,
+                    "confidence": inferred_route.get("confidence"),
+                },
+            })
             original_source = pending.get("source") or source
             response = self._dispatch_route(
                 original_message,
@@ -1526,24 +1679,24 @@ class ScoutVaultBridge:
             corrected_route.update(_presence_route_context(presence_context))
             if corrected_route.get("ok"):
                 if isinstance(presence_context, dict) and presence_context.get("clarification"):
-                    _dr.learn(original_message, corrected_route)
-                    response = self._dispatch_route(
-                        original_message,
-                        corrected_route,
-                        state,
-                        actions,
-                        source=source,
-                        presence_context=presence_context,
-                    )
+                    corrected_desc = _route_description(corrected_route, correction)
+                    confirm_text = f"I think you mean {corrected_desc}. Is that right?"
                     turn = {
                         "message": message,
                         "source": source,
                         "route": corrected_route,
-                        "response": response,
+                        "response": confirm_text,
                         "active_identity": self.active_identity,
                         "actions": actions,
                         "routing_feedback": presence_context.get("routing_feedback"),
-                        "answer_provenance": self.build_answer_provenance(original_message, corrected_route, state),
+                        "pending_confirmation": {
+                            "original_message": original_message,
+                            "source": source,
+                            "inferred_route": corrected_route,
+                            "route_description": corrected_desc,
+                            "route_correction": correction,
+                            "corrected_route_input": corrected_input,
+                        },
                     }
                     self.turns.append(turn)
                     self.turns = self.turns[-30:]
@@ -1583,6 +1736,13 @@ class ScoutVaultBridge:
         self.turns.append(turn)
         self.turns = self.turns[-30:]
         return {"ok": True, **turn}
+
+    def _complete_route_for_learning(self, message: str, route: dict, state: dict) -> None:
+        if route.get("route") != "self_question" or isinstance(route.get("self_route"), dict):
+            return
+        self_route = self.classify_self_question(message, state)
+        if self_route.get("ok"):
+            route["self_route"] = self_route
 
     def extract_message_keywords(self, message: str, presence_context: dict | None = None) -> dict:
         """Extract known people names and node names mentioned in *message*.
@@ -2219,13 +2379,26 @@ Rules:
                 "feedback response generation failed",
             )
 
-    def answer_self_question(self, message: str, state: dict, route: dict | None = None):
+    def answer_self_question(
+        self,
+        message: str,
+        state: dict,
+        route: dict | None = None,
+        source: str | None = None,
+        presence_context: dict | None = None,
+    ):
         self_route = (route or {}).get("self_route")
         if not isinstance(self_route, dict):
             self_route = self.classify_self_question(message, state)
         if route is not None:
             route["self_route"] = self_route
-        fast_answer = self.fast_self_answer(message, state, self_route)
+        fast_answer = self.fast_self_answer(
+            message,
+            state,
+            self_route,
+            source=source,
+            presence_context=presence_context,
+        )
         if fast_answer is not None:
             return fast_answer
         if self_route.get("ok") and self_route.get("route") == "user_identity":
@@ -2288,82 +2461,68 @@ Do not mention provenance unless asked.
                 "self-question generation failed",
             )
 
-    def fast_self_answer(self, message: str, state: dict, self_route: dict) -> str | None:
+    def fast_self_answer(
+        self,
+        message: str,
+        state: dict,
+        self_route: dict,
+        source: str | None = None,
+        presence_context: dict | None = None,
+    ) -> str | None:
         text = _normalize_command_text(message)
         route_name = self_route.get("route")
         if route_name == "assistant_identity":
             return self._assistant_identity_answer(state, message)
-        if route_name == "status" and _asks_casual_assistant_state(text):
-            return self._assistant_status_answer(state, message)
+        if route_name == "status" and (_asks_feeling_state(text) or _asks_casual_assistant_state(text)):
+            return self._personality_state_answer(message, state)
+        if route_name == "status" and _asks_broad_status_report(text):
+            return self._assistant_status_answer(
+                state,
+                message,
+                source=source,
+                presence_context=presence_context,
+            )
         if route_name == "user_identity":
             identity = self.active_identity
-            fallback = f"You are {identity}." if identity else "I don't know who you are yet."
-            return self._generated_fact_answer(
-                "identity_status",
-                message,
-                state,
-                {"deterministic_answer": fallback, "active_identity": identity},
-                fallback,
-            )
+            return f"You are {identity}." if identity else "I don't know who you are yet."
         if route_name == "capabilities" and _asks_skill_inventory(text):
             return self._registered_skills_answer()
         if route_name == "capabilities" and _asks_capability_inventory(text):
             return self._registered_capabilities_answer()
         if route_name == "personality":
-            return self._personality_state_answer()
+            return self._personality_state_answer(message, state)
         if route_name == "software" and _asks_stored_knowledge_owner(text):
-            fallback = "Stored knowledge belongs to Vault. Scout can witness and forward node state, but Vault owns memory, learning, and retrieval."
-            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback}, fallback, required_terms=("Vault", "Scout"))
+            return "Stored knowledge belongs to Vault. Scout can witness and forward node state, but Vault owns memory, learning, and retrieval."
         if route_name == "software" and _asks_camera_action_owner(text):
-            fallback = "Camera actions belong to Scout's camera_node. Vault can route the request, but Scout owns the camera behavior."
-            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback}, fallback, required_terms=("Vault", "Scout"))
+            return "Camera actions belong to Scout's camera_node. Vault can route the request, but Scout owns the camera behavior."
         if route_name == "status" and _asks_registered_or_active_nodes(text):
             return self._registered_nodes_answer(state, message)
         if route_name == "status" and _asks_tracking_status(text):
             if not state.get("ok"):
-                fallback = "I couldn't read Scout's live state."
-            else:
-                fallback = "Tracking is on." if state.get("tracking_enabled") else "Tracking is off."
-            return self._generated_fact_answer(
-                "self_question",
-                message,
-                state,
-                {"deterministic_answer": fallback, "tracking_enabled": state.get("tracking_enabled")},
-                fallback,
-            )
+                return "I couldn't read Scout's live state."
+            return "Tracking is on." if state.get("tracking_enabled") else "Tracking is off."
         if route_name == "status" and _asks_pose_interval(text):
             interval = state.get("pose_interval_frames")
-            fallback = (
-                "I couldn't read the pose interval from Scout's live state."
-                if interval is None
-                else f"The pose interval is set to every {interval} frames."
-            )
-            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback, "pose_interval_frames": interval}, fallback)
+            if interval is None:
+                return "I couldn't read the pose interval from Scout's live state."
+            return f"The pose interval is set to every {interval} frames."
         if route_name == "goals" and _asks_why_here(text):
             role = self.identity_profile.get("role") or "the assistant Chris created"
-            fallback = f"I'm here as {role}: to help with tasks, remember useful things, and work through the vault and connected nodes."
-            return self._generated_fact_answer("self_question", message, state, {"deterministic_answer": fallback, "role": role}, fallback)
+            return f"I'm here as {role}: to help with tasks, remember useful things, and work through the vault and connected nodes."
         if route_name == "hardware":
             return self._hardware_summary_answer()
         if route_name == "sensors":
             return self._sensors_summary_answer()
         return None
 
-    def _personality_state_answer(self) -> str:
-        identity_context = self.response_identity_context({"ok": True})
+    def _personality_state_answer(self, message: str = "", live_state: dict | None = None) -> str:
+        live_state = live_state or {"ok": True}
+        identity_context = self.response_identity_context(live_state)
         state = self.mood_engine.voice_state(identity_context)
         voice = state.get("voice") or {}
         mood = state.get("mood") or {}
         style = self.mood_engine.style_state().get("resolved") or {}
-        audience = "verified" if state.get("verified_primary_user") else "unverified"
-        return (
-            "Personality state: "
-            f"audience {audience}; dry wit {_voice_band(voice.get('sarcasm'))}; "
-            f"warmth {_voice_band(voice.get('warmth'))}; brevity {_voice_band(voice.get('brevity'))}; "
-            f"directness {_voice_band(voice.get('directness'))}. "
-            f"Mood: patience {_voice_band(mood.get('patience'))}, irritation {_voice_band(mood.get('irritation'))}; "
-            f"style baseline rudeness {_voice_band(style.get('rudeness'))}, capped for the current audience."
-        )
+        return _mood_statement_from_state(voice, mood, style, bool(state.get("verified_primary_user")))
 
     def _generated_fact_answer(
         self,
@@ -2397,43 +2556,54 @@ Do not mention provenance unless asked.
         return self.response_composer.varied_fallback(fallback, recent)
 
     def _assistant_identity_answer(self, state: dict | None = None, message: str = "") -> str:
-        state = state or {"ok": True}
         name = self.identity_profile.get("name") or "Luhkas"
-        creator = self.identity_profile.get("creator") or "Chris"
-        fallback = f"I'm {name}. {creator} built me; Scout is just one body I can use."
-        return self._generated_fact_answer(
-            "self_question",
-            message or "Who are you?",
-            state,
-            {
-                "deterministic_answer": fallback,
-                "name": name,
-                "creator": creator,
-                "node_boundary": "Scout is a connected body/node, not the assistant identity.",
-            },
-            fallback,
-            required_terms=(name,),
-        )
+        return _assistant_intro_statement(name)
 
-    def _assistant_status_answer(self, state: dict, message: str = "") -> str:
-        if state.get("ok"):
-            tracking = "tracking is on" if state.get("tracking_enabled") else "tracking is off"
-            fallback = f"I'm Luhkas. Scout is online, {tracking}, and I'm running through the vault."
-        else:
-            fallback = "I'm Luhkas. The vault is up, but I can't read Scout's live state right now."
-        return self._generated_fact_answer(
-            "self_question",
-            message or "How are you?",
-            state,
-            {
-                "deterministic_answer": fallback,
-                "scout_online": bool(state.get("ok")),
-                "tracking_enabled": state.get("tracking_enabled"),
-                "vault_runtime": True,
-            },
-            fallback,
-            required_terms=("Luhkas",),
+    def _assistant_status_answer(
+        self,
+        state: dict,
+        message: str = "",
+        source: str | None = None,
+        presence_context: dict | None = None,
+    ) -> str:
+        text = _normalize_command_text(message)
+        source_node = _source_node_id(source, presence_context)
+        if _asks_broad_status_report(text):
+            operational_facts = _operational_status_facts(
+                state,
+                source_node=source_node,
+            )
+            return _operational_status_statement(operational_facts)
+
+        identity_context = self.response_identity_context(state)
+        mood_state = self.mood_engine.voice_state(identity_context)
+        voice = mood_state.get("voice") or {}
+        mood = mood_state.get("mood") or {}
+        style = self.mood_engine.style_state().get("resolved") or {}
+        mood_statement = _mood_statement_from_state(
+            voice,
+            mood,
+            style,
+            bool(mood_state.get("verified_primary_user")),
         )
+        scout_facts = _scout_status_facts(state) if _source_is_scout(source_node) else None
+        fallback = _status_report_statement(mood_statement, scout_facts)
+        facts = {
+            "deterministic_answer": fallback,
+            "mood_statement": mood_statement,
+            "mood_values": mood,
+            "voice_values": voice,
+            "style_values": style,
+            "source_node": source_node,
+            "scout_status": scout_facts,
+            "instruction": (
+                "Generate a fresh first-person status answer. "
+                "For Scout-origin requests, include the provided Scout live-status facts. "
+                "Do not mention faces, identities, or people unless those facts are explicitly supplied."
+            ),
+        }
+        required_terms = ("Scout",) if scout_facts else ()
+        return fallback
 
     def _hardware_summary_answer(self) -> str:
         hw = (self.self_knowledge_for_route("hardware").get("records", {}) or {}).get("hardware", {}) or {}
@@ -2457,27 +2627,13 @@ Do not mention provenance unless asked.
             parts.append(f"Vault PC: {', '.join(vault_bits)}")
         if scout_bits:
             parts.append(f"Scout body: {', '.join(scout_bits)}")
-        fallback = ". ".join(parts) + "." if parts else "I don't have my hardware sheet loaded."
-        return self._generated_fact_answer(
-            "self_question",
-            "hardware summary",
-            {"ok": True},
-            {"deterministic_answer": fallback, "hardware_parts": parts},
-            fallback,
-        )
+        return ". ".join(parts) + "." if parts else "I don't have my hardware sheet loaded."
 
     def _sensors_summary_answer(self) -> str:
         rec = (self.self_knowledge_for_route("sensors").get("records", {}) or {}).get("sensors", {}) or {}
         items = rec.get("available_or_planned") or []
         live = [s for s in items if not str(s).lower().startswith("planned") and "possible" not in str(s).lower()]
-        fallback = "I don't have a sensor list loaded." if not live else "Sensors: " + ", ".join(live[:6]) + "."
-        return self._generated_fact_answer(
-            "self_question",
-            "sensors summary",
-            {"ok": True},
-            {"deterministic_answer": fallback, "sensors": live[:6]},
-            fallback,
-        )
+        return "I don't have a sensor list loaded." if not live else "Sensors: " + ", ".join(live[:6]) + "."
 
     def _registered_nodes_answer(self, state: dict | None = None, message: str = "") -> str:
         snapshot = self.registered_nodes_snapshot()
@@ -2494,19 +2650,7 @@ Do not mention provenance unless asked.
             names.append(f"{name}{suffix}")
         count = len(names)
         noun = "node" if count == 1 else "nodes"
-        fallback = f"The live node registry currently shows {count} registered {noun}: {', '.join(names)}."
-        return self._generated_fact_answer(
-            "self_question",
-            message or "Which nodes are registered?",
-            state or {"ok": True},
-            {
-                "deterministic_answer": fallback,
-                "registered_node_count": count,
-                "registered_nodes": names,
-            },
-            fallback,
-            required_terms=("Vault", "scout"),
-        )
+        return f"The live node registry currently shows {count} registered {noun}: {', '.join(names)}."
 
     def _source_node_module_block(
         self,
@@ -2576,35 +2720,24 @@ Do not mention provenance unless asked.
 
     def _registered_capabilities_answer(self) -> str:
         if self.capability_registry is None:
-            fallback = "I couldn't read the capability registry."
-            return self._generated_fact_answer("self_question", "capabilities", {"ok": True}, {"deterministic_answer": fallback}, fallback)
+            return "I couldn't read the capability registry."
         capabilities = self.capability_registry.list()
         if not capabilities:
-            fallback = "The capability registry is empty right now."
-            return self._generated_fact_answer("self_question", "capabilities", {"ok": True}, {"deterministic_answer": fallback}, fallback)
+            return "The capability registry is empty right now."
         names = [
             str(cap.get("display_name") or cap.get("name") or "unnamed").replace("_", " ")
             for cap in capabilities[:8]
         ]
         extra = len(capabilities) - len(names)
         suffix = f", plus {extra} more" if extra > 0 else ""
-        fallback = f"The capability registry lists {len(capabilities)} capabilities: {', '.join(names)}{suffix}."
-        return self._generated_fact_answer(
-            "self_question",
-            "capabilities",
-            {"ok": True},
-            {"deterministic_answer": fallback, "capability_count": len(capabilities), "capabilities": names},
-            fallback,
-        )
+        return f"The capability registry lists {len(capabilities)} capabilities: {', '.join(names)}{suffix}."
 
     def _registered_skills_answer(self) -> str:
         if self.skill_registry is None:
-            fallback = "I couldn't read the skill registry."
-            return self._generated_fact_answer("self_question", "skills", {"ok": True}, {"deterministic_answer": fallback}, fallback)
+            return "I couldn't read the skill registry."
         skills = self.skill_registry.list()
         if not skills:
-            fallback = "The skill registry is empty right now."
-            return self._generated_fact_answer("self_question", "skills", {"ok": True}, {"deterministic_answer": fallback}, fallback)
+            return "The skill registry is empty right now."
         names = [
             str(skill.get("name") or skill.get("display_name") or "unnamed").replace("_", " ")
             for skill in skills[:8]
@@ -2612,39 +2745,17 @@ Do not mention provenance unless asked.
         extra = len(skills) - len(names)
         suffix = f", plus {extra} more" if extra > 0 else ""
         noun = "skill" if len(skills) == 1 else "skills"
-        fallback = f"The skill registry lists {len(skills)} {noun}: {', '.join(names)}{suffix}."
-        return self._generated_fact_answer(
-            "self_question",
-            "skills",
-            {"ok": True},
-            {"deterministic_answer": fallback, "skill_count": len(skills), "skills": names},
-            fallback,
-        )
+        return f"The skill registry lists {len(skills)} {noun}: {', '.join(names)}{suffix}."
 
     def answer_greeting(self, message: str, state: dict):
-        return self.generate_response(
-            "greeting",
-            message,
-            state,
-            {
-                "identity_memory": self.identity_profile,
-                "identity_context": self.response_identity_context(state),
-                "instructions": [
-                    "one short sentence",
-                    "no camera, tracking, visible people, recognition, names, or objects",
-                    "do not address the user by name or title unless identity_context.may_address_primary_user is true",
-                    "do not invent a nickname or object label for the user",
-                    "use a little edge if it fits",
-                    "do not describe your own style or personality traits",
-                    "do not sound like customer service",
-                    "do not end with a generic offer to help",
-                    "no repeated catchphrase",
-                    "no emojis",
-                ],
-            },
-            max_tokens=48,
-            temperature=0.75,
-        )
+        text = _canonical_intent_text(message)
+        if "morning" in text:
+            return "Good morning."
+        if "afternoon" in text:
+            return "Good afternoon."
+        if "evening" in text:
+            return "Good evening."
+        return "Hello."
 
     def _compose_response(
         self,
@@ -2695,6 +2806,10 @@ Do not mention provenance unless asked.
             "primary_user": self.identity_profile.get("primary_user"),
             "primary_user_title": self.identity_profile.get("primary_user_title"),
         }
+        fallback = (
+            self.cleanup_policy_failed_response(response_type, state, "model generation failed")
+            or "I don't know that from the information I have."
+        )
         return self._compose_response(
             response_type,
             message,
@@ -2705,7 +2820,7 @@ Do not mention provenance unless asked.
                 "rover_tracking_available": bool(state.get("ok")),
                 "active_identity": self.active_identity if state.get("ok") else None,
             },
-            "I could not generate that response cleanly.",
+            fallback,
             options={"num_predict": max_tokens, "temperature": temperature},
         )
 
@@ -2768,7 +2883,7 @@ Do not mention provenance unless asked.
         elif response_type == "feedback_learned":
             text = "Got it. I will use that next time."
         elif response_type == "identity_binding_blocked":
-            text = "I need a verified visible person before I can attach that."
+            text = "I can't verify your identity from the current context yet."
         elif response_type == "memory_needs_clarification":
             text = "I'd save that, but I don't know who you are yet."
         elif response_type == "memory_saved":
@@ -2799,6 +2914,16 @@ Do not mention provenance unless asked.
             return "The response referred to the assistant in third person instead of answering directly."
         if _claims_assistant_is_node_identity(text):
             return "The response identified the assistant as a node instead of Luhkas."
+        if response_type == "assistant_identity" and _assistant_identity_response_violation(text):
+            return "The assistant identity response volunteered creator, node/body, or current-user identity details."
+        if response_type == "mood_statement" and _mood_statement_response_violation(text):
+            return "The mood response included operational or Scout status instead of mood only."
+        if _echoes_generation_instruction(text):
+            return "The response echoed a generation instruction instead of answering the user."
+        if response_type == "greeting" and _volunteers_node_boundary(text):
+            return "The greeting volunteered node-boundary details instead of simply greeting."
+        if response_type == "status_report" and _status_report_response_violation(text):
+            return "The status report invented identity, face, or primary-user details."
         if re.search(r"\bmaintaining anonymity\b", str(text or ""), re.I):
             return "The response used vague anonymity wording instead of answering the question directly."
         if _sounds_like_customer_service(text):
@@ -2969,18 +3094,12 @@ Do not address the user by name/title unless identity_context permits it.
         state = state or self.scout_state()
         text = _normalize_command_text(message)
 
+        toggle_request = _parse_scout_toggle_request(text)
+        if toggle_request is not None:
+            return self._handle_scout_toggle_request(toggle_request, state)
+
         if _has_any(text, ("status", "state", "why aren't you moving", "why are you not moving")):
-            message = self._generated_fact_answer(
-                "scout_status",
-                message,
-                state,
-                {
-                    "deterministic_answer": _scout_state_explanation(state),
-                    "scout_state": _compact_scout_state(state),
-                },
-                _scout_state_explanation(state),
-                required_terms=("Scout",),
-            )
+            message = _scout_state_explanation(state)
             return {
                 "ok": True,
                 "action": "inspect_scout_state",
@@ -3058,6 +3177,43 @@ Do not address the user by name/title unless identity_context permits it.
 
         if _has_any(text, ("record a clip", "save a clip", "video clip", "record video", "record a video", "take a video")):
             return self._compose_action_result(message, state, self.capture_clip())
+
+    def _handle_scout_toggle_request(self, request: dict, state: dict) -> dict:
+        label = request["label"]
+        state_key = request["state_key"]
+        desired = request.get("desired")
+        current = _toggle_state_value(state, state_key)
+        if desired is None:
+            if current is None:
+                return {
+                    "ok": False,
+                    "action": "inspect_toggle",
+                    "message": f"I couldn't read {label} from Scout's live state.",
+                    "toggle": request,
+                }
+            return {
+                "ok": True,
+                "action": "inspect_toggle",
+                "message": f"{label} is {'on' if current else 'off'}.",
+                "toggle": request,
+                "value": current,
+            }
+        endpoint = request["endpoint"]
+        payload = {request["body_key"]: desired}
+        result = self._post_json(f"{self.scout_url}{endpoint}", payload)
+        ok = bool(result.get("ok"))
+        return {
+            "ok": ok,
+            "action": "control_toggle",
+            "message": (
+                f"{label} is {'on' if desired else 'off'}."
+                if ok
+                else f"I could not turn {label.lower()} {'on' if desired else 'off'}."
+            ),
+            "toggle": request,
+            "payload": payload,
+            "result": result,
+        }
 
         return None
 
@@ -3777,12 +3933,13 @@ def _asks_to_stop_chat(message: str) -> bool:
     }
 
 
-def _source_node_id(source: str | None, presence_context: dict | None) -> str:
+def _source_node_id(source: str | None, presence_context: dict | None = None) -> str:
     if isinstance(presence_context, dict):
-        node_id = str(presence_context.get("node_id") or presence_context.get("source") or "").strip()
-        if node_id:
-            return _normalize_source(node_id)
-    return _normalize_source(source or "unknown_edge")
+        for key in ("node_id", "source_node", "source"):
+            node_id = str(presence_context.get(key) or "").strip()
+            if node_id:
+                return _normalize_source(node_id)
+    return _normalize_source(source)
 
 
 def _required_source_module(message: str) -> str | None:
@@ -3893,8 +4050,49 @@ def _asks_about_previous_answer_source(message: str) -> bool:
     )
 
 
+def _standalone_confirmation_answer(message: str) -> str | None:
+    text = _canonical_intent_text(message)
+    if text in {"yes", "yeah", "yep", "correct", "right", "no", "nope", "nah"}:
+        return "I do not have a pending confirmation for that."
+    return None
+
+
+def _personality_preference_answer(message: str) -> str | None:
+    text = _canonical_intent_text(message)
+    if "did i say" in text or "my favorite" in text:
+        return None
+    if re.search(r"\b(what kind of art|what art|art do you like|favorite art|favourite art)\b", text):
+        return (
+            "I am still forming that preference, but I am drawn to art with structure and a little unease. "
+            "Which direction should I learn from first: stark architecture, strange portraits, luminous landscapes, or rough experimental work?"
+        )
+    return None
+
+
 def _fast_route_message(message: str) -> dict | None:
     text = _canonical_intent_text(message)
+    if _is_social_greeting(text):
+        return {
+            "ok": True,
+            "route": "greeting",
+            "confidence": 1.0,
+            "reason": "common social greeting",
+            "attempts": 0,
+            "deterministic": True,
+        }
+    if _asks_feeling_state(text) or _asks_casual_assistant_state(text):
+        return _self_route("personality", "asks assistant felt mood state")
+    if _asks_broad_status_report(text):
+        return _self_route("status", "asks operational status")
+    if _personality_preference_answer(text) is not None:
+        return {
+            "ok": True,
+            "route": "general_question",
+            "confidence": 0.95,
+            "reason": "asks personality preference with curiosity follow-up",
+            "attempts": 0,
+            "deterministic": True,
+        }
     if _is_conversation_context_setup(text):
         return {
             "ok": True,
@@ -3944,14 +4142,31 @@ def _fast_route_message(message: str) -> dict | None:
     return None
 
 
+def _is_social_greeting(text: str) -> bool:
+    return text in {
+        "hello",
+        "hi",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "morning",
+        "afternoon",
+        "evening",
+    }
+
+
 def _is_conversation_context_setup(text: str) -> bool:
     return bool(
-        re.search(r"\b(test|marker|token|code word|password|phrase)\b", text)
-        and re.search(r"\b(is|equals|was|remember)\b", text)
-        and (
-            re.search(r"\breply\s+with\b", text)
-            or _extract_context_phrase(text) is not None
+        (
+            re.search(r"\b(test|marker|token|code word|password|phrase)\b", text)
+            and re.search(r"\b(is|equals|was|remember)\b", text)
+            and (
+                re.search(r"\breply\s+with\b", text)
+                or _extract_context_phrase(text) is not None
+            )
         )
+        or _extract_context_fact(text) is not None
     )
 
 
@@ -3962,6 +4177,9 @@ def _asks_recent_conversation(text: str) -> bool:
         or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|marker\s+word|test\s+phrase|test\s+word|word|phrase|thing|request)\b", text)
         or re.search(r"\bwhat\s+did\s+i\s+(ask|say|tell)\s+immediately\s+before\s+this\b", text)
         or re.search(r"\b(what|which)\s+(was|were)\s+my\s+(last|previous)\s+(message|question|request)\b", text)
+        or re.search(r"\bwhat\s+is\s+my\s+favorite\s+color\b", text)
+        or re.search(r"\bwhat\s+(?:.*\s+)?code\s+did\s+i\s+(give|tell)\s+you\b", text)
+        or re.search(r"\bwhat\s+kind\s+of\s+art\s+did\s+i\s+say\s+i\s+(like|prefer)\b", text)
         or re.search(r"\bwhat\s+did\s+you\s+just\s+(say|tell\s+me|ask)\b", text)
         or re.search(r"\bwhy\s+(not|that\s+word|did\s+you\s+say\s+that)\b", text)
     )
@@ -4008,6 +4226,368 @@ def _voice_band(value) -> str:
     return "high"
 
 
+def _mood_statement_from_state(voice: dict, mood: dict, style: dict, verified_primary_user: bool = False) -> str:
+    """Turn internal mood/style numbers into a qualitative first-person statement."""
+    patience = float(mood.get("patience", 0.8) or 0.8)
+    irritation = float(mood.get("irritation", 0.0) or 0.0)
+    arousal = float(mood.get("arousal", 0.3) or 0.3)
+    valence = float(mood.get("valence", 0.0) or 0.0)
+    social_energy = float(mood.get("social_energy", 0.5) or 0.5)
+    playfulness = float(voice.get("playfulness", mood.get("playfulness", 0.5)) or 0.5)
+    warmth = float(voice.get("warmth", style.get("warmth", 0.45)) or 0.45)
+    brevity = float(voice.get("brevity", style.get("brevity", 0.75)) or 0.75)
+
+    if irritation >= 0.65:
+        center = "irritated and tense"
+    elif arousal >= 0.68 and valence < -0.05:
+        center = "restless and keyed up"
+    elif arousal >= 0.68:
+        center = "alert and energized"
+    elif valence >= 0.25:
+        center = "upbeat and engaged"
+    elif valence <= -0.20:
+        center = "low and quiet"
+    else:
+        center = "calm and steady"
+
+    if patience >= 0.72:
+        patience_phrase = "patient"
+    elif patience >= 0.45:
+        patience_phrase = "a little impatient"
+    else:
+        patience_phrase = "impatient"
+
+    if social_energy >= 0.68 or warmth >= 0.62:
+        social_phrase = "open to people"
+    elif social_energy <= 0.35:
+        social_phrase = "more inward than social"
+    else:
+        social_phrase = "present but not especially chatty"
+
+    if playfulness >= 0.62 and irritation < 0.55:
+        edge_phrase = "curious and a little playful"
+    elif irritation >= 0.45:
+        edge_phrase = "a bit sharp"
+    elif brevity >= 0.78:
+        edge_phrase = "quietly focused"
+    else:
+        edge_phrase = "clear-headed"
+
+    return f"I feel {center}, {patience_phrase}, {social_phrase}, and {edge_phrase}."
+
+
+def _assistant_intro_statement(name: str | None = None) -> str:
+    safe_name = str(name or "Luhkas").strip() or "Luhkas"
+    return f"I'm {safe_name}: a local AI that helps think, remember, and act through the systems connected to me."
+
+
+def _assistant_identity_response_violation(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    if "chris" in lowered or "scout" in lowered:
+        return True
+    if re.search(r"\byou(?:'re| are| are not| aren't|re not)\b", lowered):
+        return True
+    if re.search(r"\bcreator|built me|made me|body|node\b", lowered):
+        return True
+    return False
+
+
+def _status_report_response_violation(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return bool(re.search(r"\b(chris|face|faces|known|identity|identities|recognize|recognition)\b", lowered))
+
+
+def _mood_statement_response_violation(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return bool(
+        re.search(
+            r"\b(scout|tracking|tracker|visible|detection|detections|chair|clock|wheel|wheels|manual mode|vault|service|hardware|thread|edges|edge|voice|style|settings|directive|directives)\b",
+            lowered,
+        )
+    )
+
+
+SCOUT_TOGGLE_DEFINITIONS = (
+    {
+        "state_key": "tracking_enabled",
+        "label": "Tracking",
+        "endpoint": "/tracking",
+        "body_key": "enabled",
+        "aliases": ("tracking", "target tracking", "object tracking"),
+    },
+    {
+        "state_key": "guard_mode",
+        "label": "Guard mode",
+        "endpoint": "/guard",
+        "body_key": "enabled",
+        "aliases": ("guard", "guard mode"),
+    },
+    {
+        "state_key": "follow_enabled",
+        "label": "Follow",
+        "endpoint": "/tracking",
+        "body_key": "follow",
+        "aliases": ("follow", "follow mode", "follow wheels", "following"),
+    },
+    {
+        "state_key": "search_movement_enabled",
+        "label": "Search camera",
+        "endpoint": "/settings",
+        "body_key": "search_movement_enabled",
+        "aliases": ("search camera", "search movement", "search movement mode"),
+    },
+    {
+        "state_key": "wheel_enabled",
+        "label": "Wheel motion",
+        "endpoint": "/settings",
+        "body_key": "wheel_enabled",
+        "aliases": ("wheel motion", "wheel drive", "wheels", "wheel movement"),
+    },
+    {
+        "state_key": "manual_controller_enabled",
+        "label": "Manual control",
+        "endpoint": "/settings",
+        "body_key": "manual_controller_enabled",
+        "aliases": ("manual control", "manual controller", "gamepad", "usb gamepad"),
+    },
+    {
+        "state_key": "camera_light_auto_enabled",
+        "label": "Auto low-light",
+        "endpoint": "/settings",
+        "body_key": "camera_light_auto_enabled",
+        "aliases": ("auto low light", "auto low-light", "auto light", "automatic light", "camera light auto"),
+    },
+    {
+        "state_key": "camera_light_enabled",
+        "label": "Camera light",
+        "endpoint": "/settings",
+        "body_key": "camera_light_enabled",
+        "aliases": ("camera light", "light", "lamp"),
+    },
+    {
+        "state_key": "edge_reacquire_enabled",
+        "label": "Edge reacquire",
+        "endpoint": "/settings",
+        "body_key": "edge_reacquire_enabled",
+        "aliases": ("edge reacquire", "edge reacquisition"),
+    },
+    {
+        "state_key": "collision_avoidance_enabled",
+        "label": "Collision avoidance",
+        "endpoint": "/collision",
+        "body_key": "enabled",
+        "aliases": ("collision avoidance", "collision guard", "collision"),
+    },
+    {
+        "state_key": "face_detection_enabled",
+        "label": "Face detection",
+        "endpoint": "/settings",
+        "body_key": "face_detection_enabled",
+        "aliases": ("face detection", "detect faces"),
+    },
+    {
+        "state_key": "face_recognition_enabled",
+        "label": "Face recognition",
+        "endpoint": "/settings",
+        "body_key": "face_recognition_enabled",
+        "aliases": ("face recognition", "recognition", "recognize faces"),
+    },
+    {
+        "state_key": "auto_reference_capture_enabled",
+        "label": "Auto reference capture",
+        "endpoint": "/settings",
+        "body_key": "auto_reference_capture_enabled",
+        "aliases": ("auto reference capture", "auto capture refs", "auto-capture refs", "automatic reference capture"),
+    },
+    {
+        "state_key": "pose_filter_persons",
+        "label": "Pose ghost filter",
+        "endpoint": "/settings",
+        "body_key": "pose_filter_persons",
+        "aliases": ("pose ghost filter", "filter ghosts by pose", "pose filter persons", "ghost filter"),
+    },
+    {
+        "state_key": "pose_enabled",
+        "label": "Pose estimation",
+        "endpoint": "/settings",
+        "body_key": "pose_enabled",
+        "aliases": ("pose estimation", "pose", "pose tracking"),
+    },
+)
+
+
+def _parse_scout_toggle_request(text: str) -> dict | None:
+    text = _normalize_command_text(text)
+    if not text:
+        return None
+    desired = None
+    if re.search(r"\b(turn|switch|set)\s+.+\b(on|enabled?)\b", text) or re.search(r"\b(enable|start)\b", text):
+        desired = True
+    elif re.search(r"\b(turn|switch|set)\s+.+\b(off|disabled?)\b", text) or re.search(r"\b(disable|stop)\b", text):
+        desired = False
+    elif re.search(r"\b(on|enabled?)\s*$", text) and not re.match(r"^(?:is|are|whats|what is)\b", text):
+        desired = True
+    elif re.search(r"\b(off|disabled?)\s*$", text) and not re.match(r"^(?:is|are|whats|what is)\b", text):
+        desired = False
+    is_query = desired is None and bool(
+        re.match(r"^(?:is|are|whats|what is|status of|check)\b", text)
+        or re.search(r"\b(status|state)\b", text)
+        or text.endswith("?")
+    )
+    for item in SCOUT_TOGGLE_DEFINITIONS:
+        if any(_phrase_in_text(alias, text) for alias in item["aliases"]):
+            if desired is None and not is_query:
+                return None
+            return {**item, "desired": desired}
+    return None
+
+
+def _toggle_state_value(state: dict, state_key: str) -> bool | None:
+    if state_key == "manual_controller_enabled":
+        gamepad = state.get("gamepad") if isinstance(state, dict) else {}
+        if isinstance(gamepad, dict) and "enabled" in gamepad:
+            return bool(gamepad.get("enabled"))
+        return None
+    if isinstance(state, dict) and state_key in state:
+        return bool(state.get(state_key))
+    return None
+
+
+def _echoes_generation_instruction(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return bool(
+        "deterministic answer" in lowered
+        or "keep the same meaning" in lowered
+        or "without copying it verbatim" in lowered
+        or "the facts require" in lowered
+        or "final user-facing answer" in lowered
+    )
+
+
+def _volunteers_node_boundary(text: str) -> bool:
+    lowered = str(text or "").casefold()
+    return bool(
+        "not a node" in lowered
+        or "separate speaker identit" in lowered
+        or re.search(r"\b(?:a|the)\s+system,\s+not\s+(?:a\s+)?node\b", lowered)
+    )
+
+
+def _scout_status_facts(state: dict) -> dict:
+    detections = state.get("detections") or []
+    label_counts = {}
+    for item in detections:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip().lower()
+        if label:
+            label_counts[label] = label_counts.get(label, 0) + 1
+    ambient = state.get("ambient_light_level")
+    try:
+        ambient = round(float(ambient), 1)
+    except (TypeError, ValueError):
+        ambient = None
+    behavior = state.get("behavior") or {}
+    return {
+        "ok": bool(state.get("ok")),
+        "behavior_state": behavior.get("state") if isinstance(behavior, dict) else None,
+        "target_state": state.get("target_state"),
+        "tracking_enabled": bool(state.get("tracking_enabled")),
+        "follow_enabled": bool(state.get("follow_enabled")),
+        "guard_mode": bool(state.get("guard_mode")),
+        "wheel_enabled": bool(state.get("wheel_enabled")),
+        "collision_blocked": bool(state.get("collision_blocked")),
+        "visible_detection_count": len(detections),
+        "visible_detection_labels": dict(sorted(label_counts.items())[:6]),
+        "ambient_light_level": ambient,
+    }
+
+
+def _status_report_statement(mood_statement: str, scout_facts: dict | None = None) -> str:
+    mood_statement = str(mood_statement or "").strip() or "I feel steady."
+    if not scout_facts:
+        return mood_statement
+    if not scout_facts.get("ok"):
+        return f"{mood_statement} I cannot read Scout's live status right now."
+    behavior = str(scout_facts.get("behavior_state") or "unknown").lower()
+    target_state = scout_facts.get("target_state") or "none"
+    tracking = "tracking on" if scout_facts.get("tracking_enabled") else "tracking off"
+    wheels = "wheel drive on" if scout_facts.get("wheel_enabled") else "wheel drive off"
+    blocked = ", collision blocked" if scout_facts.get("collision_blocked") else ""
+    detections = scout_facts.get("visible_detection_count")
+    detection_phrase = f", {detections} visible detection{'s' if detections != 1 else ''}" if detections is not None else ""
+    return (
+        f"{mood_statement} Scout is in {behavior} mode with target state {target_state}, "
+        f"{tracking}, {wheels}{blocked}{detection_phrase}."
+    )
+
+
+def _operational_status_facts(
+    state: dict,
+    models: dict | None = None,
+    hardware: dict | None = None,
+    source_node: str | None = None,
+) -> dict:
+    scout = _scout_status_facts(state)
+    tracker = state.get("tracker") if isinstance(state.get("tracker"), dict) else {}
+    vault_memory = state.get("vault_memory") if isinstance(state.get("vault_memory"), dict) else {}
+    running_services = ["Vault runtime"]
+    if _source_is_scout(source_node):
+        running_services.append("Scout presence")
+    if state.get("ok"):
+        running_services.append("Scout vision")
+    return {
+        "source_node": source_node,
+        "running_services": running_services,
+        "scout": {
+            "state": scout,
+            "tracker": {
+                "bytetracker_enabled": tracker.get("bytetracker_enabled"),
+                "active_objects": tracker.get("active_objects"),
+                "memory_objects": tracker.get("memory_objects"),
+            },
+            "options": {
+                "pose_enabled": state.get("pose_enabled"),
+                "face_detection_enabled": state.get("face_detection_enabled"),
+                "face_recognition_enabled": state.get("face_recognition_enabled"),
+                "person_memory_enabled": state.get("person_memory_enabled"),
+                "collision_avoidance_enabled": state.get("collision_avoidance_enabled"),
+                "camera_light_auto_enabled": state.get("camera_light_auto_enabled"),
+                "vault_memory_enabled": vault_memory.get("enabled"),
+                "vault_memory_synced": vault_memory.get("last_face_sync_ok"),
+            },
+        },
+    }
+
+
+def _operational_status_statement(facts: dict) -> str:
+    scout = facts.get("scout") or {}
+    scout_state = scout.get("state") or {}
+    tracker = scout.get("tracker") or {}
+    options = scout.get("options") or {}
+    running_services = [str(item) for item in (facts.get("running_services") or []) if str(item)]
+    behavior = str(scout_state.get("behavior_state") or "unknown").lower()
+    detections = scout_state.get("visible_detection_count")
+    option_states = [
+        f"wheel motion {'on' if scout_state.get('wheel_enabled') else 'off'}",
+        f"tracking {'on' if scout_state.get('tracking_enabled') else 'off'}",
+        f"follow {'on' if scout_state.get('follow_enabled') else 'off'}",
+        f"face recognition {'on' if options.get('face_recognition_enabled') else 'off'}",
+        f"collision avoidance {'on' if options.get('collision_avoidance_enabled') else 'off'}",
+        f"vault memory {'on' if options.get('vault_memory_enabled') else 'off'}",
+    ]
+    tracker_phrase = ""
+    if tracker.get("active_objects") is not None:
+        tracker_phrase = f", tracker {tracker.get('active_objects')} active"
+    detection_phrase = f", {detections} detections" if detections is not None else ""
+    services_phrase = ", ".join(running_services or ["no services confirmed"])
+    return (
+        f"Services up: {services_phrase}. "
+        f"Scout is {behavior}{detection_phrase}{tracker_phrase}. "
+        f"Options: {', '.join(option_states)}."
+    )
+
+
 def _self_route(self_route: str, reason: str) -> dict:
     return {
         "ok": True,
@@ -4028,7 +4608,7 @@ def _self_route(self_route: str, reason: str) -> dict:
 
 
 def _asks_assistant_name(text: str) -> bool:
-    """True only for terse name asks where 'I'm Luhkas. Chris built me.' is
+    """True only for terse name asks where a short Luhkas introduction is
     the right answer. Broader self-identity questions go through
     _asks_assistant_identity_topic so the chat model can apply personality."""
     return text in {
@@ -4087,11 +4667,30 @@ def _asks_casual_assistant_state(text: str) -> bool:
         "how are you",
         "how are you doing",
         "howre you",
-        "how do you feel",
         "are you ok",
         "are you okay",
         "you good",
     }
+
+
+def _asks_broad_status_report(text: str) -> bool:
+    return bool(
+        text in {
+            "status report",
+            "give me a status report",
+            "current status",
+            "system status",
+            "whats your status",
+            "what is your status",
+        }
+        or re.search(r"\b(status|state)\s+report\b", text)
+    )
+
+
+def _asks_feeling_state(text: str) -> bool:
+    return bool(
+        re.search(r"\b(how do you feel|how are you feeling|what do you feel|current mood|your mood|mood are you in)\b", text)
+    )
 
 
 def _asks_pose_interval(text: str) -> bool:
@@ -4195,6 +4794,10 @@ def _asks_for_clip(message: str) -> bool:
 
 def _looks_like_scout_action(message: str) -> bool:
     text = _normalize_command_text(message)
+    if _asks_broad_status_report(text) or _asks_casual_assistant_state(text) or _asks_feeling_state(text):
+        return False
+    if _parse_scout_toggle_request(text) is not None:
+        return True
     if _self_topic_from_text(text) == "personality":
         return False
     if _extract_light_brightness(text) is not None:

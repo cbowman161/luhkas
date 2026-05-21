@@ -1,6 +1,31 @@
 {
   "behavior": {
-    "overrides": []
+    "overrides": [
+      {
+        "applies_when": "future conversational turns",
+        "avoid": "",
+        "created_at": 1779151421.9646153,
+        "prefer": "be more sarcastic",
+        "preference": "be more sarcastic",
+        "source_message": "be more sarcastic"
+      },
+      {
+        "applies_when": "future conversational turns",
+        "avoid": "",
+        "created_at": 1779151564.0944827,
+        "prefer": "be more sarcastic",
+        "preference": "be more sarcastic",
+        "source_message": "be more sarcastic"
+      },
+      {
+        "applies_when": "future conversational turns",
+        "avoid": "",
+        "created_at": 1779151580.290537,
+        "prefer": "be less rude",
+        "preference": "be less rude",
+        "source_message": "be less rude"
+      }
+    ]
   },
   "generation": {
     "temperature": 0.35,

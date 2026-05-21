@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.modules.pop("luhkas_node", None)
+VISION_SERVICE = ROOT / "services" / "vision_service.py"
 
 from luhkas_node.chat_context import build_presence_payload
 
@@ -79,6 +80,14 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(payload["routing_feedback"]["type"], "route_correction")
         self.assertIn("memory usage", payload["clarified_request"])
         self.assertIn("Correction from user: no, I meant memory usage", payload["clarified_request"])
+
+    def test_ui_chat_attempts_local_commands_before_vault(self) -> None:
+        source = VISION_SERVICE.read_text(encoding="utf-8")
+
+        local_index = source.index("if _local_command_handle is not None:")
+        vault_index = source.index('f"{_VAULT_CHAT_URL}/presence/message"')
+
+        self.assertLess(local_index, vault_index)
 
 
 if __name__ == "__main__":

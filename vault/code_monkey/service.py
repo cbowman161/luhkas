@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .build_manager import BuildManager
 from .config import DATA_DIR
+from .recipe_generator import generate_learned_command_recipe
 from .storage import Storage
 
 DEFAULT_HOST = os.environ.get("CODE_MONKEY_HOST", "127.0.0.1")
@@ -267,6 +268,10 @@ class CoderRequestHandler(BaseHTTPRequestHandler):
                     self._send(400, {"ok": False, "error": "Missing required JSON field: goal"})
                     return
                 self._send(202, self.service.submit(goal, context=payload.get("context")))
+                return
+            if path == "/learned-command-recipe":
+                result = generate_learned_command_recipe(payload)
+                self._send(200 if result.get("ok") else 422, result)
                 return
             if path.startswith("/tasks/"):
                 parts = path.strip("/").split("/")
