@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import ast
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -13,6 +16,8 @@ from executor import execute_action
 from code_monkey_client import CodeMonkeyClient
 
 _NAMES_FILE = DATA_DIR / "code_monkey_names.json"
+
+_FINAL_CODE_MONKEY_STATES = {"verified", "build_failed", "test_failed", "failed", "cancelled"}
 
 
 def _load_names() -> dict:
@@ -1369,37 +1374,97 @@ class Router:
             }
 
         total = len(code_monkey_updates) + len(events)
-        lines = [f"{total} unread update(s):"]
+        label = "notification" if total == 1 else "notifications"
+        lines = [f"{total} unread {label}."]
 
         if code_monkey_error:
-            lines.append(f"- [code_monkey:unavailable] {code_monkey_error}")
+            lines.append(f"Code Monkey is unavailable: {code_monkey_error}")
 
         has_reviewable = False
+        state_counts = {}
         for update in code_monkey_updates:
             state = update.get("state")
-            goal = update.get("goal")
             task_id = update.get("task_id")
-            message = update.get("message")
-            lines.append(f"- [code_monkey:{state}] {message} ({task_id})")
-            if goal:
-                lines.append(f"  Goal: {goal}")
-            if state in {"verified", "build_failed", "test_failed", "failed"}:
+            state_counts[state or "unknown"] = state_counts.get(state or "unknown", 0) + 1
+            if state in _FINAL_CODE_MONKEY_STATES:
                 has_reviewable = True
                 self.blackboard.set("last_completed_task_id", task_id)
 
+        if state_counts:
+            lines.append("Code Monkey: " + self._spoken_state_counts(state_counts) + ".")
+
+        for update in code_monkey_updates[:4]:
+            lines.append(self._spoken_update_line(update))
+
+        remaining = len(code_monkey_updates) - 4
+        if remaining > 0:
+            more = "more notification" if remaining == 1 else "more notifications"
+            lines.append(f"{remaining} {more} hidden.")
+
         for event in events:
-            lines.append(f"- [{event['event_type']}] {event['message']}")
+            lines.append(f"{event['event_type']}: {self._short_text(event['message'], 140)}")
 
         self.event_log.mark_read([event["id"] for event in events])
 
         if has_reviewable:
-            lines.append("\nSay 'review' to enter the Code Monkey review session.")
+            lines.append("Say review for details.")
 
         return {
             "mode": "direct",
             "message": "\n".join(lines),
             "active_task_id": active_task_id,
         }
+
+    def _spoken_state_counts(self, counts: dict) -> str:
+        names = {
+            "verified": "passed",
+            "build_failed": "build failed",
+            "test_failed": "tests failed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "queued": "queued",
+            "building": "building",
+            "repairing": "repairing",
+        }
+        parts = []
+        for state in sorted(counts):
+            count = counts[state]
+            noun = names.get(state, state.replace("_", " "))
+            parts.append(f"{count} {noun}")
+        return ", ".join(parts)
+
+    def _spoken_update_line(self, update: dict) -> str:
+        state = str(update.get("state") or "unknown")
+        message = self._short_text(update.get("message") or state.replace("_", " "), 80)
+        goal = self._short_goal(update.get("goal") or "")
+        prefix = {
+            "verified": "Passed",
+            "build_failed": "Build failed",
+            "test_failed": "Tests failed",
+            "failed": "Failed",
+            "cancelled": "Cancelled",
+            "queued": "Queued",
+            "building": "Building",
+            "repairing": "Repairing",
+        }.get(state, state.replace("_", " ").title())
+        return f"{prefix}: {goal or message}."
+
+    def _short_goal(self, goal: str) -> str:
+        text = str(goal or "")
+        confirmed = re.search(r"Confirmed user input:\s*(.+)", text)
+        if confirmed:
+            return self._short_text(confirmed.group(1), 90)
+        original = re.search(r"Original request:\s*(.+?)(?:\. Modification request:|$)", text, re.S)
+        if original:
+            return self._short_text(original.group(1), 90)
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        return self._short_text(first, 90)
+
+    def _short_text(self, text: str, limit: int) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(clean) <= limit:
+            return clean
+        return clean[: max(0, limit - 3)].rstrip(" .,;:") + "..."
 
     def show_jobs(self, active_task_id=None):
         try:

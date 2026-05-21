@@ -1,0 +1,4 @@
+requests>=2.31
+numpy>=1.24
+opencv-python<=4.10.0.84
+pygame>=2.5

@@ -4,7 +4,8 @@ After=scout-robot-api.service
 
 [Service]
 Type=simple
-ExecStart=%h/scout_runtime/scripts/start_controller.sh
+WorkingDirectory={NODE_DIR}
+ExecStart={NODE_DIR}/scripts/start_controller.sh
 Restart=on-failure
 RestartSec=5
 

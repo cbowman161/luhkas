@@ -35,7 +35,7 @@ _latest_selftest: dict = {}
 _selftest_lock = threading.Lock()
 
 
-DEFAULT_BRAIN_URL = os.environ.get("VAULT_CHAT_URL", "http://10.10.1.1:7000")
+DEFAULT_BRAIN_URL = os.environ.get("VAULT_CHAT_URL", "http://luhkas-vault.local:7000")
 DEFAULT_SOURCE = os.environ.get("VAULT_CHAT_SOURCE", "scout_presence")
 
 
