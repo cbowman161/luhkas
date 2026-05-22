@@ -908,6 +908,132 @@ class LearnedCapabilityEngine:
             return None
         return candidate
 
+    # ---- Audit / consolidation -------------------------------------------------
+
+    def find_duplicate_caps(self, *, exact_threshold: float = 1.0,
+                            near_threshold: float = 0.85) -> list[dict]:
+        """Scan root capabilities (non-aliases) for pairs whose execution
+        recipes are identical or very similar. Returns a list of candidate
+        merge pairs, ordered by similarity descending. Each entry has:
+          primary_key, dup_key, primary_cap, dup_cap, similarity, kind.
+        kind is 'exact' for score==1.0, 'near' otherwise.
+        Higher-hit cap is chosen as primary."""
+        data = self.store.load()
+        caps = (data.get("capabilities") or {})
+        roots = {
+            k: c for k, c in caps.items()
+            if isinstance(c, dict) and not c.get("alias_of")
+        }
+        keys = list(roots.keys())
+        candidates: list[dict] = []
+        for i, key_a in enumerate(keys):
+            cap_a = roots[key_a]
+            for key_b in keys[i + 1:]:
+                cap_b = roots[key_b]
+                sim = self._recipe_similarity(cap_a, cap_b)
+                if sim["score"] < near_threshold:
+                    continue
+                # Pick primary as the cap with more hits, ties broken by
+                # older created_at so the "established" cap wins.
+                a_score = (int(cap_a.get("hits") or 0), -float(cap_a.get("created_at") or 0))
+                b_score = (int(cap_b.get("hits") or 0), -float(cap_b.get("created_at") or 0))
+                if a_score >= b_score:
+                    primary_key, dup_key = key_a, key_b
+                else:
+                    primary_key, dup_key = key_b, key_a
+                candidates.append({
+                    "primary_key": primary_key,
+                    "primary_cap": roots[primary_key],
+                    "dup_key": dup_key,
+                    "dup_cap": roots[dup_key],
+                    "similarity": sim,
+                    "kind": "exact" if sim["score"] >= exact_threshold else "near",
+                })
+        candidates.sort(key=lambda c: c["similarity"]["score"], reverse=True)
+        return candidates
+
+    def _recipe_similarity(self, cap_a: dict, cap_b: dict) -> dict:
+        """Compute a recipe-similarity score in [0.0, 1.0]. Different recipe
+        types score 0. Identical bash commands or python sources score 1.0.
+        For non-identical same-type recipes: bash uses argv-token Jaccard;
+        python uses difflib SequenceMatcher.ratio."""
+        ea = cap_a.get("execution") or {}
+        eb = cap_b.get("execution") or {}
+        if ea.get("type") != eb.get("type"):
+            return {"score": 0.0, "reason": "different recipe types"}
+        kind = ea.get("type")
+        if kind == "bash":
+            cmd_a = (ea.get("command") or "").strip()
+            cmd_b = (eb.get("command") or "").strip()
+            if cmd_a == cmd_b:
+                return {"score": 1.0, "reason": "identical bash command"}
+            try:
+                ta = set(shlex.split(cmd_a))
+                tb = set(shlex.split(cmd_b))
+            except ValueError:
+                return {"score": 0.0, "reason": "shlex parse failure"}
+            union = ta | tb
+            if not union:
+                return {"score": 0.0, "reason": "empty argv"}
+            jaccard = len(ta & tb) / len(union)
+            return {"score": jaccard, "reason": f"argv Jaccard {jaccard:.2f}"}
+        if kind == "python_script":
+            src_a = (ea.get("source") or "").strip()
+            src_b = (eb.get("source") or "").strip()
+            if src_a == src_b:
+                return {"score": 1.0, "reason": "identical python source"}
+            import difflib
+            ratio = difflib.SequenceMatcher(None, src_a, src_b).ratio()
+            return {"score": ratio, "reason": f"python source ratio {ratio:.2f}"}
+        return {"score": 0.0, "reason": f"unsupported recipe type {kind!r}"}
+
+    def merge_caps(self, primary_key: str, dup_key: str) -> dict:
+        """Merge dup_key into primary_key: dup becomes an alias entry that
+        reuses primary's execution recipe. Existing aliases of dup get
+        re-pointed at primary. Hits are summed onto primary."""
+        if primary_key == dup_key:
+            return {"ok": False, "error": "primary and dup are the same key"}
+        data = self.store.load()
+        caps = data.setdefault("capabilities", {})
+        primary = caps.get(primary_key)
+        dup = caps.get(dup_key)
+        if not isinstance(primary, dict) or not isinstance(dup, dict):
+            return {"ok": False, "error": "primary or dup not found"}
+        # Re-point pre-existing aliases of dup → primary.
+        repointed = []
+        for k, c in caps.items():
+            if isinstance(c, dict) and c.get("alias_of") == dup_key:
+                c["alias_of"] = primary_key
+                repointed.append(k)
+        # Replace dup with an alias that inherits primary's recipe but keeps
+        # dup's original input for record-keeping.
+        new_alias = {
+            **primary,
+            "name": primary.get("name"),
+            "intent": primary.get("intent"),
+            "description": primary.get("description"),
+            "input": dup.get("input"),
+            "normalized_input": dup_key,
+            "alias_of": primary_key,
+            "confirmed_by": "audit_merge",
+            "merged_from": dup.get("description") or dup.get("intent"),
+            "created_at": dup.get("created_at") or primary.get("created_at") or time.time(),
+            "updated_at": time.time(),
+            "hits": int(dup.get("hits") or 0),
+            "examples": (dup.get("examples") or [])[-20:],
+        }
+        caps[dup_key] = new_alias
+        # Roll up dup's hits onto primary so popularity is preserved.
+        primary["hits"] = int(primary.get("hits") or 0) + int(dup.get("hits") or 0)
+        primary["updated_at"] = time.time()
+        self.store.save(data)
+        return {
+            "ok": True,
+            "primary_key": primary_key,
+            "dup_key": dup_key,
+            "repointed_aliases": repointed,
+        }
+
     def install_package(self, package: str, timeout: int = 180) -> dict:
         """Install an apt package non-interactively. Returns a dict with
         ok/stdout/stderr/returncode. The caller is responsible for getting

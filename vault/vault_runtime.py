@@ -64,6 +64,16 @@ _CODE_MONKEY_HEALTH_COMMANDS = {
     "coder status",
 }
 
+_AUDIT_CAPS_COMMANDS = {
+    "audit caps",
+    "audit learned caps",
+    "audit learned commands",
+    "consolidate caps",
+    "consolidate learned caps",
+    "consolidate learned commands",
+    "merge duplicate caps",
+}
+
 SESSION_COMMANDS = {
     "new": "new",
     "new task": "new",
@@ -210,6 +220,9 @@ class VaultRuntime:
                 "code_monkey_health",
             ))
 
+        if command_text in _AUDIT_CAPS_COMMANDS:
+            return self._remember_active(self._start_audit_caps(node_id))
+
         if lowered in {"review", "review code", "review build", "review project", "review results"} or lowered.startswith("review "):
             parts = user_input.strip().split(None, 1)
             explicit_id = parts[1].strip() if len(parts) > 1 and parts[0].lower() == "review" else None
@@ -261,6 +274,11 @@ class VaultRuntime:
             install_flow = self._handle_learned_install_confirmation(user_input, node_id)
             if install_flow is not None:
                 return install_flow
+
+        if isinstance(pending, dict) and pending.get("type") == "audit_merge_confirmation":
+            audit_flow = self._handle_audit_merge_confirmation(user_input, node_id)
+            if audit_flow is not None:
+                return audit_flow
 
         # Requirements gathering and review sessions receive raw user text — no intent
         # classification needed since the agents handle their own conversation logic.
@@ -415,6 +433,10 @@ class VaultRuntime:
         if install_flow is not None:
             return install_flow
 
+        audit_flow = self._handle_audit_merge_confirmation(message, node_id)
+        if audit_flow is not None:
+            return audit_flow
+
         pending = self.blackboard.get_pending_decision()
         if pending and pending.get("type") in {
             "existing_skill",
@@ -446,6 +468,9 @@ class VaultRuntime:
                 self.router.show_code_monkey_health(self.active_task_id),
                 "code_monkey_health",
             ))
+
+        if text in _AUDIT_CAPS_COMMANDS:
+            return self._remember_active(self._start_audit_caps(node_id))
 
         command_response = self.command_agent.handle(message)
         if command_response is not None:
@@ -515,6 +540,198 @@ class VaultRuntime:
         }
         response["data"] = data
         return response
+
+    def _start_audit_caps(self, node_id: str) -> dict:
+        """Build the duplicate-merge queue and present the first proposed
+        merge. Sets pending state so subsequent yes/no/skip turns process
+        the queue one pair at a time."""
+        engine = self._learned_engine()
+        pairs = engine.find_duplicate_caps()
+        if not pairs:
+            return {
+                "mode": "direct",
+                "message": "Audit complete. No duplicate or near-duplicate caps found.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "audit_caps",
+                "compose": False,
+                "response_composed": True,
+            }
+        # Stash a compact serializable form of each pair on the blackboard
+        # so it survives node-id transitions and re-loads of the engine.
+        queue = []
+        for pair in pairs:
+            queue.append({
+                "primary_key": pair["primary_key"],
+                "dup_key": pair["dup_key"],
+                "similarity_score": float(pair["similarity"]["score"]),
+                "similarity_reason": pair["similarity"]["reason"],
+                "kind": pair["kind"],
+                "primary_description": pair["primary_cap"].get("description"),
+                "dup_description": pair["dup_cap"].get("description"),
+                "primary_hits": int(pair["primary_cap"].get("hits") or 0),
+                "dup_hits": int(pair["dup_cap"].get("hits") or 0),
+                "primary_execution": pair["primary_cap"].get("execution") or {},
+                "dup_execution": pair["dup_cap"].get("execution") or {},
+            })
+        self._set_pending({
+            "type": "audit_merge_confirmation",
+            "queue": queue,
+            "decisions": [],
+            "node_id": node_id,
+        })
+        return {
+            "mode": "direct",
+            "message": self._format_audit_pair(queue, idx=0, total=len(queue)),
+            "data": {"pending_pairs": len(queue)},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "audit_caps",
+            "compose": False,
+            "response_composed": True,
+        }
+
+    def _format_audit_pair(self, queue: list, idx: int, total: int) -> str:
+        pair = queue[idx] if idx < len(queue) else None
+        if pair is None:
+            return "Audit complete."
+        kind = pair.get("kind") or "near"
+        sim = pair.get("similarity_score") or 0.0
+        reason = pair.get("similarity_reason") or ""
+        primary = pair["primary_execution"] or {}
+        dup = pair["dup_execution"] or {}
+        def render_exec(exe: dict) -> str:
+            if exe.get("type") == "bash":
+                return f"bash: {exe.get('command') or ''}"
+            if exe.get("type") == "python_script":
+                src = (exe.get("source") or "").strip()
+                # Show full python source (up to 800 chars) so the user can
+                # judge similarity directly.
+                if len(src) > 800:
+                    src = src[:797] + "..."
+                return f"python_script:\n----\n{src}\n----"
+            return repr(exe)
+        progress = f"[{idx + 1}/{total}]"
+        kind_label = "EXACT MATCH" if kind == "exact" else f"NEAR MATCH ({sim:.2f})"
+        return (
+            f"Audit {progress} — {kind_label} ({reason}).\n\n"
+            f"PRIMARY (kept): {pair['primary_description']!r}  "
+            f"[key={pair['primary_key']!r}, hits={pair['primary_hits']}]\n"
+            f"  runs: {render_exec(primary)}\n\n"
+            f"DUPLICATE (to merge into primary): {pair['dup_description']!r}  "
+            f"[key={pair['dup_key']!r}, hits={pair['dup_hits']}]\n"
+            f"  runs: {render_exec(dup)}\n\n"
+            "Merge them? (yes / no / skip — skip leaves both as-is, no rejects "
+            "this merge but keeps auditing.)"
+        )
+
+    def _handle_audit_merge_confirmation(self, message: str, node_id: str) -> dict | None:
+        pending = self.blackboard.get_pending_decision()
+        if not isinstance(pending, dict) or pending.get("type") != "audit_merge_confirmation":
+            return None
+        queue = list(pending.get("queue") or [])
+        decisions = list(pending.get("decisions") or [])
+        if not queue:
+            self._clear_pending()
+            return self._audit_complete_summary(decisions)
+
+        text = _command_text(message)
+        is_yes = _is_affirmative(message)
+        is_no = _is_denial(message) or text in {"no", "skip", "next", "pass"}
+        is_cancel = text in {"cancel", "stop audit", "abort", "abort audit", "quit"}
+
+        if is_cancel:
+            self._clear_pending()
+            decisions.append({"action": "cancel", "remaining": len(queue)})
+            return self._audit_complete_summary(decisions, cancelled=True)
+
+        if not (is_yes or is_no):
+            # Ambiguous — re-prompt without advancing.
+            return self._remember_active({
+                "mode": "direct",
+                "message": (
+                    "Please answer with yes (merge), no (keep both separate), "
+                    "skip (move on), or cancel (stop the audit)."
+                ),
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "audit_merge_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        engine = self._learned_engine()
+        head = queue.pop(0)
+        if is_yes:
+            result = engine.merge_caps(head["primary_key"], head["dup_key"])
+            decisions.append({
+                "action": "merge",
+                "primary": head["primary_description"],
+                "dup": head["dup_description"],
+                "ok": bool(result.get("ok")),
+                "error": result.get("error"),
+            })
+        else:
+            decisions.append({
+                "action": "skip",
+                "primary": head["primary_description"],
+                "dup": head["dup_description"],
+            })
+
+        if not queue:
+            self._clear_pending()
+            return self._audit_complete_summary(decisions)
+
+        self._set_pending({
+            "type": "audit_merge_confirmation",
+            "queue": queue,
+            "decisions": decisions,
+            "node_id": node_id,
+        })
+        last = decisions[-1]
+        prefix = (
+            ("Merged." if last.get("ok") else f"Merge failed: {last.get('error')}.")
+            if last.get("action") == "merge"
+            else "Skipped."
+        )
+        body = self._format_audit_pair(queue, idx=0, total=len(queue) + len(decisions))
+        return self._remember_active({
+            "mode": "direct",
+            "message": f"{prefix}\n\n{body}",
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "audit_merge_confirmation",
+            "compose": False,
+            "response_composed": True,
+        })
+
+    def _audit_complete_summary(self, decisions: list, cancelled: bool = False) -> dict:
+        merged = sum(1 for d in decisions if d.get("action") == "merge" and d.get("ok"))
+        failed = sum(1 for d in decisions if d.get("action") == "merge" and not d.get("ok"))
+        skipped = sum(1 for d in decisions if d.get("action") == "skip")
+        cancel_note = " (audit cancelled by user)" if cancelled else ""
+        lines = [
+            f"Audit complete{cancel_note}.",
+            f"  merged: {merged}",
+            f"  skipped: {skipped}",
+        ]
+        if failed:
+            lines.append(f"  merge errors: {failed}")
+        if merged:
+            lines.append("\nMerged pairs:")
+            for d in decisions:
+                if d.get("action") == "merge" and d.get("ok"):
+                    lines.append(f"  • {d.get('dup')!r} → {d.get('primary')!r}")
+        return self._remember_active({
+            "mode": "direct",
+            "message": "\n".join(lines),
+            "data": {"decisions": decisions},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "audit_caps_complete",
+            "compose": False,
+            "response_composed": True,
+        })
 
     def _handle_learned_install_confirmation(self, message: str, node_id: str) -> dict | None:
         """One-turn handler for 'should I install <pkg>?' prompts.
