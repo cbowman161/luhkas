@@ -106,7 +106,24 @@ class NodeRegistry:
             if not clean_id or self._is_synthetic_node_id(clean_id):
                 changed = True
                 continue
-            cleaned[clean_id] = cfg if isinstance(cfg, dict) else {}
+            if not isinstance(cfg, dict):
+                changed = True
+                continue
+            # Prune entries that look like ad-hoc /ui callers rather than real
+            # registered nodes. A real /node/register call always supplies at
+            # least one of ip / services / modules. Intrinsic entries (e.g.
+            # vault) are preserved regardless.
+            if not cfg.get("intrinsic"):
+                has_substance = bool(
+                    cfg.get("ip")
+                    or cfg.get("services")
+                    or cfg.get("modules")
+                    or cfg.get("capabilities")
+                )
+                if not has_substance:
+                    changed = True
+                    continue
+            cleaned[clean_id] = cfg
         if VAULT_NODE_ID not in cleaned:
             cleaned[VAULT_NODE_ID] = self._vault_registration()
             changed = True
@@ -159,20 +176,23 @@ class NodeRegistry:
 
     def update_capabilities(self, node_id: str, capabilities: dict | None = None,
                             modules: dict | None = None) -> None:
+        """Update capabilities/modules for an already-registered node.
+
+        Does NOT auto-create a registry entry: only nodes that have explicitly
+        registered via /node/register can have their capabilities updated here.
+        This prevents arbitrary ad-hoc node_ids (e.g. one-shot CLI/test calls
+        through /ui) from polluting the registry.
+        """
         node_id = str(node_id or "").strip()
         if not node_id or self._is_synthetic_node_id(node_id):
+            return
+        reg = self._registered.get(node_id)
+        if not isinstance(reg, dict):
             return
         capabilities = capabilities if isinstance(capabilities, dict) else {}
         modules = modules if isinstance(modules, dict) else capabilities.get("module_status")
         if not isinstance(modules, dict):
             modules = {}
-        reg = self._registered.setdefault(node_id, {
-            "display": {},
-            "node_name": node_id,
-            "ip": "",
-            "services": {},
-            "registered_at": time.time(),
-        })
         if capabilities:
             reg["capabilities"] = capabilities
         if modules:
