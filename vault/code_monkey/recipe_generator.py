@@ -21,9 +21,12 @@ SMOKE_TIMEOUT_SECONDS = 8
 # concrete dangerous binaries/operations. Keep this list narrow — overly broad
 # substrings (e.g. bare "format") false-positive on flag names like
 # --format=csv. Specific destructive binaries are the right granularity.
+#
+# Note: `sudo` and `apt-get` are NOT in this list. Recipes are allowed to
+# install missing tools via `sudo apt-get install ...`; that path is gated by
+# _is_safe_sudo_install below — any OTHER sudo use is rejected.
 BLOCKED_COMMAND_SUBSTRINGS = (
     "rm -rf",
-    "sudo",
     " su ",
     "shutdown",
     "reboot",
@@ -35,14 +38,43 @@ BLOCKED_COMMAND_SUBSTRINGS = (
     "shred ",
     "curl ",
     "wget ",
-    "apt ",
-    "apt-get",
     "pip install",
     "npm install",
     "$(",
     "${",
     "`",
 )
+
+
+# Recognized safe sudo patterns inside a recipe. The recipe runs via
+# subprocess.run(argv) with no shell, so argv[0] must be exactly "sudo" and
+# argv[1:] must form one of these whitelisted operations. Anything else with
+# sudo is rejected.
+SAFE_SUDO_PATTERNS = (
+    # apt-get install ...
+    ("apt-get", "install"),
+    ("apt", "install"),
+    # apt-get update (often needed before an install)
+    ("apt-get", "update"),
+    ("apt", "update"),
+)
+
+
+def _is_safe_sudo_install(argv: list[str]) -> bool:
+    """Return True only when argv represents a safe sudo invocation —
+    currently limited to apt-get install/update style commands."""
+    if not argv or argv[0] != "sudo":
+        return False
+    # Strip benign sudo flags like -n, -E, -H from the front.
+    rest = list(argv[1:])
+    while rest and rest[0].startswith("-"):
+        rest.pop(0)
+    if len(rest) < 2:
+        return False
+    for prefix in SAFE_SUDO_PATTERNS:
+        if tuple(rest[:len(prefix)]) == prefix:
+            return True
+    return False
 
 # Tokens that would be present after shlex.split if the planner emitted a
 # shell pipeline / redirect / chain. Reject these — the executor runs argv
@@ -212,8 +244,12 @@ def _recipe_prompt(*, user_input: str, payload: Dict[str, Any]) -> str:
         "  If the task needs any of those, use a python_script instead.\n"
         "- python_script recipes run via `python3 <file>` and may call\n"
         "  subprocess.run([...]) themselves to invoke other read-only tools.\n"
-        "- Recipes must be read-only and local: no sudo, no installs, no network\n"
-        "  sockets, no writes outside stdout, no destructive commands.\n"
+        "- Recipes must otherwise be read-only and local: no destructive commands,\n"
+        "  no network sockets, no writes outside stdout.\n"
+        "- The only privileged operation allowed is installing missing packages\n"
+        "  via apt — `sudo apt-get install -y <package>` (or `sudo apt install ...`).\n"
+        "  Use this only when a needed tool isn't on PATH. Anything else with sudo\n"
+        "  is rejected.\n"
         "- Output must go to stdout. required_facts names what the caller should\n"
         "  expect to parse out of stdout.\n\n"
         "How you'll learn what works:\n"
@@ -286,6 +322,14 @@ def _smoke_test_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
     permission requirements that only show up at runtime, etc.
     """
     kind = recipe.get("type")
+    # Recipes that perform an apt install can legitimately take 30-90s; bump
+    # the smoke timeout adaptively when we see those tokens.
+    def _timeout_for(command_or_source: str) -> int:
+        lowered = (command_or_source or "").lower()
+        if "apt-get install" in lowered or "apt install" in lowered:
+            return 120
+        return SMOKE_TIMEOUT_SECONDS
+
     try:
         if kind == "bash":
             command = str(recipe.get("command") or "").strip()
@@ -299,7 +343,7 @@ def _smoke_test_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
                 argv,
                 capture_output=True,
                 text=True,
-                timeout=SMOKE_TIMEOUT_SECONDS,
+                timeout=_timeout_for(command),
                 check=False,
             )
         elif kind == "python_script":
@@ -314,7 +358,7 @@ def _smoke_test_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
                     ["python3", script_path],
                     capture_output=True,
                     text=True,
-                    timeout=SMOKE_TIMEOUT_SECONDS,
+                    timeout=_timeout_for(source),
                     check=False,
                 )
             finally:
@@ -383,6 +427,18 @@ def _validate_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
                         f"Generated command contains shell metachar {token!r}; the executor "
                         "runs argv without a shell so pipes/redirects/chains do not work. "
                         "Use a python_script recipe for anything that needs piping."
+                    ),
+                }
+        # Sudo is allowed only for the apt-install path. Any other sudo
+        # invocation is a privilege-escalation surface and is rejected.
+        if argv[0] == "sudo":
+            if not _is_safe_sudo_install(argv):
+                return {
+                    "ok": False,
+                    "error": (
+                        "sudo is only permitted for `apt-get install` / `apt install` / "
+                        "`apt-get update` (and `apt update`). Use the unprivileged form of "
+                        "your command, or restrict the sudo usage to an apt install."
                     ),
                 }
         binary = argv[0]
