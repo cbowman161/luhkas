@@ -561,6 +561,43 @@ class VaultRuntime:
                 "response_composed": True,
             })
 
+        # If the corrected (topic, aspect) matches an existing cap, MOVE the
+        # original phrase to that cap instead of starting a new propose flow.
+        # This is the explicit "remove from bad command, add to good command"
+        # behaviour.
+        corrected_topic = ((proposal.get("inferred") or {}).get("topic") or "")
+        corrected_aspect = ((proposal.get("inferred") or {}).get("aspect") or "")
+        existing_cap = None
+        if corrected_topic:
+            for cap in engine.same_topic_caps(corrected_topic):
+                ct, ca = engine._cap_concept(cap)
+                if ct == corrected_topic and ca == corrected_aspect:
+                    existing_cap = cap
+                    break
+        if existing_cap is not None:
+            original_msg = pending.get("original_message") or message
+            self._clear_pending()
+            result = engine.execute_capability(existing_cap)
+            if result.get("ok"):
+                engine.record_alias(original_msg, existing_cap)
+            summary = engine.summarize_result(original_msg, existing_cap, result)
+            prefix = "Removed the wrong learned command and routed to" if removed else "Routed to"
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"{prefix} the existing {existing_cap.get('description')}. {summary}",
+                "data": {
+                    "learned_capability": existing_cap,
+                    "execution_result": result,
+                    "alias_recorded": result.get("ok"),
+                    "alias_removed": removed,
+                },
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": f"learned_capability:{existing_cap.get('name') or existing_cap.get('intent')}",
+                "compose": False,
+                "response_composed": True,
+            })
+
         original_message = pending.get("original_message") or message
         self._set_pending({
             "type": "learned_capability_confirmation",
@@ -628,6 +665,39 @@ class VaultRuntime:
                     "active_task_id": self.active_task_id,
                     "deterministic": True,
                     "deterministic_source": "learned_capability_confirmation",
+                    "compose": False,
+                    "response_composed": True,
+                })
+            # If the corrected (topic, aspect) matches a cap we already have,
+            # execute that directly and record the ORIGINAL message as an
+            # alias of it — no need to learn a new cap.
+            corrected_topic = ((proposal.get("inferred") or {}).get("topic") or "")
+            corrected_aspect = ((proposal.get("inferred") or {}).get("aspect") or "")
+            existing_cap = None
+            if corrected_topic:
+                for cap in engine.same_topic_caps(corrected_topic):
+                    ct, ca = engine._cap_concept(cap)
+                    if ct == corrected_topic and ca == corrected_aspect:
+                        existing_cap = cap
+                        break
+            if existing_cap is not None:
+                original_msg = pending.get("original_message") or message
+                self._clear_pending()
+                result = engine.execute_capability(existing_cap)
+                if result.get("ok"):
+                    engine.record_alias(original_msg, existing_cap)
+                summary = engine.summarize_result(original_msg, existing_cap, result)
+                return self._remember_active({
+                    "mode": "direct",
+                    "message": f"Got it — that's the existing {existing_cap.get('description')}. {summary}",
+                    "data": {
+                        "learned_capability": existing_cap,
+                        "execution_result": result,
+                        "alias_recorded": result.get("ok"),
+                    },
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": f"learned_capability:{existing_cap.get('name') or existing_cap.get('intent')}",
                     "compose": False,
                     "response_composed": True,
                 })
@@ -721,16 +791,47 @@ class VaultRuntime:
         proposal = engine.propose(message)
         if proposal is None:
             return None
+        # Surface existing same-topic alternatives so the user can redirect
+        # to an existing cap instead of fragmenting the topic into a near-
+        # duplicate. Common case: user says "available ram" -> LLM proposes
+        # memory/hardware; we already have memory/usage. Tell them.
+        proposed_topic = ((proposal.get("inferred") or {}).get("topic") or "")
+        proposed_aspect = ((proposal.get("inferred") or {}).get("aspect") or "")
+        same_topic = engine.same_topic_caps(proposed_topic) if proposed_topic else []
+        # Don't list the proposed (topic, aspect) itself if a cap happens to
+        # already match it (lookup_by_concept would have caught that, but
+        # cheap to filter here).
+        alternatives = [
+            cap for cap in same_topic
+            if engine._cap_concept(cap) != (proposed_topic, proposed_aspect)
+        ]
+        alt_descriptions = []
+        seen_descs = set()
+        for cap in alternatives[:3]:
+            desc = cap.get("description") or cap.get("name") or ""
+            if desc and desc not in seen_descs and desc != proposal.get("description"):
+                alt_descriptions.append(desc)
+                seen_descs.add(desc)
+        if alt_descriptions:
+            alt_clause = ", ".join(f"\"{d}\"" for d in alt_descriptions)
+            message_text = (
+                f"I think you mean {proposal['description']}. "
+                f"You also already have {alt_clause}. "
+                f"Is that right, or did you mean one of those?"
+            )
+        else:
+            message_text = f"I think you mean {proposal['description']}. Is that right?"
         self._set_pending({
             "type": "learned_capability_confirmation",
             "original_message": message,
             "proposal": proposal,
             "node_id": node_id,
+            "alternative_descriptions": alt_descriptions,
         })
         return self._remember_active(self._attach_learned_capability_update({
             "mode": "direct",
-            "message": f"I think you mean {proposal['description']}. Is that right?",
-            "data": {"proposal": proposal},
+            "message": message_text,
+            "data": {"proposal": proposal, "alternatives": alt_descriptions},
             "active_task_id": self.active_task_id,
             "deterministic": True,
             "deterministic_source": "learned_capability_confirmation",

@@ -505,6 +505,31 @@ class LearnedCapabilityEngine:
     def lookup(self, text: str) -> dict | None:
         return self.store.lookup(text)
 
+    def same_topic_caps(self, topic: str) -> list[dict]:
+        """All caps stored under the given topic, ranked by hits then recency.
+        Used to surface alternatives when the user proposes a *new* aspect
+        for a topic we already have caps for — lets them pick the existing
+        one instead of fragmenting the topic into near-duplicates."""
+        if not topic:
+            return []
+        data = self.store.load()
+        caps = (data.get("capabilities") or {}).values()
+        matches = []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                continue
+            if (cap.get("execution") or {}).get("type") not in {"bash", "python_script"}:
+                continue
+            cap_topic, _ = self._cap_concept(cap)
+            if cap_topic != topic:
+                continue
+            matches.append(cap)
+        matches.sort(
+            key=lambda c: (int(c.get("hits") or 0), float(c.get("updated_at") or 0)),
+            reverse=True,
+        )
+        return matches
+
     def lookup_by_concept(self, text: str) -> dict | None:
         """Find an existing capability whose inferred (topic, aspect) matches the
         LLM-classified concept of *text*. Falls back to parsing the intent name
