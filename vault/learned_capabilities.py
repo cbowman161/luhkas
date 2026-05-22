@@ -15,26 +15,24 @@ from safety_policy import SafetyPolicy
 
 DEFAULT_STORE = Path(__file__).parent / "data" / "learned_capabilities" / "capabilities.json"
 
-SYSTEM_TOPICS = (
-    "cpu", "memory", "gpu", "disk", "uptime", "os", "hostname",
-    "python", "process", "network", "service", "temperature",
-)
-SYSTEM_ASPECTS = ("usage", "hardware", "status", "version")
 
 _CORRECTION_PROMPT = """You classify a user CORRECTION to a previous request about a Linux server's runtime state.
 
-Output strict JSON: {"topic": <topic_or_none>, "aspect": <aspect_or_none>}
+Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_none>}
 
-Valid topics: cpu, memory, gpu, disk, uptime, os, hostname, python, process, network, service, temperature, none
-Valid aspects: usage, hardware, status, version, none
+- "topic" is the singular lowercase noun for what the user is asking about
+  (e.g. cpu, memory, disk, temperature, process, port, user, log, package,
+  time, kernel, drive, fan — anything that fits). Use "none" if the
+  correction provides no new topic and you cannot tell from context.
+- "aspect" is the singular lowercase noun for what about that topic
+  (e.g. usage, hardware, status, version, list, count, recent). Use "none"
+  if the correction provides no new aspect.
 
-The user just rejected the system's previous interpretation. Use the context to
-figure out what they actually want:
-- If the correction only specifies a new aspect ("the hardware"), keep the
-  previous topic.
-- If it specifies a new topic but no aspect, keep the previous aspect.
-- If it specifies both, use both from the correction.
-- If the correction is empty/just "no" with no information, output "none"/"none".
+Use the previous topic/aspect as defaults when the correction is partial:
+- aspect-only correction ("the hardware") → keep the previous topic
+- topic-only correction ("actually disk") → keep the previous aspect
+- both specified → use both from the correction
+- empty / just "no" → output "none"/"none"
 
 Examples:
 PREVIOUS topic=cpu aspect=usage
@@ -48,11 +46,6 @@ CORRECTION: "actually disk"
 OUTPUT: {"topic": "disk", "aspect": "usage"}
 
 PREVIOUS topic=memory aspect=usage
-ORIGINAL: "memory"
-CORRECTION: "no, gpu hardware"
-OUTPUT: {"topic": "gpu", "aspect": "hardware"}
-
-PREVIOUS topic=memory aspect=usage
 ORIGINAL: "ram free"
 CORRECTION: "no I meant the processor"
 OUTPUT: {"topic": "cpu", "aspect": "usage"}
@@ -61,6 +54,11 @@ PREVIOUS topic=cpu aspect=hardware
 ORIGINAL: "what's my cpu"
 CORRECTION: "no, current usage"
 OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+PREVIOUS topic=disk aspect=usage
+ORIGINAL: "disk space"
+CORRECTION: "no, by user"
+OUTPUT: {"topic": "user", "aspect": "usage"}
 
 PREVIOUS topic=disk aspect=usage
 ORIGINAL: "disk space"
@@ -74,31 +72,24 @@ CORRECTION: %(correction)s
 OUTPUT:"""
 
 
-_CLASSIFIER_PROMPT = """You classify whether a user request is asking about a Linux server's runtime state.
+_CLASSIFIER_PROMPT = """You classify whether a user request is asking about a Linux server's runtime state, hardware, or configuration.
 
-Output strict JSON: {"topic": <topic_or_none>, "aspect": <aspect_or_none>}
+Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_none>}
 
-Topics:
-- cpu: processors, cores, threads
-- memory: RAM, swap
-- gpu: graphics cards
-- disk: storage, filesystems, volumes
-- uptime: how long the system has been up
-- os: kernel, distro, OS version
-- hostname: machine name
-- python: Python interpreter
-- process: running processes, tasks (NOT "how long it's been running")
-- network: interfaces, IPs, network state
-- service: systemd services
-- temperature: thermals, sensors
-- none: NOT a Linux-server-state question (identity, chitchat, memory recall, math, gibberish, scout/camera/robot actions)
+- "topic" is a SINGULAR LOWERCASE one-word noun for what the user is asking
+  about. Use the most natural common noun. Some examples (not an exhaustive
+  list): cpu, memory, gpu, disk, uptime, os, kernel, hostname, python,
+  process, network, port, service, temperature, fan, user, login, log,
+  package, time, timezone, locale, drive, partition, mount, volume, ip,
+  route, dns, firewall, battery, vault, scout. Use "none" if the user is
+  NOT asking about a Linux server's state (greetings, identity, chitchat,
+  math, gibberish, scout/camera/robot actions, chat-context memory recall).
 
-Aspects:
-- usage: live percent or current activity
-- hardware: specs, capacity, models
-- status: current state, what's running
-- version: which version is installed
-- none
+- "aspect" is a SINGULAR LOWERCASE one-word noun for what they want about
+  the topic. Common ones: usage (live activity/percent), hardware
+  (specs/capacity/model), status (current state, what's running), version
+  (which version installed), list (enumeration of items), count (how many),
+  recent (latest events). Use "none" only if they truly didn't specify.
 
 Examples:
 INPUT: "cpu usage"
@@ -154,6 +145,45 @@ OUTPUT: {"topic": "none", "aspect": "version"}
 
 INPUT: "no the usage"
 OUTPUT: {"topic": "none", "aspect": "usage"}
+
+INPUT: "what's the cpu temperature"
+OUTPUT: {"topic": "temperature", "aspect": "status"}
+
+INPUT: "list my disks"
+OUTPUT: {"topic": "disk", "aspect": "list"}
+
+INPUT: "what time is it"
+OUTPUT: {"topic": "time", "aspect": "status"}
+
+INPUT: "who's logged in"
+OUTPUT: {"topic": "user", "aspect": "list"}
+
+INPUT: "any errors in the journal"
+OUTPUT: {"topic": "log", "aspect": "recent"}
+
+INPUT: "what ports are open"
+OUTPUT: {"topic": "port", "aspect": "list"}
+
+INPUT: "is ollama running"
+OUTPUT: {"topic": "service", "aspect": "status"}
+
+INPUT: "any failed services"
+OUTPUT: {"topic": "service", "aspect": "status"}
+
+INPUT: "what timezone are we in"
+OUTPUT: {"topic": "timezone", "aspect": "status"}
+
+INPUT: "how many processes are running"
+OUTPUT: {"topic": "process", "aspect": "count"}
+
+INPUT: "what's eating cpu"
+OUTPUT: {"topic": "process", "aspect": "usage"}
+
+INPUT: "show fan speeds"
+OUTPUT: {"topic": "fan", "aspect": "status"}
+
+INPUT: "is the firewall on"
+OUTPUT: {"topic": "firewall", "aspect": "status"}
 
 Now classify:
 INPUT: %s
@@ -422,25 +452,25 @@ class LearnedCapabilityEngine:
         parsed = LearnedCapabilityEngine._parse_json_object(raw)
         if not isinstance(parsed, dict):
             return None, None
-        topic = parsed.get("topic")
-        aspect = parsed.get("aspect")
-        if isinstance(topic, str):
-            topic = topic.strip().lower() or None
-        else:
-            topic = None
-        if isinstance(aspect, str):
-            aspect = aspect.strip().lower() or None
-        else:
-            aspect = None
-        if topic == "none":
-            topic = None
-        if aspect == "none":
-            aspect = None
-        if topic and topic not in SYSTEM_TOPICS:
-            topic = None
-        if aspect and aspect not in SYSTEM_ASPECTS:
-            aspect = None
+        topic = LearnedCapabilityEngine._clean_noun(parsed.get("topic"))
+        aspect = LearnedCapabilityEngine._clean_noun(parsed.get("aspect"))
         return topic, aspect
+
+    @staticmethod
+    def _clean_noun(value) -> str | None:
+        """Normalize an LLM-returned topic/aspect noun: lowercase singular
+        single token. Returns None for 'none', empty, multi-word, or
+        non-string values."""
+        if not isinstance(value, str):
+            return None
+        token = value.strip().lower()
+        if not token or token == "none" or token == "null":
+            return None
+        # Require a single short alphabetic word — guards against the LLM
+        # returning a sentence or hallucinated structure.
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,30}", token):
+            return None
+        return token
 
     @staticmethod
     def _parse_json_object(raw: str) -> dict | None:
@@ -514,26 +544,20 @@ class LearnedCapabilityEngine:
 
     @staticmethod
     def _cap_concept(cap: dict) -> tuple[str | None, str | None]:
+        """Return the (topic, aspect) for a stored capability. Reads the
+        inferred field first; falls back to parsing the intent name
+        (vault_<topic>_<aspect> or vault_<topic>) for legacy caps that
+        pre-date LLM classification."""
         inferred = cap.get("inferred") or {}
-        topic = inferred.get("topic")
-        aspect = inferred.get("aspect")
-        if topic and topic in SYSTEM_TOPICS:
-            return topic, (aspect if aspect in SYSTEM_ASPECTS else None)
+        topic = LearnedCapabilityEngine._clean_noun(inferred.get("topic"))
+        aspect = LearnedCapabilityEngine._clean_noun(inferred.get("aspect"))
+        if topic:
+            return topic, aspect
         intent = str(cap.get("intent") or "")
-        match = re.match(r"vault_([a-z]+)(?:_([a-z]+))?$", intent)
+        match = re.match(r"vault_([a-z][a-z0-9_]*?)(?:_([a-z][a-z0-9_]*))?$", intent)
         if not match:
             return None, None
-        parsed_topic = match.group(1)
-        parsed_aspect = match.group(2)
-        if parsed_topic not in SYSTEM_TOPICS:
-            # Allow common single-word legacy intents that ARE a topic on their own.
-            legacy_topic_only = {"uptime", "hostname"}
-            if parsed_topic in legacy_topic_only:
-                return parsed_topic, "status"
-            return None, None
-        if parsed_aspect and parsed_aspect not in SYSTEM_ASPECTS:
-            parsed_aspect = None
-        return parsed_topic, parsed_aspect
+        return match.group(1), match.group(2) or "status"
 
     def record_alias(self, new_text: str, source_cap: dict) -> dict | None:
         return self.store.remember_alias(new_text, source_cap)
@@ -606,11 +630,10 @@ class LearnedCapabilityEngine:
         return self._code_monkey_recipe_proposal(topic, aspect or self._default_aspect_for(topic))
 
     def _default_aspect_for(self, topic: str | None) -> str:
-        if topic in {"python", "os"}:
-            return "version"
-        if topic in {"hostname", "network", "service", "process", "temperature", "uptime"}:
-            return "status"
-        return "usage"
+        """Pick a sane default aspect when one isn't supplied. The classifier
+        almost always returns an aspect for system queries, so this is only
+        a last-resort fallback when topic is known but aspect was 'none'."""
+        return "status"
 
     def _code_monkey_recipe_proposal(self, topic: str, aspect: str) -> dict:
         description = self._describe_inferred_system_info(topic, aspect)
@@ -632,28 +655,14 @@ class LearnedCapabilityEngine:
         }
 
     def _describe_inferred_system_info(self, topic: str, aspect: str) -> str:
-        topic_names = {
-            "cpu": "CPU",
-            "memory": "RAM" if aspect == "hardware" else "memory",
-            "gpu": "GPU",
-            "disk": "disk",
-            "uptime": "uptime",
-            "os": "operating system",
-            "hostname": "hostname",
-            "python": "Python runtime",
-            "process": "process",
-            "network": "network",
-            "service": "service",
-            "temperature": "temperature",
-            "system": "system",
-        }
-        aspect_names = {
-            "hardware": "hardware",
-            "usage": "usage",
-            "status": "status",
-            "version": "version",
-        }
-        return f"Vault {topic_names.get(topic, topic)} {aspect_names.get(aspect, aspect)}"
+        # Topic/aspect are free-form LLM-inferred nouns. Pretty-print a handful
+        # of common acronyms but otherwise display the LLM's noun directly so
+        # any topic the model recognized shows up reasonably.
+        acronyms = {"cpu": "CPU", "gpu": "GPU", "ram": "RAM", "os": "operating system", "ip": "IP", "dns": "DNS"}
+        topic_display = acronyms.get(topic, topic)
+        if topic == "memory" and aspect == "hardware":
+            topic_display = "RAM"
+        return f"Vault {topic_display} {aspect}".strip()
 
     def build_recipe(self, text: str, proposal: dict) -> dict:
         raise ValueError(
