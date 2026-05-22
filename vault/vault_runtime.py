@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 import time
@@ -74,6 +75,12 @@ _AUDIT_CAPS_COMMANDS = {
     "consolidate learned commands",
     "merge duplicate caps",
 }
+
+# `install <pkg>` admin command — single-arg form. Recognized when the
+# remainder validates as an apt-style package name. Anything not matching
+# falls through to normal routing (so "install a fence in the yard" stays
+# chat).
+_INSTALL_COMMAND_PREFIX = "install "
 
 SESSION_COMMANDS = {
     "new": "new",
@@ -184,6 +191,11 @@ class VaultRuntime:
         self.learned_capabilities = LearnedCapabilityEngine()
         # Per-node active_task_id so multi-node sessions don't clobber each other
         self._node_task_ids: dict = {}
+        # In-flight background workers — description/package → started_at unix.
+        # Surfaced in "any updates" so the user knows learning is still cooking.
+        self._active_learn_jobs: dict = {}
+        self._active_install_jobs: dict = {}
+        self._async_job_lock = threading.Lock()
 
     def handle(self, user_input, node_id: str = "cli"):
         user_input = (user_input or "").strip()
@@ -205,7 +217,7 @@ class VaultRuntime:
 
         if command_text in _UPDATES_COMMANDS:
             return self._remember_active(self._runtime_command_response(
-                self.router.show_updates(self.active_task_id),
+                self._show_updates_with_progress(),
                 "code_monkey_updates",
             ))
 
@@ -224,6 +236,10 @@ class VaultRuntime:
         if command_text in _AUDIT_CAPS_COMMANDS:
             return self._remember_active(self._start_audit_caps(node_id))
 
+        install_response = self._maybe_handle_install_command(user_input, node_id)
+        if install_response is not None:
+            return install_response
+
         if lowered in {"review", "review code", "review build", "review project", "review results"} or lowered.startswith("review "):
             parts = user_input.strip().split(None, 1)
             explicit_id = parts[1].strip() if len(parts) > 1 and parts[0].lower() == "review" else None
@@ -238,7 +254,7 @@ class VaultRuntime:
         # Single-word command keywords — catch before any LLM is invoked.
         if lowered in _UPDATES_KEYWORDS and " " not in lowered:
             return self._remember_active(self._runtime_command_response(
-                self.router.show_updates(self.active_task_id),
+                self._show_updates_with_progress(),
                 "code_monkey_updates",
             ))
 
@@ -504,7 +520,7 @@ class VaultRuntime:
 
         if text in _UPDATES_COMMANDS:
             return self._remember_active(self._runtime_command_response(
-                self.router.show_updates(self.active_task_id),
+                self._show_updates_with_progress(),
                 "code_monkey_updates",
             ))
 
@@ -522,6 +538,10 @@ class VaultRuntime:
 
         if text in _AUDIT_CAPS_COMMANDS:
             return self._remember_active(self._start_audit_caps(node_id))
+
+        install_response = self._maybe_handle_install_command(message, node_id)
+        if install_response is not None:
+            return install_response
 
         command_response = self.command_agent.handle(message)
         if command_response is not None:
@@ -546,10 +566,9 @@ class VaultRuntime:
 
     def _spawn_async_learn(self, *, original_message: str, proposal: dict,
                            confirmed_by: str, node_id: str) -> None:
-        """Run the planner+smoke+save loop on a background thread. On
-        completion, write a notification to the event log so the next /ui
-        call can prepend 'New notifications received'."""
-        import threading
+        """Run the planner+smoke+save loop on a background thread. Tracked in
+        _active_learn_jobs so 'any updates' can show in-flight work."""
+        description = proposal.get("description") or "that capability"
 
         def _worker():
             engine = self._learned_engine()
@@ -560,19 +579,136 @@ class VaultRuntime:
                     confirmed_by=confirmed_by,
                 )
             except Exception as exc:
-                self.event_log.notify(
-                    job_id=f"learn:{_learned_normalize(original_message)}",
-                    level="error",
-                    message=(
-                        f"Learning {proposal.get('description') or 'that capability'} "
-                        f"crashed: {exc}"
-                    ),
+                self.event_log.write(
+                    job_id=f"learn:{_learned_normalize(original_message)}:{int(time.time())}",
+                    event_type="learn_failed",
+                    message=f"Learning {description} crashed: {exc}"[:1200],
                     data={"original_message": original_message, "error": str(exc)},
                 )
-                return
-            self._notify_learn_result(original_message, proposal, result)
+            else:
+                self._notify_learn_result(original_message, proposal, result)
+            finally:
+                with self._async_job_lock:
+                    self._active_learn_jobs.pop(description, None)
 
+        with self._async_job_lock:
+            self._active_learn_jobs[description] = time.time()
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _spawn_async_install(self, package: str, node_id: str) -> dict:
+        """Install an apt package in the background. Same pattern as
+        _spawn_async_learn: immediate ack to the user, notification on
+        completion."""
+        engine = self._learned_engine()
+
+        def _worker():
+            try:
+                result = engine.install_package(package)
+            except Exception as exc:
+                self.event_log.write(
+                    job_id=f"install:{package}:{int(time.time())}",
+                    event_type="install_failed",
+                    message=f"Install of {package} crashed: {exc}"[:1200],
+                    data={"package": package, "error": str(exc)},
+                )
+                return
+            finally:
+                with self._async_job_lock:
+                    self._active_install_jobs.pop(package, None)
+            if result.get("ok"):
+                self.event_log.write(
+                    job_id=f"install:{package}:{int(time.time())}",
+                    event_type="install_succeeded",
+                    message=f"Installed {package}.",
+                    data={"package": package, "result": result},
+                )
+            else:
+                err = result.get("error") or result.get("stderr") or f"rc={result.get('returncode')}"
+                self.event_log.write(
+                    job_id=f"install:{package}:{int(time.time())}",
+                    event_type="install_failed",
+                    message=f"Install of {package} failed: {err}"[:1200],
+                    data={"package": package, "result": result},
+                )
+
+        with self._async_job_lock:
+            self._active_install_jobs[package] = time.time()
+        threading.Thread(target=_worker, daemon=True).start()
+        return self._remember_active({
+            "mode": "direct",
+            "message": f"I'll install {package} and let you know when it's done.",
+            "data": {"install_async": True, "package": package},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "install_async",
+            "compose": False,
+            "response_composed": True,
+        })
+
+    def _maybe_handle_install_command(self, user_input: str, node_id: str) -> dict | None:
+        """Recognize `install <pkg>` admin commands. Returns a response when
+        the input matches the strict pattern, None otherwise so normal routing
+        proceeds (e.g. "install a screen door" stays chat)."""
+        raw = (user_input or "").strip()
+        lowered = raw.lower()
+        if not lowered.startswith(_INSTALL_COMMAND_PREFIX):
+            return None
+        remainder = raw[len(_INSTALL_COMMAND_PREFIX):].strip()
+        # Strip trailing punctuation
+        remainder = remainder.rstrip(".!?,")
+        # Strict: a single apt-style package name.
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+\-.]{0,63}", remainder.lower()):
+            return None
+        package = remainder.lower()
+        # Idempotent: if already installing the same package, just say so.
+        with self._async_job_lock:
+            if package in self._active_install_jobs:
+                return self._remember_active({
+                    "mode": "direct",
+                    "message": f"Already installing {package}; I'll notify you when it finishes.",
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": "install_async",
+                    "compose": False,
+                    "response_composed": True,
+                })
+        return self._spawn_async_install(package, node_id)
+
+    def _show_updates_with_progress(self) -> dict:
+        """Wrap router.show_updates so the response also reports any
+        in-flight background jobs (async learning, async installs)."""
+        response = self.router.show_updates(self.active_task_id)
+        if not isinstance(response, dict):
+            return response
+        progress = self._async_progress_summary()
+        if progress:
+            msg = response.get("message") or ""
+            response = dict(response)
+            response["message"] = (
+                f"{progress}\n{msg}" if msg.strip() else progress
+            )
+        return response
+
+    def _async_progress_summary(self) -> str:
+        """Human-readable summary of in-flight background jobs, or '' if none."""
+        with self._async_job_lock:
+            learn_jobs = list(self._active_learn_jobs.items())
+            install_jobs = list(self._active_install_jobs.items())
+        now = time.time()
+        lines = []
+        if learn_jobs:
+            entries = ", ".join(
+                f"'{desc}' ({int(now - started)}s)" for desc, started in learn_jobs
+            )
+            label = "learn job" if len(learn_jobs) == 1 else "learn jobs"
+            lines.append(f"{len(learn_jobs)} {label} in progress: {entries}")
+        if install_jobs:
+            entries = ", ".join(
+                f"{pkg} ({int(now - started)}s)" for pkg, started in install_jobs
+            )
+            label = "install" if len(install_jobs) == 1 else "installs"
+            lines.append(f"{len(install_jobs)} {label} in progress: {entries}")
+        return "\n".join(lines)
 
     def _notify_learn_result(self, original_message: str, proposal: dict, result: dict) -> None:
         """Write a notification summarizing an async learn job."""
