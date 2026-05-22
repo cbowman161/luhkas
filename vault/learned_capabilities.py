@@ -388,7 +388,11 @@ class LearnedCapabilityEngine:
         self.store = store or LearnedCapabilityStore()
         self.safety = SafetyPolicy()
         self.scripts_dir = self.store.path.parent / "scripts"
-        self.code_monkey = code_monkey_client if code_monkey_client is not None else CodeMonkeyClient(timeout=3)
+        # Recipe generation can run the planner LLM multiple times (initial
+        # attempt + retries) and uses format-constrained decoding, which is
+        # slower than plain generation. The default 3s timeout was too tight
+        # and aborted legitimate calls mid-retry. 60s is generous but bounded.
+        self.code_monkey = code_monkey_client if code_monkey_client is not None else CodeMonkeyClient(timeout=60)
         self.model = model if model is not None else get_model("router")
         self._inference_cache: dict = {}
 

@@ -48,30 +48,98 @@ FORBIDDEN_ARGV_TOKENS = frozenset({
 })
 
 
+MAX_PLANNER_RETRIES = 2
+
+
 def generate_learned_command_recipe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Plan a recipe for the confirmed request. If the generated recipe fails
+    validation, re-prompt the planner with the rejection reason as feedback
+    (up to MAX_PLANNER_RETRIES). Temperature is bumped on retries so the
+    planner doesn't just repeat the same mistake."""
     user_input = str(payload.get("input") or payload.get("user_input") or "").strip()
     if not user_input:
         return {"ok": False, "error": "Missing required field: input"}
 
-    prompt = _recipe_prompt(user_input=user_input, payload=payload)
-    model = LocalModel(model=PLANNER_MODEL, timeout=120, temperature=0.05, num_ctx=4096)
-    raw = model.generate(prompt)
-    parsed = _parse_json_object(raw)
-    recipe = _normalize_recipe(parsed)
-    validation = _validate_recipe(recipe)
-    if not validation.get("ok"):
-        return {
-            "ok": False,
-            "error": validation.get("error"),
-            "raw_response": raw,
-            "recipe": recipe,
-        }
+    last_recipe: Dict[str, Any] | None = None
+    last_error: str = ""
+    last_raw: str = ""
+
+    for attempt in range(MAX_PLANNER_RETRIES + 1):
+        if attempt == 0:
+            prompt = _recipe_prompt(user_input=user_input, payload=payload)
+            temperature = 0.05
+        else:
+            prompt = _retry_prompt(
+                user_input=user_input,
+                payload=payload,
+                previous_recipe=last_recipe or {},
+                rejection=last_error,
+            )
+            temperature = 0.25 + 0.15 * (attempt - 1)
+
+        model = LocalModel(
+            model=PLANNER_MODEL,
+            timeout=120,
+            temperature=temperature,
+            num_ctx=4096,
+            # Recipes are short JSON; cap output well above the longest
+            # python_script template we'd produce, but not so high that
+            # format=json's per-token validation balloons latency.
+            num_predict=1024,
+        )
+        try:
+            raw = model.generate(prompt, response_format="json")
+        except Exception as exc:
+            last_error = f"planner call failed: {exc}"
+            last_raw = ""
+            continue
+        last_raw = raw
+
+        try:
+            parsed = _parse_json_object(raw)
+        except ValueError as exc:
+            last_error = f"planner returned unparseable JSON: {exc}"
+            continue
+
+        recipe = _normalize_recipe(parsed)
+        validation = _validate_recipe(recipe)
+        if validation.get("ok"):
+            return {
+                "ok": True,
+                "recipe": recipe,
+                "raw_response": raw,
+                "generator": "code_monkey_single_recipe",
+                "attempts": attempt + 1,
+            }
+        last_recipe = recipe
+        last_error = validation.get("error") or "unknown validator error"
+
     return {
-        "ok": True,
-        "recipe": recipe,
-        "raw_response": raw,
-        "generator": "code_monkey_single_recipe",
+        "ok": False,
+        "error": f"After {MAX_PLANNER_RETRIES + 1} planner attempts: {last_error}",
+        "raw_response": last_raw,
+        "recipe": last_recipe,
+        "attempts": MAX_PLANNER_RETRIES + 1,
     }
+
+
+def _retry_prompt(*, user_input: str, payload: Dict[str, Any], previous_recipe: Dict[str, Any], rejection: str) -> str:
+    return (
+        _recipe_prompt(user_input=user_input, payload=payload)
+        + "\n\n----- RETRY -----\n"
+        + "Your previous attempt was REJECTED by the validator:\n"
+        + f"  Rejected recipe: {json.dumps(previous_recipe, indent=2, sort_keys=True)}\n"
+        + f"  Rejection reason: {rejection}\n\n"
+        + "Try AGAIN with a different approach. Concretely:\n"
+        + "- If rejection mentions a shell metachar (|, >, ;, &&, etc.) or piping, "
+        + "switch to type=python_script and aggregate inside Python.\n"
+        + "- If rejection mentions PATH or 'not on PATH', pick a binary that exists "
+        + "on stock Ubuntu/Debian (e.g. systemctl, ip, ss, lsblk, lsmod, lspci, "
+        + "journalctl) or use a python_script.\n"
+        + "- If rejection mentions a blocked operation, choose a non-destructive "
+        + "equivalent.\n\n"
+        + "Return the corrected JSON object only.\n"
+    )
 
 
 def _recipe_prompt(*, user_input: str, payload: Dict[str, Any]) -> str:
@@ -126,6 +194,17 @@ def _recipe_prompt(*, user_input: str, payload: Dict[str, Any]) -> str:
         "- Python scripts may use subprocess to call read-only commands and may read\n"
         "  /proc and /sys, but must not write files or open network sockets.\n"
         "- Choose the command whose first word resolves on a stock Ubuntu/Debian PATH.\n\n"
+        "Common patterns the planner often gets wrong — pick the CORRECT form:\n"
+        "  • DNS servers — DON'T `cat /etc/resolv.conf | grep nameserver`.\n"
+        "    DO python_script that reads /etc/resolv.conf line-by-line and prints lines starting with 'nameserver'.\n"
+        "  • Firewall active — DON'T `iptables -L` (needs root) or `ufw status` (often not installed).\n"
+        "    DO python_script that calls `subprocess.run([\"systemctl\", \"is-active\", svc], ...)` for each of ufw, firewalld, nftables, iptables and reports which are active.\n"
+        "  • Counting items in command output — DON'T `dpkg -l | wc -l` etc.\n"
+        "    DO python_script that runs the producer command via subprocess, splits stdout lines in Python, and counts.\n"
+        "  • Grepping a file — DON'T `grep PATTERN /path` if you want only matching lines from a config file.\n"
+        "    DO python_script that opens the file and filters in Python (better error handling, no shell).\n"
+        "  • dmesg — DON'T use it (requires root on most kernels).\n"
+        "    DO `journalctl -k --no-pager -n 50` (unprivileged equivalent for recent kernel messages).\n\n"
         f"Confirmed request context:\n{json.dumps(context, indent=2, sort_keys=True)}\n"
     )
 
@@ -217,6 +296,19 @@ def _validate_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
         source = str(recipe.get("source") or "")
         if not source.strip():
             return {"ok": False, "error": "Generated python recipe is missing source."}
+        # Syntax-check first. The planner occasionally emits truncated source
+        # (cut off mid-f-string when generation is bounded). compile() catches
+        # those before they get saved and fail at execution time.
+        try:
+            compile(source, "<learned-recipe>", "exec")
+        except SyntaxError as exc:
+            return {
+                "ok": False,
+                "error": (
+                    f"Generated python source has a syntax error at line {exc.lineno}: "
+                    f"{exc.msg}. The recipe is likely truncated — emit the whole script."
+                ),
+            }
         lowered = source.lower()
         # subprocess is allowed (read-only commands invoked from python), so it
         # is NOT in this list. Network and file-write tokens stay blocked.

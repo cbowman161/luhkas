@@ -32,24 +32,34 @@ class LocalModel:
         timeout: int = 600,
         temperature: float = 0.15,
         num_ctx: int = 16384,
+        num_predict: int | None = None,
     ):
         self.model = model
         self.endpoint = endpoint
         self.timeout = timeout
         self.temperature = temperature
         self.num_ctx = num_ctx
+        self.num_predict = num_predict
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, response_format: str | None = None) -> str:
+        options: Dict[str, Any] = {
+            "temperature": self.temperature,
+            "num_ctx": self.num_ctx,
+        }
+        if self.num_predict is not None:
+            options["num_predict"] = self.num_predict
         payload: Dict[str, Any] = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
             "keep_alive": BACKGROUND_KEEP_ALIVE,
-            "options": {
-                "temperature": self.temperature,
-                "num_ctx": self.num_ctx,
-            },
+            "options": options,
         }
+        if response_format:
+            # Ollama supports format="json" to constrain the model to emit a
+            # syntactically valid JSON value. Use sparingly — it slows
+            # generation but eliminates a whole class of parse failures.
+            payload["format"] = response_format
 
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
