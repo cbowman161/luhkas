@@ -1247,7 +1247,7 @@ class VaultRuntime:
             "original_message": original_message,
             "proposal": proposal,
             "node_id": node_id,
-            "correction": correction,
+            "correction": message,
         })
         prefix = "Removed the wrong learned command." if removed else "Got it."
         return self._remember_active({

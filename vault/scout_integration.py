@@ -444,6 +444,14 @@ class ScoutVaultBridge:
         self.route_model = get_model("router")
         self.chat_model = get_model("chat")
         self.response_composer = ResponseComposer(self.chat_model)
+        try:
+            from storage.vector_store import MemoryStore
+            self.embed_model = get_model("embed")
+            self.memory_store = MemoryStore(embedder=self.embed_model)
+        except Exception as exc:
+            print(f"[memory_store] disabled: {exc}")
+            self.embed_model = None
+            self.memory_store = None
 
     def capabilities(self):
         scout_capabilities = self.scout_node_capabilities()
@@ -1517,11 +1525,14 @@ class ScoutVaultBridge:
         )
 
         # New low-confidence phrase: ask for confirmation before learning.
+        # general_question is the conversational catch-all — asking "did you
+        # mean a general question?" is never useful, so we never confirm it.
         if (
             route.get("ok")
             and not route.get("from_cache")
             and not route.get("deterministic")
             and float(route.get("confidence") or 0.0) < 0.88
+            and route.get("route") != "general_question"
             and not scout_action_allowed
             and not local_node_command
         ):
@@ -1573,6 +1584,15 @@ class ScoutVaultBridge:
             return self.generate_response(
                 "routing_error", message, state, {"route": route}, max_tokens=100
             )
+
+        if route.get("route") in {"general_question", "direction"}:
+            stored = self.persist_user_facts(message, state)
+            if stored:
+                actions.append({
+                    "name": "persist_user_facts",
+                    "ok": True,
+                    "result": {"count": len(stored), "facts": [r["content"] for r in stored]},
+                })
 
         introduced_name = _extract_introduction_name(message)
 
@@ -1952,16 +1972,35 @@ Allowed route values:
   self, or action question.
 - general_question: questions about the world, facts, conversation, or anything
   that does not request a change/action and is not about the live camera image.
+  This also covers questions about the SPEAKER's own attributes, possessions,
+  preferences, or facts they have shared in this conversation (e.g. their pet,
+  family, favorite color, plans) — recall is answered from chat history.
 - analyze_vision: questions about what the scout sees, the camera image, visual
   scene, objects in front of the scout, visible people, colors, room layout, or
   visual recognition from the current snapshot.
-- self_question: questions about the assistant's name, identity, personality,
-  software, hardware, memory, sensors, capabilities, or current recognition
-  state. This includes service health, runtime health, status, current model
-  stack, and whether brain/scout services are available.
+- self_question: questions about the ASSISTANT itself — its name, identity,
+  personality, software, hardware, sensors, capabilities, runtime/service
+  status — OR questions about whether the assistant RECOGNIZES the current
+  user (face/identity recognition). "what do you know about me" and "who am I"
+  belong here because they ask what the assistant has stored or recognized.
 - direction: instructions or requests to do something, including movement,
   looking, learning a face/name, remembering a fact/preference, changing a
   setting, or using a capability.
+
+Pronoun convention (important):
+- "you", "your", "yours", "yourself" → refer to the ASSISTANT (Luhkas).
+- "I", "me", "my", "mine", "myself" → refer to the SPEAKER (the user).
+- A question about a SPEAKER attribute ("what is my pet's name", "what's my
+  favorite color", "where did I say I lived") is general_question, NOT
+  self_question — the assistant is being asked to recall something about the
+  user from chat history, not introspect on itself.
+- "what do you know about me" and "who am I" are the exception: those ask what
+  the assistant has recognized or stored about the user, so they are
+  self_question (user_identity / memory bucket).
+- Declarative speaker facts ("my pet's name is Salem", "I live in Austin")
+  without an explicit "remember" verb are general_question (the chat layer
+  will retain them in session history); only an explicit "remember ..." is
+  direction.
 
 Rules:
 - Pick exactly one allowed route.
@@ -1987,6 +2026,11 @@ Examples:
 - "is anyone in front of you" -> {{"route":"analyze_vision","confidence":0.9,"reason":"asks about visible people"}}
 - "I am Chris" -> {{"route":"direction","confidence":0.85,"reason":"introduces a person to learn"}}
 - "remember that I like blue" -> {{"route":"direction","confidence":0.9,"reason":"asks to store memory"}}
+- "my pet's name is Salem" -> {{"route":"general_question","confidence":0.85,"reason":"speaker shares a personal fact, retained in chat history"}}
+- "what is my pet's name" -> {{"route":"general_question","confidence":0.9,"reason":"asks recall of speaker fact from chat history"}}
+- "what's my favorite color" -> {{"route":"general_question","confidence":0.9,"reason":"asks recall of speaker preference from chat history"}}
+- "who am I" -> {{"route":"self_question","confidence":0.9,"reason":"asks assistant's recognition of the user"}}
+- "what do you know about me" -> {{"route":"self_question","confidence":0.9,"reason":"asks assistant's stored memory about the user"}}
 - "go forward" -> {{"route":"direction","confidence":0.95,"reason":"movement instruction"}}
 
 Assistant identity memory:
@@ -3061,6 +3105,117 @@ Do not mention provenance unless asked.
                 )
         return None
 
+    _FACT_EXTRACTOR_PROMPT = """Extract any personal facts the SPEAKER stated about THEMSELVES in this message.
+Return a compact JSON list of fact statements rewritten in third person referring
+to "the user" (e.g. "the user's pet is named Salem", "the user lives in Austin").
+
+Rules:
+- Only extract things the user said about themselves, their possessions,
+  preferences, relationships, location, plans, or activities.
+- Do NOT extract questions, commands, requests, observations about the
+  assistant, or external/world facts.
+- Each fact must be a short standalone sentence starting with "the user"
+  or "the user's".
+- If no personal facts are present, return [].
+- Output JSON list only. No markdown, no prose.
+
+Examples:
+- "my pet's name is Salem"     -> ["the user's pet is named Salem"]
+- "I live in Austin"            -> ["the user lives in Austin"]
+- "what's my pet's name"        -> []
+- "remember I like blue"        -> ["the user likes blue"]
+- "good morning"                -> []
+- "what's the capital of japan" -> []
+- "I work as an SRE and I have a cat named Whiskers"
+                                -> ["the user works as an SRE", "the user has a cat named Whiskers"]
+
+User message:
+{message}
+"""
+
+    def extract_user_facts(self, message: str) -> list[str]:
+        """Use the small router model to pull declarative speaker-facts out of a turn.
+        Returns a (possibly empty) list of third-person fact sentences."""
+        if not message or not message.strip():
+            return []
+        prompt = self._FACT_EXTRACTOR_PROMPT.format(message=message.strip())
+        try:
+            raw = self.route_model.generate(
+                prompt,
+                options={"num_predict": 120, "temperature": 0.0, "top_p": 0.9},
+                timeout=30,
+                allow_empty=True,
+            )
+        except Exception:
+            return []
+        if not raw:
+            return []
+        text = raw.strip()
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return []
+        facts = []
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, str) and item.strip():
+                facts.append(item.strip())
+        return facts
+
+    def _unidentified_face_ref(self, state: dict | None) -> str | None:
+        """Best-effort handle for the unknown-bucket: most-confident visible
+        face/person detection id, used to tie unknown memories to a face
+        observation when one exists."""
+        if not state:
+            return None
+        for det in state.get("detections", []) or []:
+            label = str(det.get("label", "")).lower()
+            if det.get("identity"):
+                continue
+            if label == "person" or "face" in label:
+                det_id = det.get("id")
+                if det_id is not None:
+                    return str(det_id)
+        return None
+
+    def persist_user_facts(self, message: str, state: dict | None = None) -> list[dict]:
+        """Extract any speaker-facts from the message and write them to the
+        identity-scoped memory store. Returns the list of stored records."""
+        if not self.memory_store:
+            return []
+        facts = self.extract_user_facts(message)
+        if not facts:
+            return []
+        identity = self.active_identity
+        unidentified_face_ref = None if identity else self._unidentified_face_ref(state)
+        stored = []
+        for fact in facts:
+            try:
+                res = self.memory_store.add(
+                    fact,
+                    identity=identity,
+                    unidentified_face_ref=unidentified_face_ref,
+                    category="fact",
+                    source_message=message,
+                )
+                if res.get("ok"):
+                    stored.append(res["record"])
+            except Exception as exc:
+                print(f"[memory_store] write failed: {exc}")
+        return stored
+
+    def recall_user_facts(self, query: str, top_k: int = 5) -> list[dict]:
+        if not self.memory_store:
+            return []
+        identity = self.active_identity or "unknown"
+        try:
+            return self.memory_store.search(query, identity=identity, top_k=top_k)
+        except Exception as exc:
+            print(f"[memory_store] search failed: {exc}")
+            return []
+
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
@@ -3069,6 +3224,7 @@ Do not mention provenance unless asked.
         identity_context = self.response_identity_context(state)
         response_context = self.response_context(state)
         conversation_context = _presence_conversation_context(presence_context)
+        recalled_facts = [r["content"] for r in self.recall_user_facts(message, top_k=5)]
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -3082,9 +3238,11 @@ Context:
     "tracking_available": bool(state.get("ok")),
     "active_identity": active_identity_context or "unknown",
     "tracking_memory": state.get("object_memory", [])[:4],
+    "remembered_user_facts": recalled_facts,
 }, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts.
+If the user is asking about something in remembered_user_facts, answer from those facts directly.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
