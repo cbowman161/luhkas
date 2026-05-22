@@ -17,6 +17,77 @@ from safety_policy import SafetyPolicy
 DEFAULT_STORE = Path(__file__).parent / "data" / "learned_capabilities" / "capabilities.json"
 
 
+_PENDING_INTENT_PROMPT = """You decide what a user's message means in the context of a pending proposal or just-run command.
+
+The system either just proposed something to the user ("I think you mean Vault <X> <Y>. Is that right?")  or just ran a command and is waiting one turn for the user to correct it. The user's next message can be:
+
+- "affirm": the user accepts the proposal/result as-is.
+- "deny": the user rejects it WITHOUT specifying a replacement.
+- "correct": the user says they actually wanted something different. You MUST output the corrected topic and aspect.
+- "unrelated": the user is changing subject or asking something else entirely.
+
+Output strict JSON: {"intent": "<one of the four>", "topic": <noun_or_none>, "aspect": <noun_or_none>}
+
+Topic and aspect are required only for "correct". For other intents they should be null/none.
+
+Topic is a singular lowercase one-word noun (cpu, memory, disk, network, port, service, kernel, log, time, user, etc., or any Linux tool name like iotop, lsof, nmap). Aspect is one of: usage, hardware, status, version, list, count, recent — or another singular noun if those don't fit.
+
+When the correction only mentions an aspect ("hardware", "current usage"), keep the previous topic. When it mentions only a topic ("actually disk"), keep the previous aspect.
+
+Examples (PREVIOUS shows what was just proposed/executed; USER MESSAGE is what they said next):
+
+PREVIOUS topic=cpu aspect=status description="Vault CPU status"
+ORIGINAL: "CPU status"
+USER MESSAGE: "I actually wanted CPU hardware"
+OUTPUT: {"intent": "correct", "topic": "cpu", "aspect": "hardware"}
+
+PREVIOUS topic=cpu aspect=status description="Vault CPU status"
+ORIGINAL: "CPU status"
+USER MESSAGE: "I actually wanted CPU hardware status"
+OUTPUT: {"intent": "correct", "topic": "cpu", "aspect": "hardware"}
+
+PREVIOUS topic=memory aspect=usage description="Vault memory usage"
+ORIGINAL: "show me memory"
+USER MESSAGE: "no, the hardware"
+OUTPUT: {"intent": "correct", "topic": "memory", "aspect": "hardware"}
+
+PREVIOUS topic=memory aspect=usage description="Vault memory usage"
+ORIGINAL: "show me memory"
+USER MESSAGE: "actually disk"
+OUTPUT: {"intent": "correct", "topic": "disk", "aspect": "usage"}
+
+PREVIOUS topic=cpu aspect=usage description="Vault CPU usage"
+ORIGINAL: "cpu usage"
+USER MESSAGE: "yes"
+OUTPUT: {"intent": "affirm", "topic": "none", "aspect": "none"}
+
+PREVIOUS topic=cpu aspect=usage description="Vault CPU usage"
+ORIGINAL: "cpu usage"
+USER MESSAGE: "no"
+OUTPUT: {"intent": "deny", "topic": "none", "aspect": "none"}
+
+PREVIOUS topic=disk aspect=usage description="Vault disk usage"
+ORIGINAL: "how full is the drive"
+USER MESSAGE: "what time is it"
+OUTPUT: {"intent": "unrelated", "topic": "none", "aspect": "none"}
+
+PREVIOUS topic=cpu aspect=usage description="Vault CPU usage"
+ORIGINAL: "cpu usage"
+USER MESSAGE: "that's wrong, I wanted the processor model"
+OUTPUT: {"intent": "correct", "topic": "cpu", "aspect": "hardware"}
+
+PREVIOUS topic=cpu aspect=status description="Vault CPU status"
+ORIGINAL: "CPU status"
+USER MESSAGE: "give me hardware specs instead"
+OUTPUT: {"intent": "correct", "topic": "cpu", "aspect": "hardware"}
+
+Now classify:
+PREVIOUS topic=%(prev_topic)s aspect=%(prev_aspect)s description=%(prev_description)s
+ORIGINAL: %(original)s
+USER MESSAGE: %(user_message)s
+OUTPUT:"""
+
+
 _CORRECTION_PROMPT = """You classify a user CORRECTION to a previous request about a Linux server's runtime state.
 
 Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_none>}
@@ -456,6 +527,50 @@ class LearnedCapabilityEngine:
         result = self._llm_classify(text)
         self._inference_cache[key] = result
         return result
+
+    def classify_pending_intent(
+        self,
+        message: str,
+        original: str = "",
+        previous_topic: str | None = None,
+        previous_aspect: str | None = None,
+        previous_description: str | None = None,
+    ) -> dict:
+        """Decide what a user's message means in the context of a pending
+        proposal or just-executed cap. Returns a dict:
+            {"intent": "affirm" | "deny" | "correct" | "unrelated",
+             "topic": <topic_or_none>,
+             "aspect": <aspect_or_none>}
+        - affirm  → user accepts the proposal as-is
+        - deny    → user rejects, no replacement
+        - correct → user wants a different topic/aspect (LLM fills both)
+        - unrelated → not about the pending decision
+
+        The LLM decides whether it's a correction; no leading-"no"/"actually"
+        regex required."""
+        if self.model is None:
+            return {"intent": "unrelated", "topic": None, "aspect": None}
+        prompt = _PENDING_INTENT_PROMPT % {
+            "prev_topic": previous_topic or "none",
+            "prev_aspect": previous_aspect or "none",
+            "prev_description": previous_description or "none",
+            "original": json.dumps(str(original or "")),
+            "user_message": json.dumps(str(message or "")),
+        }
+        try:
+            raw = self.model.generate(prompt, think=False, timeout=10)
+        except Exception:
+            return {"intent": "unrelated", "topic": None, "aspect": None}
+        parsed = self._parse_json_object(raw)
+        if not isinstance(parsed, dict):
+            return {"intent": "unrelated", "topic": None, "aspect": None}
+        raw_intent = parsed.get("intent")
+        intent = (raw_intent.strip().lower() if isinstance(raw_intent, str) else "unrelated")
+        if intent not in {"affirm", "deny", "correct", "unrelated"}:
+            intent = "unrelated"
+        topic = self._clean_noun(parsed.get("topic"))
+        aspect = self._clean_noun(parsed.get("aspect"))
+        return {"intent": intent, "topic": topic, "aspect": aspect}
 
     def classify_correction(
         self,

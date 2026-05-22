@@ -137,17 +137,20 @@ def _is_denial(text: str) -> bool:
 
 
 def _extract_correction(text: str) -> str | None:
+    """Deprecated fast-path heuristic — only catches the most unambiguous
+    leading-"no"/"nope"/"nah" forms. Anything subtler is now decided by the
+    LLM intent classifier (LearnedCapabilityEngine.classify_pending_intent)
+    called from the handlers when this returns None.
+
+    Kept as a cheap pre-check so plain "no, hardware" responses don't pay an
+    extra LLM round-trip."""
     import re
     raw = str(text or "").strip()
     lowered = raw.lower()
     for pattern in (
-        r"^no[,.]?\s+i\s+mean\s+(.+)$",
-        r"^no[,.]?\s+i\s+meant\s+(.+)$",
         r"^no[,.]?\s+(.+)$",
         r"^nope[,.]?\s+(.+)$",
         r"^nah[,.]?\s+(.+)$",
-        r"^actually[,.]?\s+(.+)$",
-        r"^not\s+that[,.]?\s+(.+)$",
     ):
         match = re.match(pattern, lowered)
         if match:
@@ -563,6 +566,39 @@ class VaultRuntime:
             return learned_response
 
         return None
+
+    def _resolve_pending_intent(
+        self,
+        message: str,
+        *,
+        previous_inferred: dict | None = None,
+        previous_description: str | None = None,
+        original_message: str = "",
+    ) -> dict:
+        """Ask the LLM what the user means with `message` in the context of a
+        pending proposal or just-executed cap. Returns a dict with intent +
+        (when intent is 'correct') topic/aspect.
+
+        Cheap fast-paths first:
+          - leading "no, ..." regex → returns intent=correct with the rest as
+            the correction text (LLM still classifies topic/aspect from it).
+          - plain `_is_affirmative` / `_is_denial` → returns those intents
+            without an LLM call.
+
+        Anything else → defer to the LLM intent classifier."""
+        if _is_affirmative(message):
+            return {"intent": "affirm", "topic": None, "aspect": None}
+        if _is_denial(message):
+            return {"intent": "deny", "topic": None, "aspect": None}
+        engine = self._learned_engine()
+        prev = previous_inferred or {}
+        return engine.classify_pending_intent(
+            message,
+            original=original_message,
+            previous_topic=prev.get("topic"),
+            previous_aspect=prev.get("aspect"),
+            previous_description=previous_description,
+        )
 
     def _spawn_async_learn(self, *, original_message: str, proposal: dict,
                            confirmed_by: str, node_id: str) -> None:
@@ -1118,9 +1154,19 @@ class VaultRuntime:
         if not isinstance(pending, dict) or pending.get("type") != "learned_execution_review":
             return None
 
-        correction = _extract_correction(message)
-        if not correction and not _is_denial(message):
-            # User moved on without correcting — review window closes.
+        # LLM-driven intent classification — no hardcoded "is this a
+        # correction" patterns. Fast-paths still handle plain yes/no.
+        intent_info = self._resolve_pending_intent(
+            message,
+            previous_inferred=pending.get("executed_cap_inferred") or {},
+            previous_description=pending.get("executed_cap_description"),
+            original_message=pending.get("original_message") or "",
+        )
+        intent = intent_info.get("intent")
+
+        if intent in {"affirm", "unrelated"}:
+            # Affirm = user is happy with the cap; unrelated = moved on.
+            # Either way, close the review window and stop intercepting.
             self._clear_pending()
             return None
 
@@ -1128,19 +1174,16 @@ class VaultRuntime:
         alias_key = pending.get("alias_key") or ""
         removed = engine.store.forget(alias_key) if alias_key else False
 
-        if correction:
-            # Build a synthetic "previous proposal" from what we executed so
-            # the LLM correction classifier sees full prior context.
-            previous_proposal = {
-                "inferred": pending.get("executed_cap_inferred") or {},
-                "description": pending.get("executed_cap_description"),
-                "intent": pending.get("executed_cap_intent"),
-            }
-            proposal = engine.propose_correction(
-                correction,
-                previous_proposal,
-                original_message=pending.get("original_message") or "",
-            )
+        if intent == "correct":
+            corrected_topic = intent_info.get("topic")
+            corrected_aspect = intent_info.get("aspect")
+            if corrected_topic is None:
+                proposal = None
+            else:
+                proposal = engine._code_monkey_recipe_proposal(
+                    corrected_topic,
+                    corrected_aspect or engine._default_aspect_for(corrected_topic),
+                )
         else:
             proposal = None
 
@@ -1319,14 +1362,37 @@ class VaultRuntime:
                 "compose": False,
                 "response_composed": True,
             })
-        correction = _extract_correction(message)
-        if correction:
-            previous_proposal = pending.get("proposal") or {}
-            proposal = engine.propose_correction(
-                correction,
-                previous_proposal,
-                original_message=pending.get("original_message") or "",
-            )
+        # Non-affirmative response: ask the LLM whether the user is correcting
+        # the pending proposal, denying it, or moving on. No hardcoded patterns
+        # — the LLM has full context of what was proposed and what the user
+        # originally asked for.
+        previous_proposal = pending.get("proposal") or {}
+        intent_info = self._resolve_pending_intent(
+            message,
+            previous_inferred=previous_proposal.get("inferred") or {},
+            previous_description=previous_proposal.get("description"),
+            original_message=pending.get("original_message") or "",
+        )
+        intent = intent_info.get("intent")
+        if intent == "correct":
+            corrected_topic = intent_info.get("topic")
+            corrected_aspect = intent_info.get("aspect")
+            if corrected_topic is None and corrected_aspect is None:
+                proposal = None
+            else:
+                # Keep the previous topic when the correction only specified
+                # an aspect, and vice versa.
+                previous_inferred = previous_proposal.get("inferred") or {}
+                use_topic = corrected_topic or previous_inferred.get("topic")
+                use_aspect = (
+                    corrected_aspect
+                    or previous_inferred.get("aspect")
+                    or engine._default_aspect_for(use_topic)
+                )
+                if not use_topic:
+                    proposal = None
+                else:
+                    proposal = engine._code_monkey_recipe_proposal(use_topic, use_aspect)
             if proposal is None:
                 self._clear_pending()
                 return self._remember_active({
@@ -1392,7 +1458,7 @@ class VaultRuntime:
                 "compose": False,
                 "response_composed": True,
             })
-        if _is_denial(message):
+        if intent == "deny":
             self._clear_pending()
             return self._remember_active({
                 "mode": "direct",
@@ -1403,6 +1469,7 @@ class VaultRuntime:
                 "compose": False,
                 "response_composed": True,
             })
+        # "unrelated" or anything else — let normal routing take over.
         return None
 
     def _handle_learned_capability_request(self, message: str, node_id: str) -> dict | None:
