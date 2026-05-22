@@ -788,24 +788,24 @@ class VaultRuntime:
         )
 
     def _attach_notification_alert(self, response: dict) -> dict:
-        """Prepend 'New notifications received' to response.message when the
-        event_log has unread events that originated from async work (learning,
-        installs, etc). Only counts events with a known background-job type
-        so we don't pick up unrelated chatter.
+        """Add a separate notification-alert field to the response when the
+        event_log has unread async-work events. The main `message` (and
+        `tts`) field is left untouched — the alert is its own thing in
+        `notification_alert`, plus a count under `data.unread_async_events`,
+        so the /ui client can render or speak it on a separate channel from
+        the primary reply.
 
-        Idempotent — won't double-prepend, and silenced on the updates view
-        itself."""
+        Silenced on the responses that ARE about notifications (so reading
+        updates doesn't carry an alert about itself)."""
         if not isinstance(response, dict):
             return response
         src = str(response.get("deterministic_source") or "")
-        # Don't prepend on the response that's already about notifications.
         if src in {"code_monkey_updates", "learned_capability_async"}:
             return response
         try:
             unread = self.event_log.unread() or []
         except Exception:
             return response
-        # Only count events from background workers we own.
         background_types = {
             "learn_succeeded", "learn_failed", "learn_needs_install",
             "install_succeeded", "install_failed",
@@ -814,15 +814,14 @@ class VaultRuntime:
         count = len(relevant)
         if count <= 0:
             return response
-        msg = str(response.get("message") or "")
-        if msg.startswith("New notifications received"):
-            return response
-        prefix = (
-            f"New notifications received ({count}). Say 'any updates' to read them. "
-        )
         response = dict(response)
-        response["message"] = prefix + msg
-        response["data"] = {**(response.get("data") or {}), "unread_async_events": count}
+        response["notification_alert"] = (
+            f"New notifications received ({count}). Say 'any updates' to read them."
+        )
+        response["data"] = {
+            **(response.get("data") or {}),
+            "unread_async_events": count,
+        }
         return response
 
     def _learned_engine(self) -> LearnedCapabilityEngine:
