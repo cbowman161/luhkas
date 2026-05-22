@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -889,11 +890,12 @@ class LearnedCapabilityEngine:
             return {"ok": False, "error": f"refusing to install: bad package name {package!r}"}
         try:
             completed = subprocess.run(
-                ["sudo", "-n", "DEBIAN_FRONTEND=noninteractive",
-                 "apt-get", "install", "-y", "--no-install-recommends", package],
+                ["sudo", "-n", "apt-get", "install", "-y",
+                 "--no-install-recommends", package],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
                 check=False,
             )
             return {
