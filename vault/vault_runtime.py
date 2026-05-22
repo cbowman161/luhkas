@@ -257,6 +257,11 @@ class VaultRuntime:
             if review is not None:
                 return review
 
+        if isinstance(pending, dict) and pending.get("type") == "learned_install_confirmation":
+            install_flow = self._handle_learned_install_confirmation(user_input, node_id)
+            if install_flow is not None:
+                return install_flow
+
         # Requirements gathering and review sessions receive raw user text — no intent
         # classification needed since the agents handle their own conversation logic.
         if pending and pending.get("type") in {
@@ -406,6 +411,10 @@ class VaultRuntime:
         if review is not None:
             return review
 
+        install_flow = self._handle_learned_install_confirmation(message, node_id)
+        if install_flow is not None:
+            return install_flow
+
         pending = self.blackboard.get_pending_decision()
         if pending and pending.get("type") in {
             "existing_skill",
@@ -506,6 +515,85 @@ class VaultRuntime:
         }
         response["data"] = data
         return response
+
+    def _handle_learned_install_confirmation(self, message: str, node_id: str) -> dict | None:
+        """One-turn handler for 'should I install <pkg>?' prompts.
+
+        - 'yes' → install via apt, then retry learn_and_execute end-to-end.
+        - 'no' / denial → clear pending, tell user nothing was installed.
+        - any other input → clear pending and fall through.
+        """
+        pending = self.blackboard.get_pending_decision()
+        if not isinstance(pending, dict) or pending.get("type") != "learned_install_confirmation":
+            return None
+        engine = self._learned_engine()
+        package = pending.get("package") or ""
+
+        if _is_denial(message):
+            self._clear_pending()
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"OK, I won't install {package}. The capability wasn't learned.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_install_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        if not _is_affirmative(message):
+            # Treat anything else as backing out — too risky to install on a vague reply.
+            self._clear_pending()
+            return None
+
+        install_result = engine.install_package(package)
+        if not install_result.get("ok"):
+            self._clear_pending()
+            err = (
+                install_result.get("error")
+                or install_result.get("stderr")
+                or f"exited rc={install_result.get('returncode')}"
+            )
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"Install of {package} failed: {err}",
+                "data": {"install_result": install_result},
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_install_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        # Install succeeded — retry the learn flow end-to-end.
+        original = pending.get("original_message") or ""
+        proposal = pending.get("proposal") or {}
+        self._clear_pending()
+        result = engine.learn_and_execute(
+            original,
+            proposal,
+            confirmed_by=f"user_confirmation_after_install:{package}",
+        )
+        capability = result.get("capability") or proposal
+        summary = engine.summarize_result(original, capability, result)
+        if result.get("saved"):
+            summary = f"Installed {package} and learned the command. {summary}"
+        else:
+            summary = f"Installed {package} but the recipe still didn't work: {summary}"
+        return self._remember_active({
+            "mode": "direct",
+            "message": summary,
+            "data": {
+                "install_result": install_result,
+                "learned_capability": capability,
+                "execution_result": result,
+            },
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": f"learned_capability:{capability.get('name') or capability.get('intent')}",
+            "compose": False,
+            "response_composed": True,
+        })
 
     def _handle_learned_execution_review(self, message: str, node_id: str) -> dict | None:
         """One-turn handler that runs immediately after a concept-match
@@ -631,6 +719,53 @@ class VaultRuntime:
                 proposal,
                 confirmed_by=str(message or "user_confirmation"),
             )
+            # If the planner failed because a tool isn't installed, surface
+            # that to the user. Two paths:
+            #  - we identified the apt package → propose install (pending
+            #    learned_install_confirmation).
+            #  - tool name known but no package mapping → just report cleanly
+            #    so the user can install it manually.
+            if not result.get("ok") and result.get("missing_binary"):
+                missing = result.get("missing_binary")
+                pkg = result.get("suggested_package")
+                if pkg:
+                    self._set_pending({
+                        "type": "learned_install_confirmation",
+                        "original_message": original,
+                        "proposal": proposal,
+                        "node_id": node_id,
+                        "missing_binary": missing,
+                        "package": pkg,
+                    })
+                    return self._remember_active({
+                        "mode": "direct",
+                        "message": (
+                            f"I need the '{missing}' tool to do that, but it's not "
+                            f"installed. I can install it via apt — that would run "
+                            f"`sudo apt-get install -y {pkg}`. OK to install?"
+                        ),
+                        "data": {"missing_binary": missing, "suggested_package": pkg},
+                        "active_task_id": self.active_task_id,
+                        "deterministic": True,
+                        "deterministic_source": "learned_install_confirmation",
+                        "compose": False,
+                        "response_composed": True,
+                    })
+                self._clear_pending()
+                return self._remember_active({
+                    "mode": "direct",
+                    "message": (
+                        f"I need the '{missing}' tool to do that, but it's not installed "
+                        "and I'm not sure which apt package provides it. Install it manually "
+                        "and I can try again."
+                    ),
+                    "data": {"missing_binary": missing},
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": "learned_capability_missing_tool",
+                    "compose": False,
+                    "response_composed": True,
+                })
             self._clear_pending()
             capability = result.get("capability") or proposal
             summary = engine.summarize_result(original, capability, result)

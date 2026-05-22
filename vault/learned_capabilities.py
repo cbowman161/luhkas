@@ -747,6 +747,15 @@ class LearnedCapabilityEngine:
         if proposal.get("planner") == "code_monkey_single_recipe":
             recipe_result = self.generate_single_command_recipe(text, proposal)
             if not recipe_result.get("ok"):
+                # If every attempt failed because a specific binary isn't
+                # installed, look up the apt package and surface that to the
+                # caller — they'll ask the user for permission to install.
+                missing_binary = recipe_result.get("missing_binary")
+                suggested_package = (
+                    self.lookup_package_for_binary(missing_binary)
+                    if missing_binary
+                    else None
+                )
                 return {
                     "ok": False,
                     "stdout": "",
@@ -754,7 +763,13 @@ class LearnedCapabilityEngine:
                     "returncode": -1,
                     "error": recipe_result.get("error"),
                     "ran_at": time.time(),
-                    "code_monkey_task": {"ok": False, "single_recipe": True, "error": recipe_result.get("error")},
+                    "code_monkey_task": {
+                        "ok": False,
+                        "single_recipe": True,
+                        "error": recipe_result.get("error"),
+                        "missing_binary": missing_binary,
+                        "suggested_package": suggested_package,
+                    },
                     "capability": {
                         "name": proposal.get("intent"),
                         "intent": proposal.get("intent"),
@@ -767,6 +782,8 @@ class LearnedCapabilityEngine:
                         "confirmed_by": confirmed_by,
                     },
                     "saved": False,
+                    "missing_binary": missing_binary,
+                    "suggested_package": suggested_package,
                 }
             code_monkey_task = {
                 "ok": True,
@@ -836,6 +853,62 @@ class LearnedCapabilityEngine:
             return self.code_monkey.generate_learned_command_recipe(text, proposal)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    def lookup_package_for_binary(self, binary: str) -> str | None:
+        """Ask the LLM which Debian/Ubuntu apt package provides a binary.
+        Returns the package name (validated as a sane apt name) or None when
+        the model can't identify one."""
+        binary = (binary or "").strip()
+        if not binary or self.model is None:
+            return None
+        prompt = (
+            "On a Debian or Ubuntu system, which apt package provides the "
+            f"binary named {binary!r}? Respond with ONLY the package name as "
+            "a single lowercase token, or the literal token 'unknown' if you "
+            "don't know.\n\nPackage:"
+        )
+        try:
+            raw = self.model.generate(prompt, think=False, timeout=10)
+        except Exception:
+            return None
+        candidate = (raw or "").strip().splitlines()[0].strip() if raw else ""
+        candidate = candidate.strip("`'\"").strip().lower()
+        if not candidate or candidate in {"unknown", "none", "n/a", "null"}:
+            return None
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+\-.]{0,63}", candidate):
+            return None
+        return candidate
+
+    def install_package(self, package: str, timeout: int = 180) -> dict:
+        """Install an apt package non-interactively. Returns a dict with
+        ok/stdout/stderr/returncode. The caller is responsible for getting
+        user confirmation BEFORE calling this — this method just runs the
+        install."""
+        package = (package or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+\-.]{0,63}", package):
+            return {"ok": False, "error": f"refusing to install: bad package name {package!r}"}
+        try:
+            completed = subprocess.run(
+                ["sudo", "-n", "DEBIAN_FRONTEND=noninteractive",
+                 "apt-get", "install", "-y", "--no-install-recommends", package],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            return {
+                "ok": completed.returncode == 0,
+                "package": package,
+                "stdout": (completed.stdout or "")[-2000:],
+                "stderr": (completed.stderr or "")[-2000:],
+                "returncode": completed.returncode,
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "package": package, "error": f"install timed out after {timeout}s"}
+        except FileNotFoundError as exc:
+            return {"ok": False, "package": package, "error": f"sudo or apt-get not found: {exc}"}
+        except Exception as exc:
+            return {"ok": False, "package": package, "error": str(exc)}
 
     def _materialize_generated_recipe(self, text: str, recipe: dict) -> dict:
         kind = recipe.get("type")

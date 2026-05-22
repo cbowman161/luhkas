@@ -126,13 +126,44 @@ def generate_learned_command_recipe(payload: Dict[str, Any]) -> Dict[str, Any]:
             "attempts": attempt + 1,
         }
 
+    # If every attempt died because a binary the planner picked isn't on the
+    # host, surface that as structured data so the brain can offer to install
+    # it rather than just reporting a generic failure.
+    missing_binary = _detect_missing_binary(last_error)
     return {
         "ok": False,
         "error": f"After {MAX_PLANNER_RETRIES + 1} planner attempts: {last_error}",
         "raw_response": last_raw,
         "recipe": last_recipe,
         "attempts": MAX_PLANNER_RETRIES + 1,
+        "missing_binary": missing_binary,
     }
+
+
+_MISSING_BINARY_PATTERNS = (
+    re.compile(r"(?:first token )?'([A-Za-z0-9_.\-]+)'(?: is)? not on PATH", re.IGNORECASE),
+    re.compile(r"binary not found.*?'([A-Za-z0-9_.\-]+)'", re.IGNORECASE),
+    re.compile(r"FileNotFoundError.*?'([A-Za-z0-9_.\-]+)'", re.IGNORECASE),
+    re.compile(r"\b([A-Za-z0-9_.\-]+): command not found", re.IGNORECASE),
+    re.compile(r"No such file or directory: '([A-Za-z0-9_.\-]+)'", re.IGNORECASE),
+)
+
+
+def _detect_missing_binary(error_text: str) -> str | None:
+    """Extract a binary name from a smoke/validator error if the failure was
+    'tool not installed'. Returns None for other failure modes."""
+    if not error_text:
+        return None
+    for pattern in _MISSING_BINARY_PATTERNS:
+        match = pattern.search(error_text)
+        if match:
+            candidate = match.group(1).strip()
+            # Filter out obvious non-binaries — paths, python keywords, etc.
+            if candidate and "/" not in candidate and candidate not in {
+                "python3", "python", "sh", "bash"
+            }:
+                return candidate
+    return None
 
 
 def _retry_prompt(*, user_input: str, payload: Dict[str, Any], previous_recipe: Dict[str, Any], rejection: str) -> str:

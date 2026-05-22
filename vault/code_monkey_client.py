@@ -41,7 +41,40 @@ class CodeMonkeyClient:
             "confidence": (proposal or {}).get("confidence"),
             "inferred": (proposal or {}).get("inferred"),
         }
-        return self._request("POST", "/learned-command-recipe", payload)
+        # This endpoint returns structured failures (ok=false plus
+        # missing_binary/error fields) via HTTP 422. Use the body-returning
+        # path so callers can act on the structured fields instead of getting
+        # a flattened RuntimeError.
+        return self._request_with_body("POST", "/learned-command-recipe", payload)
+
+    def _request_with_body(self, method, path, payload=None):
+        """Like _request but returns the parsed JSON body even on 4xx, so
+        callers can read structured error fields. Only used for endpoints
+        designed to signal failure modes in their response body."""
+        url = self.base_url + path
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raise RuntimeError(f"Code Monkey returned HTTP {exc.code}: {exc.reason}")
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Code Monkey service is unavailable at "
+                f"{self.base_url}. Original error: {exc}"
+            )
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Code Monkey returned invalid JSON: {exc}")
 
     def continue_task(self, active_task_id, followup):
         previous = self.safe_status(active_task_id)
