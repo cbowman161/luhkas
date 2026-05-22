@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 
 from blackboard import Blackboard
 from background_manager import BackgroundManager
@@ -395,18 +396,68 @@ class VaultRuntime:
         if direct is not None:
             self.node_registry.update_activity(node_id, identity=None)
             return direct
+        # Vision short-circuit: if a previous turn left us in
+        # vision_full_analysis_confirmation, a yes here re-routes through
+        # scout WITH force_full_vision so the heavy vision LLM runs.
+        pending = self.blackboard.get_pending_decision()
+        force_full_vision = False
+        if isinstance(pending, dict) and pending.get("type") == "vision_full_analysis_confirmation":
+            if _is_affirmative(message):
+                force_full_vision = True
+                message_for_scout = pending.get("original_message") or message
+                self._clear_pending()
+                presence_context = dict(presence_context or {})
+                presence_context["force_full_vision"] = True
+                message = message_for_scout
+            elif _is_denial(message):
+                self._clear_pending()
+                return self._remember_active({
+                    "mode": "direct",
+                    "message": "OK, I won't run the full vision analysis.",
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": "vision_full_analysis_confirmation",
+                    "compose": False,
+                    "response_composed": True,
+                })
+            else:
+                # Ambiguous → drop the pending and let the new message route
+                # normally; the short-circuit will re-arm if it's a vision ask.
+                self._clear_pending()
+        # Clear any prior short-circuit marker on scout before calling.
+        if hasattr(self.scout, "_stash_vision_short_circuit_marker"):
+            try:
+                delattr(self.scout, "_stash_vision_short_circuit_marker")
+            except Exception:
+                pass
         result = self.scout.handle_message(
             message,
             source=node_id,
             node_id=node_id,
             presence_context=presence_context,
         )
+        # If scout's analyze_vision dispatch short-circuited and asked the
+        # user whether to do the heavy analysis, install the pending state
+        # here so the user's next yes/no is routed correctly.
+        marker = getattr(self.scout, "_stash_vision_short_circuit_marker", None)
+        if isinstance(marker, dict) and marker.get("needs_vision_confirmation") and not force_full_vision:
+            self._set_pending({
+                "type": "vision_full_analysis_confirmation",
+                "original_message": marker.get("original_message") or message,
+                "summary": marker.get("vision_summary"),
+                "node_id": node_id,
+            })
+            try:
+                delattr(self.scout, "_stash_vision_short_circuit_marker")
+            except Exception:
+                pass
         # Scout bridge stores the reply text in "response" and the input in "message"
         reply_text = result.get("response") or ""
         result["message"] = reply_text
         result["response_composed"] = True
         active_id = result.get("active_identity")
         self.node_registry.update_activity(node_id, identity=active_id)
+        result = self._attach_notification_alert(result)
         return self._enrich(result, node_id)
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
@@ -492,6 +543,115 @@ class VaultRuntime:
             return learned_response
 
         return None
+
+    def _spawn_async_learn(self, *, original_message: str, proposal: dict,
+                           confirmed_by: str, node_id: str) -> None:
+        """Run the planner+smoke+save loop on a background thread. On
+        completion, write a notification to the event log so the next /ui
+        call can prepend 'New notifications received'."""
+        import threading
+
+        def _worker():
+            engine = self._learned_engine()
+            try:
+                result = engine.learn_and_execute(
+                    original_message,
+                    proposal,
+                    confirmed_by=confirmed_by,
+                )
+            except Exception as exc:
+                self.event_log.notify(
+                    job_id=f"learn:{_learned_normalize(original_message)}",
+                    level="error",
+                    message=(
+                        f"Learning {proposal.get('description') or 'that capability'} "
+                        f"crashed: {exc}"
+                    ),
+                    data={"original_message": original_message, "error": str(exc)},
+                )
+                return
+            self._notify_learn_result(original_message, proposal, result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _notify_learn_result(self, original_message: str, proposal: dict, result: dict) -> None:
+        """Write a notification summarizing an async learn job."""
+        engine = self._learned_engine()
+        description = proposal.get("description") or "that"
+        capability = result.get("capability") or proposal
+        if result.get("saved"):
+            summary = engine.summarize_result(original_message, capability, result)
+            msg = f"Learned: {description}. {summary}"
+            event_type = "learn_succeeded"
+        elif result.get("missing_binary") and result.get("suggested_package"):
+            msg = (
+                f"Couldn't learn {description}: '{result.get('missing_binary')}' "
+                f"isn't installed. Suggested package: "
+                f"{result.get('suggested_package')}."
+            )
+            event_type = "learn_needs_install"
+        elif result.get("missing_binary"):
+            msg = (
+                f"Couldn't learn {description}: '{result.get('missing_binary')}' "
+                "isn't installed and I couldn't identify its apt package."
+            )
+            event_type = "learn_needs_install"
+        else:
+            err = result.get("error") or result.get("stderr") or "unknown error"
+            msg = f"Couldn't learn {description}: {err}"
+            event_type = "learn_failed"
+        # Write to the events table so it surfaces via the existing
+        # "any updates" router (which queries event_log.unread()).
+        self.event_log.write(
+            job_id=f"learn:{_learned_normalize(original_message)}:{int(time.time())}",
+            event_type=event_type,
+            message=msg[:1200],
+            data={
+                "original_message": original_message,
+                "description": description,
+                "saved": bool(result.get("saved")),
+                "missing_binary": result.get("missing_binary"),
+                "suggested_package": result.get("suggested_package"),
+            },
+        )
+
+    def _attach_notification_alert(self, response: dict) -> dict:
+        """Prepend 'New notifications received' to response.message when the
+        event_log has unread events that originated from async work (learning,
+        installs, etc). Only counts events with a known background-job type
+        so we don't pick up unrelated chatter.
+
+        Idempotent — won't double-prepend, and silenced on the updates view
+        itself."""
+        if not isinstance(response, dict):
+            return response
+        src = str(response.get("deterministic_source") or "")
+        # Don't prepend on the response that's already about notifications.
+        if src in {"code_monkey_updates", "learned_capability_async"}:
+            return response
+        try:
+            unread = self.event_log.unread() or []
+        except Exception:
+            return response
+        # Only count events from background workers we own.
+        background_types = {
+            "learn_succeeded", "learn_failed", "learn_needs_install",
+            "install_succeeded", "install_failed",
+        }
+        relevant = [e for e in unread if e.get("event_type") in background_types]
+        count = len(relevant)
+        if count <= 0:
+            return response
+        msg = str(response.get("message") or "")
+        if msg.startswith("New notifications received"):
+            return response
+        prefix = (
+            f"New notifications received ({count}). Say 'any updates' to read them. "
+        )
+        response = dict(response)
+        response["message"] = prefix + msg
+        response["data"] = {**(response.get("data") or {}), "unread_async_events": count}
+        return response
 
     def _learned_engine(self) -> LearnedCapabilityEngine:
         engine = getattr(self, "learned_capabilities", None)
@@ -931,17 +1091,39 @@ class VaultRuntime:
         if _is_affirmative(message):
             original = pending.get("original_message") or ""
             proposal = pending.get("proposal") or {}
+            confirmed_by = str(message or "user_confirmation")
+            self._clear_pending()
+            # Learning is async: spawn the planner+smoke+save work in a
+            # background thread and ack the user immediately. When the
+            # background finishes it writes a notification to the event log
+            # so subsequent /ui calls report "new notifications received".
+            self._spawn_async_learn(
+                original_message=original,
+                proposal=proposal,
+                confirmed_by=confirmed_by,
+                node_id=node_id,
+            )
+            description = proposal.get("description") or "that"
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"I'll work on that ({description}). I'll let you know when it's ready.",
+                "data": {"learning_async": True, "proposal": proposal},
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_capability_async",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        # Legacy synchronous path (kept for fallback inspection; not used)
+        if False and _is_affirmative(message):
+            original = pending.get("original_message") or ""
+            proposal = pending.get("proposal") or {}
             result = engine.learn_and_execute(
                 original,
                 proposal,
                 confirmed_by=str(message or "user_confirmation"),
             )
-            # If the planner failed because a tool isn't installed, surface
-            # that to the user. Two paths:
-            #  - we identified the apt package → propose install (pending
-            #    learned_install_confirmation).
-            #  - tool name known but no package mapping → just report cleanly
-            #    so the user can install it manually.
             if not result.get("ok") and result.get("missing_binary"):
                 missing = result.get("missing_binary")
                 pkg = result.get("suggested_package")
@@ -1298,6 +1480,7 @@ class VaultRuntime:
         node_id = getattr(self, "_current_node_id", "cli")
         # Persist per-node task id
         self._node_task_ids[node_id] = self.active_task_id
+        response = self._attach_notification_alert(response)
         return self._enrich(response, node_id)
 
     def _runtime_command_response(self, response: dict, source: str) -> dict:

@@ -207,6 +207,58 @@ def _extract_context_fact(text: str) -> tuple[str, str, str | None] | None:
 VISION_ROUTE_CONFIDENCE_FLOOR = 0.85
 
 
+def _detection_summary(state: dict | None) -> str | None:
+    """Natural-language summary of what the camera node is currently
+    seeing, from its detection metadata. Returns None when there are no
+    usable detections — caller should fall back to the full vision LLM."""
+    if not isinstance(state, dict):
+        return None
+    detections = state.get("detections") or []
+    if not detections:
+        return None
+    from collections import Counter
+    label_counts = Counter()
+    identified_people: list[str] = []
+    for det in detections:
+        if not isinstance(det, dict):
+            continue
+        label = str(det.get("label") or "").strip().lower()
+        if not label:
+            continue
+        label_counts[label] += 1
+        if label == "person":
+            identity = str(det.get("identity") or "").strip()
+            if identity and identity.lower() not in {"unknown", "none"}:
+                identified_people.append(identity)
+    if not label_counts:
+        return None
+    parts = []
+    for label, count in label_counts.most_common():
+        noun = label if count == 1 else _pluralize_noun(label)
+        parts.append(f"{count} {noun}")
+    if len(parts) > 1:
+        base = "I see " + ", ".join(parts[:-1]) + " and " + parts[-1]
+    else:
+        base = "I see " + parts[0]
+    if identified_people:
+        unique = sorted(set(identified_people))
+        if len(unique) == 1:
+            base += f", identified as {unique[0]}"
+        else:
+            base += f", identified as {', '.join(unique[:-1])} and {unique[-1]}"
+    return base + "."
+
+
+def _pluralize_noun(noun: str) -> str:
+    if noun == "person":
+        return "people"
+    if noun.endswith(("s", "x", "z", "ch", "sh")):
+        return noun + "es"
+    if noun.endswith("y") and len(noun) > 1 and noun[-2] not in "aeiou":
+        return noun[:-1] + "ies"
+    return noun + "s"
+
+
 def _conversation_setup_answer(message: str) -> str | None:
     phrase = _extract_context_phrase(message)
     if phrase:
@@ -1601,6 +1653,29 @@ class ScoutVaultBridge:
                     f"< floor {VISION_ROUTE_CONFIDENCE_FLOOR}"
                 )
             else:
+                # Short-circuit: if the camera node has identifiable
+                # detections, answer from those first and ask whether the
+                # user wants the heavy vision LLM analysis.  Only fall
+                # through to analyze_scene when the caller explicitly
+                # forced it (via presence_context.force_full_vision, set
+                # by vault_runtime when the user has just confirmed).
+                force_full = False
+                if isinstance(presence_context, dict):
+                    force_full = bool(presence_context.get("force_full_vision"))
+                summary = _detection_summary(state)
+                if summary and not force_full:
+                    actions.append({"name": "analyze_vision", "ok": True, "result": {"short_circuit": True, "summary": summary}})
+                    # Surface a marker so vault_runtime can set a
+                    # vision_full_analysis_confirmation pending state and
+                    # route the user's next "yes" back here with
+                    # force_full_vision=True.
+                    extra = {
+                        "needs_vision_confirmation": True,
+                        "original_message": message,
+                        "vision_summary": summary,
+                    }
+                    self._stash_vision_short_circuit_marker = extra
+                    return f"{summary} Would you like me to analyze the scene?"
                 result = self.analyze_scene(message, state)
                 actions.append({"name": "analyze_vision", "ok": bool(result.get("ok")), "result": result})
                 response = result.get("answer") or result.get("summary")
