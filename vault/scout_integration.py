@@ -201,27 +201,10 @@ def _extract_context_fact(text: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-_VISION_INTENT_PATTERN = re.compile(
-    r"\b("
-    r"see|seen|seeing|look|looking|looks|view|viewing|watch|watching|"
-    r"image|picture|pic|photo|photograph|snapshot|frame|scene|camera|"
-    r"visible|visual|in\s+front|in\s+the\s+room|"
-    r"who(?:'s|\s+is)?\s+(?:there|here|near|nearby|around|in\s+front)|"
-    r"anyone\s+(?:there|here|near|nearby|around|in\s+front)|"
-    r"what(?:'s|\s+is)?\s+(?:in|on)\s+(?:the\s+)?(?:room|table|desk|screen|image|picture|frame)|"
-    r"what\s+do\s+you\s+see|"
-    r"describe\s+(?:what|the)\s+(?:you\s+see|scene|image|view|room)|"
-    r"identify\s+(?:the|this|that)\s+(?:object|person|thing|item)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _explicitly_asks_for_vision(message: str) -> bool:
-    """True only when the input clearly invokes the camera/vision subsystem.
-    Used to gate the analyze_vision route — the LLM router otherwise treats
-    it as a low-confidence fallback for any unfamiliar phrasing."""
-    return bool(_VISION_INTENT_PATTERN.search(str(message or "")))
+# Vision routing is gated on the LLM router's own confidence — see the dispatcher.
+# Calls below this threshold get downgraded out of analyze_vision so unfamiliar
+# phrasings don't fall through to "describe what's in the camera view".
+VISION_ROUTE_CONFIDENCE_FLOOR = 0.85
 
 
 def _conversation_setup_answer(message: str) -> str | None:
@@ -1603,15 +1586,20 @@ class ScoutVaultBridge:
                     return action_result.get("message") or action_result.get("error") or "Done."
 
         if route["route"] == "analyze_vision":
-            # Only run the vision analyzer when the message is unambiguously
-            # asking about what the scout sees. Without this guard the router
-            # LLM tends to fall through to analyze_vision for any unfamiliar
-            # phrasing ("show me cgroup hierarchy", "what bluetooth devices
-            # are paired"), producing nonsense about chairs and clocks.
-            if not _explicitly_asks_for_vision(message):
+            # Gate analyze_vision on the router LLM's own confidence — we
+            # already have that signal, no need to hardcode phrases.  The
+            # router prompt rates explicit vision questions at 0.9+ and
+            # falls into the 0.5-0.7 band when it's guessing on unfamiliar
+            # phrasings (which is when it used to spuriously produce
+            # "describe the chairs and clock" answers).
+            route_confidence = float(route.get("confidence") or 0.0)
+            if route_confidence < VISION_ROUTE_CONFIDENCE_FLOOR:
                 route["route"] = "general_question"
                 route.setdefault("downgraded_from", "analyze_vision")
-                route["downgrade_reason"] = "no explicit vision verb in input"
+                route["downgrade_reason"] = (
+                    f"router confidence {route_confidence:.2f} "
+                    f"< floor {VISION_ROUTE_CONFIDENCE_FLOOR}"
+                )
             else:
                 result = self.analyze_scene(message, state)
                 actions.append({"name": "analyze_vision", "ok": bool(result.get("ok")), "result": result})

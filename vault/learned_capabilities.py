@@ -81,9 +81,11 @@ Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_no
   list): cpu, memory, gpu, disk, uptime, os, kernel, hostname, python,
   process, network, port, service, temperature, fan, user, login, log,
   package, time, timezone, locale, drive, partition, mount, volume, ip,
-  route, dns, firewall, battery, vault, scout. Use "none" if the user is
-  NOT asking about a Linux server's state (greetings, identity, chitchat,
-  math, gibberish, scout/camera/robot actions, chat-context memory recall).
+  route, dns, firewall, battery, bluetooth, wifi, audio, usb, pci, sensor,
+  cgroup, namespace, swap, gpu, nvidia, vault, scout. Use "none" if the
+  user is NOT asking about a Linux server's state (greetings, identity,
+  chitchat, math, gibberish, scout/camera/robot actions, chat-context
+  memory recall).
 
 - "aspect" is a SINGULAR LOWERCASE one-word noun for what they want about
   the topic. Common ones: usage (live activity/percent), hardware
@@ -184,6 +186,21 @@ OUTPUT: {"topic": "fan", "aspect": "status"}
 
 INPUT: "is the firewall on"
 OUTPUT: {"topic": "firewall", "aspect": "status"}
+
+INPUT: "what bluetooth devices are paired"
+OUTPUT: {"topic": "bluetooth", "aspect": "list"}
+
+INPUT: "is bluetooth on"
+OUTPUT: {"topic": "bluetooth", "aspect": "status"}
+
+INPUT: "what wifi am I connected to"
+OUTPUT: {"topic": "wifi", "aspect": "status"}
+
+INPUT: "show audio devices"
+OUTPUT: {"topic": "audio", "aspect": "list"}
+
+INPUT: "what's my battery percentage"
+OUTPUT: {"topic": "battery", "aspect": "usage"}
 
 Now classify:
 INPUT: %s
