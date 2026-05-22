@@ -1,0 +1,25 @@
+[Unit]
+Description=LUHKAS vault runtime orchestrator service
+After=network-online.target ollama.service code-monkey.service
+Wants=network-online.target
+Requires=code-monkey.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/luhkas/vault
+ExecStart=/usr/bin/python3 vault_service.py --host 0.0.0.0 --port 7000
+ExecStartPost=/usr/bin/systemctl --user start --no-block vault-autosync.service
+Restart=always
+RestartSec=5
+TimeoutStartSec=600
+TimeoutStopSec=60
+Environment=PYTHONUNBUFFERED=1
+Environment=CODE_MONKEY_URL=http://127.0.0.1:8765
+Environment=VAULT_IMMEDIATE_KEEP_ALIVE=24h
+Environment=VAULT_BACKGROUND_KEEP_ALIVE=5m
+Environment=VAULT_WARM_MODEL_ROLES=router,chat,vision
+Environment=VAULT_SCOUT_URL=http://luhkas-scout.local:5000
+Environment=VAULT_SCOUT_ROBOT_URL=http://luhkas-scout.local:5001
+
+[Install]
+WantedBy=default.target

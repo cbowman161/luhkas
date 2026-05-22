@@ -1,0 +1,11 @@
+[Unit]
+Description=LUHKAS vault auto-push of node/ code to all nodes
+After=vault-runtime.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/luhkas/vault
+ExecStart=/usr/bin/python3 -c "from sync_manager import push_all; r=push_all(); ok=r.get('ok'); nodes=r.get('nodes') or {}; changed={nid:n.get('files_changed') for nid,n in nodes.items()}; restarted={nid:n.get('services_restarted') for nid,n in nodes.items() if n.get('services_restarted')}; print(f'autosync ok={ok} changed={changed} restarted={restarted}')"
+TimeoutStartSec=120
+Environment=PYTHONUNBUFFERED=1

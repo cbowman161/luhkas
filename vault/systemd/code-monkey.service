@@ -1,0 +1,21 @@
+[Unit]
+Description=LUHKAS code_monkey async coder service
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/luhkas/vault
+ExecStart=/usr/bin/python3 -m code_monkey service --host 127.0.0.1 --port 8765 --workers 2
+ExecStartPost=/usr/bin/systemctl --user start --no-block vault-autosync.service
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=300
+Environment=PYTHONUNBUFFERED=1
+Environment=VAULT_BACKGROUND_KEEP_ALIVE=5m
+Environment=VAULT_CODER_MODEL=deepseek-coder-v2:16b
+Environment=BRAIN_REPAIR_MODEL=deepseek-coder-v2:16b
+
+[Install]
+WantedBy=default.target
