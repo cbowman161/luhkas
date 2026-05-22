@@ -93,6 +93,15 @@ OUTPUT: {"topic": "cpu", "aspect": "hardware"}
 INPUT: "look at me"
 OUTPUT: {"topic": "none", "aspect": "none"}
 
+INPUT: "no, the hardware"
+OUTPUT: {"topic": "none", "aspect": "hardware"}
+
+INPUT: "actually I meant the version"
+OUTPUT: {"topic": "none", "aspect": "version"}
+
+INPUT: "no the usage"
+OUTPUT: {"topic": "none", "aspect": "usage"}
+
 Now classify:
 INPUT: %s
 OUTPUT:"""
@@ -354,14 +363,24 @@ class LearnedCapabilityEngine:
         """Find an existing capability whose inferred (topic, aspect) matches the
         LLM-classified concept of *text*. Falls back to parsing the intent name
         (vault_<topic>_<aspect>) for legacy capabilities that pre-date LLM
-        classification. Returns None if no inference or no match."""
+        classification.
+
+        Matching rules:
+        - If the LLM gave a specific aspect, ONLY caps with that exact aspect
+          qualify. We never silently substitute a different aspect (e.g. usage
+          for hardware), because that gives the user the wrong answer when they
+          explicitly asked for a particular facet.
+        - If the LLM left aspect unset, any cap on the same topic is a
+          candidate, ranked by hits.
+
+        Returns None when no candidate matches.
+        """
         topic, aspect = self._infer_topic_and_aspect(text)
         if topic is None:
             return None
         data = self.store.load()
         caps = (data.get("capabilities") or {}).values()
-        topic_aspect_matches = []
-        topic_only_matches = []
+        candidates = []
         for cap in caps:
             if not isinstance(cap, dict):
                 continue
@@ -370,11 +389,9 @@ class LearnedCapabilityEngine:
             cap_topic, cap_aspect = self._cap_concept(cap)
             if cap_topic != topic:
                 continue
-            if cap_aspect == aspect:
-                topic_aspect_matches.append(cap)
-            else:
-                topic_only_matches.append(cap)
-        candidates = topic_aspect_matches or topic_only_matches
+            if aspect and cap_aspect != aspect:
+                continue
+            candidates.append(cap)
         if not candidates:
             return None
         candidates.sort(
@@ -421,10 +438,16 @@ class LearnedCapabilityEngine:
         new_topic, new_aspect = self._infer_topic_and_aspect(correction)
         previous_inferred = (previous_proposal or {}).get("inferred") or {}
         previous_topic = previous_inferred.get("topic")
+        previous_aspect = previous_inferred.get("aspect")
         if new_topic is None:
             if previous_topic is None:
                 return None
-            return self._code_monkey_recipe_proposal(previous_topic, new_aspect or previous_inferred.get("aspect") or "usage")
+            # Aspect-only correction: keep the previous topic, switch to the
+            # corrected aspect if the user specified one. Falls back to the
+            # previous aspect (or a sensible default) when neither side
+            # specified.
+            chosen_aspect = new_aspect or previous_aspect or self._default_aspect_for(previous_topic)
+            return self._code_monkey_recipe_proposal(previous_topic, chosen_aspect)
         safe = self.safety.classify_capability_request(normalize_text(correction))
         if not safe.get("allowed"):
             return None

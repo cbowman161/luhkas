@@ -11,7 +11,7 @@ from config import INSTALLED_CAPABILITIES_DIR
 from event_log import EventLog
 from interaction_interpreter import InteractionInterpreter
 from job_manager import JobManager
-from learned_capabilities import LearnedCapabilityEngine
+from learned_capabilities import LearnedCapabilityEngine, normalize_text as _learned_normalize
 from models import model_manifest, warm_models
 from node_health_monitor import NodeHealthMonitor
 from node_registry import NodeRegistry
@@ -252,6 +252,11 @@ class VaultRuntime:
             if learned_flow is not None:
                 return learned_flow
 
+        if isinstance(pending, dict) and pending.get("type") == "learned_execution_review":
+            review = self._handle_learned_execution_review(user_input, node_id)
+            if review is not None:
+                return review
+
         # Requirements gathering and review sessions receive raw user text — no intent
         # classification needed since the agents handle their own conversation logic.
         if pending and pending.get("type") in {
@@ -397,6 +402,10 @@ class VaultRuntime:
         if learned_flow is not None:
             return learned_flow
 
+        review = self._handle_learned_execution_review(message, node_id)
+        if review is not None:
+            return review
+
         pending = self.blackboard.get_pending_decision()
         if pending and pending.get("type") in {
             "existing_skill",
@@ -498,6 +507,70 @@ class VaultRuntime:
         response["data"] = data
         return response
 
+    def _handle_learned_execution_review(self, message: str, node_id: str) -> dict | None:
+        """One-turn handler that runs immediately after a concept-match
+        execution. If the user says 'no' or 'no, X' here, the freshly-saved
+        alias is removed and a new propose flow is started using the
+        correction text. Any other message clears the review state and falls
+        through to normal handling."""
+        pending = self.blackboard.get_pending_decision()
+        if not isinstance(pending, dict) or pending.get("type") != "learned_execution_review":
+            return None
+
+        correction = _extract_correction(message)
+        if not correction and not _is_denial(message):
+            # User moved on without correcting — review window closes.
+            self._clear_pending()
+            return None
+
+        engine = self._learned_engine()
+        alias_key = pending.get("alias_key") or ""
+        removed = engine.store.forget(alias_key) if alias_key else False
+
+        if correction:
+            combined = f"{pending.get('original_message') or ''} {correction}".strip()
+            proposal = engine.propose(combined) or engine.propose(correction)
+        else:
+            proposal = None
+
+        if proposal is None:
+            self._clear_pending()
+            note = (
+                "Got it, I removed that wrong learned command."
+                if removed
+                else "Got it."
+            )
+            tail = " Try rephrasing what you wanted."
+            return self._remember_active({
+                "mode": "direct",
+                "message": note + tail,
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_execution_review",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        original_message = pending.get("original_message") or message
+        self._set_pending({
+            "type": "learned_capability_confirmation",
+            "original_message": original_message,
+            "proposal": proposal,
+            "node_id": node_id,
+            "correction": correction,
+        })
+        prefix = "Removed the wrong learned command." if removed else "Got it."
+        return self._remember_active({
+            "mode": "direct",
+            "message": f"{prefix} I think you actually mean {proposal['description']}. Is that right?",
+            "data": {"proposal": proposal, "alias_removed": removed},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "learned_execution_review",
+            "compose": False,
+            "response_composed": True,
+        })
+
     def _handle_learned_capability_confirmation(self, message: str, node_id: str) -> dict | None:
         pending = self.blackboard.get_pending_decision()
         if not isinstance(pending, dict) or pending.get("type") != "learned_capability_confirmation":
@@ -589,19 +662,32 @@ class VaultRuntime:
                 alias_source = concept
         if learned is not None:
             result = engine.execute_capability(learned)
+            alias_recorded = False
             if result.get("ok") and alias_source is not None:
                 stored_alias = engine.record_alias(message, alias_source)
                 if stored_alias is not None:
                     learned = stored_alias
+                    alias_recorded = True
             summary = engine.summarize_result(message, learned, result)
             summary = f"Learned command. {summary}"
+            # Set a one-turn review state so the user can correct a wrong
+            # concept-match by saying "no" / "no, X" — that will remove the
+            # just-saved alias and propose a fresh learn flow.
+            if alias_recorded:
+                self._set_pending({
+                    "type": "learned_execution_review",
+                    "original_message": message,
+                    "alias_key": _learned_normalize(message),
+                    "executed_cap_intent": learned.get("intent"),
+                    "node_id": node_id,
+                })
             return self._remember_active(self._attach_learned_capability_update({
                 "mode": "direct",
                 "message": summary,
                 "data": {
                     "learned_capability": learned,
                     "execution_result": result,
-                    "alias_recorded": bool(alias_source) and result.get("ok"),
+                    "alias_recorded": alias_recorded,
                 },
                 "active_task_id": self.active_task_id,
                 "deterministic": True,
