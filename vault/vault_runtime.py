@@ -528,8 +528,18 @@ class VaultRuntime:
         removed = engine.store.forget(alias_key) if alias_key else False
 
         if correction:
-            combined = f"{pending.get('original_message') or ''} {correction}".strip()
-            proposal = engine.propose(combined) or engine.propose(correction)
+            # Build a synthetic "previous proposal" from what we executed so
+            # the LLM correction classifier sees full prior context.
+            previous_proposal = {
+                "inferred": pending.get("executed_cap_inferred") or {},
+                "description": pending.get("executed_cap_description"),
+                "intent": pending.get("executed_cap_intent"),
+            }
+            proposal = engine.propose_correction(
+                correction,
+                previous_proposal,
+                original_message=pending.get("original_message") or "",
+            )
         else:
             proposal = None
 
@@ -605,7 +615,11 @@ class VaultRuntime:
         correction = _extract_correction(message)
         if correction:
             previous_proposal = pending.get("proposal") or {}
-            proposal = engine.propose_correction(correction, previous_proposal)
+            proposal = engine.propose_correction(
+                correction,
+                previous_proposal,
+                original_message=pending.get("original_message") or "",
+            )
             if proposal is None:
                 self._clear_pending()
                 return self._remember_active({
@@ -674,11 +688,20 @@ class VaultRuntime:
             # concept-match by saying "no" / "no, X" — that will remove the
             # just-saved alias and propose a fresh learn flow.
             if alias_recorded:
+                cap_inferred = (alias_source or {}).get("inferred") or {}
+                # If the source cap was a legacy entry without inferred,
+                # derive concept from intent so corrections still get context.
+                if not cap_inferred.get("topic"):
+                    cap_topic, cap_aspect = engine._cap_concept(alias_source or {})
+                    if cap_topic:
+                        cap_inferred = {"topic": cap_topic, "aspect": cap_aspect}
                 self._set_pending({
                     "type": "learned_execution_review",
                     "original_message": message,
                     "alias_key": _learned_normalize(message),
                     "executed_cap_intent": learned.get("intent"),
+                    "executed_cap_description": learned.get("description"),
+                    "executed_cap_inferred": cap_inferred,
                     "node_id": node_id,
                 })
             return self._remember_active(self._attach_learned_capability_update({

@@ -21,6 +21,59 @@ SYSTEM_TOPICS = (
 )
 SYSTEM_ASPECTS = ("usage", "hardware", "status", "version")
 
+_CORRECTION_PROMPT = """You classify a user CORRECTION to a previous request about a Linux server's runtime state.
+
+Output strict JSON: {"topic": <topic_or_none>, "aspect": <aspect_or_none>}
+
+Valid topics: cpu, memory, gpu, disk, uptime, os, hostname, python, process, network, service, temperature, none
+Valid aspects: usage, hardware, status, version, none
+
+The user just rejected the system's previous interpretation. Use the context to
+figure out what they actually want:
+- If the correction only specifies a new aspect ("the hardware"), keep the
+  previous topic.
+- If it specifies a new topic but no aspect, keep the previous aspect.
+- If it specifies both, use both from the correction.
+- If the correction is empty/just "no" with no information, output "none"/"none".
+
+Examples:
+PREVIOUS topic=cpu aspect=usage
+ORIGINAL: "what is your CPU"
+CORRECTION: "no, the hardware"
+OUTPUT: {"topic": "cpu", "aspect": "hardware"}
+
+PREVIOUS topic=cpu aspect=usage
+ORIGINAL: "tell me about the cpu"
+CORRECTION: "actually disk"
+OUTPUT: {"topic": "disk", "aspect": "usage"}
+
+PREVIOUS topic=memory aspect=usage
+ORIGINAL: "memory"
+CORRECTION: "no, gpu hardware"
+OUTPUT: {"topic": "gpu", "aspect": "hardware"}
+
+PREVIOUS topic=memory aspect=usage
+ORIGINAL: "ram free"
+CORRECTION: "no I meant the processor"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+PREVIOUS topic=cpu aspect=hardware
+ORIGINAL: "what's my cpu"
+CORRECTION: "no, current usage"
+OUTPUT: {"topic": "cpu", "aspect": "usage"}
+
+PREVIOUS topic=disk aspect=usage
+ORIGINAL: "disk space"
+CORRECTION: "no"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+Now classify:
+PREVIOUS topic=%(prev_topic)s aspect=%(prev_aspect)s
+ORIGINAL: %(original)s
+CORRECTION: %(correction)s
+OUTPUT:"""
+
+
 _CLASSIFIER_PROMPT = """You classify whether a user request is asking about a Linux server's runtime state.
 
 Output strict JSON: {"topic": <topic_or_none>, "aspect": <aspect_or_none>}
@@ -123,6 +176,33 @@ class LearnedCapabilityStore:
 
     def save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Defensive: refuse to overwrite a populated file with an empty one.
+        # The whole learned-capabilities feature depends on this file, and a
+        # bug elsewhere (e.g. a load failure followed by a save) could silently
+        # nuke every confirmed cap.
+        new_caps = (data.get("capabilities") or {}) if isinstance(data, dict) else {}
+        if not new_caps and self.path.exists():
+            try:
+                existing = json.loads(self.path.read_text(encoding="utf-8"))
+                existing_caps = (existing.get("capabilities") or {}) if isinstance(existing, dict) else {}
+            except Exception:
+                existing_caps = {}
+            if existing_caps:
+                import sys
+                print(
+                    f"[learned_capabilities] REFUSING to save: would replace "
+                    f"{len(existing_caps)} caps with 0. Caller bug — investigate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+        # Keep a rolling backup of the previous good state.
+        if self.path.exists():
+            try:
+                bak = self.path.with_suffix(".bak")
+                bak.write_bytes(self.path.read_bytes())
+            except Exception:
+                pass
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
@@ -297,6 +377,31 @@ class LearnedCapabilityEngine:
         self._inference_cache[key] = result
         return result
 
+    def classify_correction(
+        self,
+        correction: str,
+        original: str = "",
+        previous_topic: str | None = None,
+        previous_aspect: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """LLM classification for a CORRECTION turn, with full prior context.
+
+        Unlike `_infer_topic_and_aspect`, this is not memoized: the result
+        depends on the previous proposal/cap, so each correction is fresh."""
+        if self.model is None:
+            return None, None
+        prompt = _CORRECTION_PROMPT % {
+            "prev_topic": previous_topic or "none",
+            "prev_aspect": previous_aspect or "none",
+            "original": json.dumps(str(original or "")),
+            "correction": json.dumps(str(correction or "")),
+        }
+        try:
+            raw = self.model.generate(prompt, think=False, timeout=10)
+        except Exception:
+            return None, None
+        return self._parse_classification(raw)
+
     def _llm_classify(self, text: str) -> tuple[str | None, str | None]:
         if self.model is None:
             return None, None
@@ -305,7 +410,16 @@ class LearnedCapabilityEngine:
             raw = self.model.generate(prompt, think=False, timeout=10)
         except Exception:
             return None, None
-        parsed = self._parse_json_object(raw)
+        topic, aspect = self._parse_classification(raw)
+        # Plain classify path requires a topic; aspect-only doesn't make sense
+        # for a fresh request.
+        if topic is None:
+            return None, None
+        return topic, aspect
+
+    @staticmethod
+    def _parse_classification(raw: str) -> tuple[str | None, str | None]:
+        parsed = LearnedCapabilityEngine._parse_json_object(raw)
         if not isinstance(parsed, dict):
             return None, None
         topic = parsed.get("topic")
@@ -326,8 +440,6 @@ class LearnedCapabilityEngine:
             topic = None
         if aspect and aspect not in SYSTEM_ASPECTS:
             aspect = None
-        if topic is None:
-            return None, None
         return topic, aspect
 
     @staticmethod
@@ -434,24 +546,46 @@ class LearnedCapabilityEngine:
             return None
         return self._propose_code_monkey_recipe(normalized)
 
-    def propose_correction(self, correction: str, previous_proposal: dict | None = None) -> dict | None:
-        new_topic, new_aspect = self._infer_topic_and_aspect(correction)
+    def propose_correction(
+        self,
+        correction: str,
+        previous_proposal: dict | None = None,
+        original_message: str = "",
+    ) -> dict | None:
+        """Classify a correction turn with full prior context (original
+        message + previous proposal) so the LLM knows what's being
+        corrected. Falls back to plain classification if context-aware
+        inference fails to find a topic."""
         previous_inferred = (previous_proposal or {}).get("inferred") or {}
         previous_topic = previous_inferred.get("topic")
         previous_aspect = previous_inferred.get("aspect")
-        if new_topic is None:
-            if previous_topic is None:
-                return None
-            # Aspect-only correction: keep the previous topic, switch to the
-            # corrected aspect if the user specified one. Falls back to the
-            # previous aspect (or a sensible default) when neither side
-            # specified.
+
+        new_topic, new_aspect = self.classify_correction(
+            correction,
+            original=original_message,
+            previous_topic=previous_topic,
+            previous_aspect=previous_aspect,
+        )
+
+        # Fall back to plain classification if the context-aware call gave
+        # nothing useful and we have no previous topic to anchor to.
+        if new_topic is None and new_aspect is None and previous_topic is None:
+            return None
+
+        if new_topic is None and previous_topic is not None:
             chosen_aspect = new_aspect or previous_aspect or self._default_aspect_for(previous_topic)
             return self._code_monkey_recipe_proposal(previous_topic, chosen_aspect)
-        safe = self.safety.classify_capability_request(normalize_text(correction))
-        if not safe.get("allowed"):
-            return None
-        return self._code_monkey_recipe_proposal(new_topic, new_aspect or self._default_aspect_for(new_topic))
+
+        if new_topic is not None:
+            safe = self.safety.classify_capability_request(normalize_text(correction))
+            if not safe.get("allowed"):
+                return None
+            return self._code_monkey_recipe_proposal(
+                new_topic,
+                new_aspect or previous_aspect or self._default_aspect_for(new_topic),
+            )
+
+        return None
 
     def correction_updates_previous_request(self, proposal: dict, previous_proposal: dict | None = None) -> bool:
         inferred = proposal.get("inferred") or {}
