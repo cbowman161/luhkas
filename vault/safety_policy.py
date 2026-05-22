@@ -1,12 +1,17 @@
 class SafetyPolicy:
+    # Substring matches against the lower-cased command. Keep narrow —
+    # generic words like "format" / "wipe" appear in legitimate read-only
+    # flags (e.g. `nvidia-smi --format=csv`) and produce false positives.
     BLOCKED_WORDS = [
         "rm -rf",
         "shutdown",
         "reboot",
         "mkfs",
-        "dd ",
-        "format",
-        "wipe",
+        "mkfs.",
+        "dd if=",
+        "dd of=",
+        "wipefs",
+        "shred ",
         "delete all",
         "fork bomb",
         ":(){",

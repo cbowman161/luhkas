@@ -145,6 +145,20 @@ class CodeMonkeyClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            # The service IS reachable; it just returned a non-2xx. Surface the
+            # response body (typically {"ok": false, "error": "..."}) so callers
+            # see WHY rather than a misleading "service unavailable".
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    raise RuntimeError(
+                        f"Code Monkey returned HTTP {exc.code}: {parsed.get('error')}"
+                    )
+            except (json.JSONDecodeError, ValueError):
+                pass
+            raise RuntimeError(f"Code Monkey returned HTTP {exc.code}: {exc.reason}")
         except urllib.error.URLError as exc:
             raise RuntimeError(
                 "Code Monkey service is unavailable at "

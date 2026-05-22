@@ -727,7 +727,30 @@ class LearnedCapabilityEngine:
                 "single_recipe": True,
                 "generator": recipe_result.get("generator") or "code_monkey_single_recipe",
             }
-            recipe = self._materialize_generated_recipe(text, recipe_result.get("recipe") or {})
+            try:
+                recipe = self._materialize_generated_recipe(text, recipe_result.get("recipe") or {})
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": str(exc),
+                    "returncode": -1,
+                    "error": f"Generated recipe failed safety/format check: {exc}",
+                    "ran_at": time.time(),
+                    "code_monkey_task": {"ok": False, "single_recipe": True, "error": str(exc)},
+                    "capability": {
+                        "name": proposal.get("intent"),
+                        "intent": proposal.get("intent"),
+                        "description": proposal.get("description"),
+                        "route": proposal.get("route"),
+                        "target": proposal.get("target"),
+                        "confidence": proposal.get("confidence"),
+                        "reason": proposal.get("reason"),
+                        "inferred": proposal.get("inferred"),
+                        "confirmed_by": confirmed_by,
+                    },
+                    "saved": False,
+                }
         else:
             code_monkey_task = {"ok": False, "skipped": True, "reason": "legacy_builtin_recipe"}
             recipe = self.build_recipe(text, proposal)
@@ -1004,6 +1027,10 @@ class LearnedCapabilityEngine:
             "timeout_seconds": 10,
         }
 
+    _FORBIDDEN_SHELL_TOKENS = frozenset({
+        "|", "||", "&&", "&", ";", ">", ">>", "<", "<<", "<<<",
+    })
+
     def _run_bash(self, command: str) -> dict:
         command = str(command or "").strip()
         safety = self.safety.validate_command(command)
@@ -1015,8 +1042,15 @@ class LearnedCapabilityEngine:
             return self._error(str(exc))
         if not argv:
             return self._error("Empty command.")
-        if not shutil.which(argv[0]):
-            return self._error(f"Command not found: {argv[0]}", returncode=127)
+        for token in argv:
+            if token in self._FORBIDDEN_SHELL_TOKENS:
+                return self._error(
+                    f"Refusing to run: command contains shell metachar {token!r} "
+                    "but the executor runs argv without a shell."
+                )
+        binary = argv[0]
+        if "/" not in binary and not shutil.which(binary):
+            return self._error(f"Command not found: {binary}", returncode=127)
         try:
             completed = subprocess.run(
                 argv,
