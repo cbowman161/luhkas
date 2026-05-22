@@ -4,10 +4,16 @@ import json
 import re
 import shlex
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, Dict
 
 from .coder import LocalModel
 from .config import PLANNER_MODEL
+
+
+SMOKE_TIMEOUT_SECONDS = 8
 
 
 # Substring patterns rejected in the raw command string before shlex.split.
@@ -103,16 +109,22 @@ def generate_learned_command_recipe(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         recipe = _normalize_recipe(parsed)
         validation = _validate_recipe(recipe)
-        if validation.get("ok"):
-            return {
-                "ok": True,
-                "recipe": recipe,
-                "raw_response": raw,
-                "generator": "code_monkey_single_recipe",
-                "attempts": attempt + 1,
-            }
-        last_recipe = recipe
-        last_error = validation.get("error") or "unknown validator error"
+        if not validation.get("ok"):
+            last_recipe = recipe
+            last_error = validation.get("error") or "unknown validator error"
+            continue
+        smoke = _smoke_test_recipe(recipe)
+        if not smoke.get("ok"):
+            last_recipe = recipe
+            last_error = smoke.get("error") or "unknown smoke error"
+            continue
+        return {
+            "ok": True,
+            "recipe": recipe,
+            "raw_response": raw,
+            "generator": "code_monkey_single_recipe",
+            "attempts": attempt + 1,
+        }
 
     return {
         "ok": False,
@@ -250,6 +262,91 @@ def _normalize_recipe(parsed: Dict[str, Any]) -> Dict[str, Any]:
         recipe["filename"] = str(parsed.get("filename") or "learned_command.py").strip()
         recipe["source"] = str(parsed.get("source") or "")
     return recipe
+
+
+def _smoke_test_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
+    """Actually run the recipe in a sandboxed subprocess with a short timeout.
+    Returns {"ok": True} if it ran clean (rc=0, non-empty stdout); otherwise
+    {"ok": False, "error": "..."} with the runtime failure as the reason so
+    the retry loop can pass it back to the planner.
+
+    Catches the class of bug a structural validator can't — semantically
+    wrong flags (e.g. `ps -o etime,pid,comm --sort=-etime --no-headers` on a
+    busybox vs procps where flag names differ), missing optional features,
+    permission requirements that only show up at runtime, etc.
+    """
+    kind = recipe.get("type")
+    try:
+        if kind == "bash":
+            command = str(recipe.get("command") or "").strip()
+            try:
+                argv = shlex.split(command)
+            except ValueError as exc:
+                return {"ok": False, "error": f"smoke: shlex failed: {exc}"}
+            if not argv:
+                return {"ok": False, "error": "smoke: empty argv"}
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=SMOKE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        elif kind == "python_script":
+            source = str(recipe.get("source") or "")
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8",
+            ) as fh:
+                fh.write(source)
+                script_path = fh.name
+            try:
+                result = subprocess.run(
+                    ["python3", script_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=SMOKE_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            finally:
+                try:
+                    Path(script_path).unlink()
+                except Exception:
+                    pass
+        else:
+            return {"ok": False, "error": f"smoke: unsupported recipe type {kind!r}"}
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": (
+                f"smoke: recipe exceeded {SMOKE_TIMEOUT_SECONDS}s timeout. "
+                "Pick a fast non-blocking variant or trim the work."
+            ),
+        }
+    except FileNotFoundError as exc:
+        return {"ok": False, "error": f"smoke: binary not found: {exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"smoke: unexpected error: {exc}"}
+
+    if result.returncode != 0:
+        stderr_snippet = (result.stderr or "").strip()[:300]
+        return {
+            "ok": False,
+            "error": (
+                f"smoke: recipe exited rc={result.returncode}. "
+                f"stderr: {stderr_snippet or '(empty)'}. "
+                "The command is syntactically OK but the flags/arguments are wrong; "
+                "pick a different invocation or use python_script."
+            ),
+        }
+    if not (result.stdout or "").strip():
+        return {
+            "ok": False,
+            "error": (
+                "smoke: recipe ran cleanly but produced no stdout. "
+                "Choose a command/script that actually prints the requested fact."
+            ),
+        }
+    return {"ok": True}
 
 
 def _validate_recipe(recipe: Dict[str, Any]) -> Dict[str, Any]:
