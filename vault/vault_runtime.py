@@ -1439,14 +1439,14 @@ class VaultRuntime:
             original_message = (
                 pending.get("original_message")
                 if engine.correction_updates_previous_request(proposal, previous_proposal)
-                else correction
+                else message
             )
             self._set_pending({
                 "type": "learned_capability_confirmation",
                 "original_message": original_message,
                 "proposal": proposal,
                 "node_id": node_id,
-                "correction": correction,
+                "correction": message,
             })
             return self._remember_active({
                 "mode": "direct",
@@ -1490,15 +1490,21 @@ class VaultRuntime:
                     alias_recorded = True
             summary = engine.summarize_result(message, learned, result)
             summary = f"Learned command. {summary}"
-            # Set a one-turn review state so the user can correct a wrong
-            # concept-match by saying "no" / "no, X" — that will remove the
-            # just-saved alias and propose a fresh learn flow.
-            if alias_recorded:
-                cap_inferred = (alias_source or {}).get("inferred") or {}
-                # If the source cap was a legacy entry without inferred,
-                # derive concept from intent so corrections still get context.
+            # Set a one-turn review state on EVERY successful learned-cap
+            # execution, regardless of how the cap was matched (exact-key
+            # hit OR concept-match-with-alias-recording). Without this the
+            # user could only correct on a phrase's first use, not on
+            # subsequent uses where lookup hit an existing key directly.
+            if result.get("ok"):
+                # Prefer the source cap's inferred (when concept-match), else
+                # the learned cap's own inferred, else derive from intent.
+                cap_inferred = (
+                    (alias_source or {}).get("inferred")
+                    or learned.get("inferred")
+                    or {}
+                )
                 if not cap_inferred.get("topic"):
-                    cap_topic, cap_aspect = engine._cap_concept(alias_source or {})
+                    cap_topic, cap_aspect = engine._cap_concept(alias_source or learned or {})
                     if cap_topic:
                         cap_inferred = {"topic": cap_topic, "aspect": cap_aspect}
                 self._set_pending({
