@@ -83,10 +83,20 @@ Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_no
   process, network, port, service, temperature, fan, user, login, log,
   package, time, timezone, locale, drive, partition, mount, volume, ip,
   route, dns, firewall, battery, bluetooth, wifi, audio, usb, pci, sensor,
-  cgroup, namespace, swap, gpu, nvidia, vault, scout. Use "none" if the
-  user is NOT asking about a Linux server's state (greetings, identity,
-  chitchat, math, gibberish, scout/camera/robot actions, chat-context
-  memory recall).
+  cgroup, namespace, swap, gpu, nvidia, vault, scout.
+
+  IMPORTANT: if the user names a specific Linux command/tool in their
+  message (e.g. "show me iotop output", "run lsof", "use nmap to scan",
+  "what does dig say", "let me see netstat"), use THAT TOOL NAME as the
+  topic. Treat phrasings like "show me X", "run X", "use X", "let me see
+  X output" as system queries where X is the topic — not as vision asks.
+  The classifier should reach for the tool name even when the surrounding
+  verb ("show me") would otherwise suggest something visual.
+
+  Use "none" if the user is NOT asking about a Linux server's state at all
+  (greetings, identity, chitchat, math, gibberish, scout/camera/robot
+  actions, chat-context memory recall, or genuinely vision-only requests
+  like "what do you see in the camera").
 
 - "aspect" is a SINGULAR LOWERCASE one-word noun for what they want about
   the topic. Common ones: usage (live activity/percent), hardware
@@ -202,6 +212,24 @@ OUTPUT: {"topic": "audio", "aspect": "list"}
 
 INPUT: "what's my battery percentage"
 OUTPUT: {"topic": "battery", "aspect": "usage"}
+
+INPUT: "show me iotop output"
+OUTPUT: {"topic": "iotop", "aspect": "status"}
+
+INPUT: "run lsof"
+OUTPUT: {"topic": "lsof", "aspect": "list"}
+
+INPUT: "use nmap to scan localhost"
+OUTPUT: {"topic": "nmap", "aspect": "status"}
+
+INPUT: "what does dig say for google.com"
+OUTPUT: {"topic": "dig", "aspect": "status"}
+
+INPUT: "let me see strace on pid 1234"
+OUTPUT: {"topic": "strace", "aspect": "status"}
+
+INPUT: "show me what's on the camera"
+OUTPUT: {"topic": "none", "aspect": "none"}
 
 Now classify:
 INPUT: %s
