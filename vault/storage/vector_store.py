@@ -67,23 +67,45 @@ class MemoryStore:
         unidentified_face_ref: str | None = None,
         category: str = "fact",
         source_message: str = "",
+        duplicate_distance: float = 0.25,
     ) -> dict[str, Any]:
         content = (content or "").strip()
         if not content:
             return {"ok": False, "error": "empty_content"}
+        ident = _norm_identity(identity)
+        vec = self._embed(content)
+        # Duplicate guard: if a very-close match already exists in this
+        # identity's namespace, return it instead of inserting a second copy.
+        with self._lock:
+            existing = (
+                self._table.search(vec)
+                .where(f"identity = '{ident}'", prefilter=True)
+                .limit(1)
+                .to_list()
+            )
+        if existing:
+            dist = existing[0].get("_distance")
+            if dist is not None and dist <= duplicate_distance:
+                row = existing[0]
+                return {
+                    "ok": True,
+                    "duplicate": True,
+                    "distance": dist,
+                    "record": {k: v for k, v in row.items() if k != "vector"},
+                }
         record = {
             "id": str(uuid.uuid4()),
-            "identity": _norm_identity(identity),
+            "identity": ident,
             "unidentified_face_ref": (unidentified_face_ref or "").strip(),
             "content": content,
             "category": category or "fact",
             "source_message": (source_message or "").strip(),
             "created_at": time.time(),
-            "vector": self._embed(content),
+            "vector": vec,
         }
         with self._lock:
             self._table.add([record])
-        return {"ok": True, "record": {k: v for k, v in record.items() if k != "vector"}}
+        return {"ok": True, "duplicate": False, "record": {k: v for k, v in record.items() if k != "vector"}}
 
     def search(
         self,

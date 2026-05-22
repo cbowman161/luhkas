@@ -1585,14 +1585,29 @@ class ScoutVaultBridge:
                 "routing_error", message, state, {"route": route}, max_tokens=100
             )
 
+        persist_result = {"stored": [], "already_known": []}
         if route.get("route") in {"general_question", "direction"}:
-            stored = self.persist_user_facts(message, state)
-            if stored:
+            persist_result = self.persist_user_facts(message, state)
+            if persist_result["stored"] or persist_result["already_known"]:
                 actions.append({
                     "name": "persist_user_facts",
                     "ok": True,
-                    "result": {"count": len(stored), "facts": [r["content"] for r in stored]},
+                    "result": {
+                        "stored": [r["content"] for r in persist_result["stored"]],
+                        "already_known": [r["content"] for r in persist_result["already_known"]],
+                    },
                 })
+        self._current_persist_result = persist_result
+
+        # Deterministic short-circuit: user just restated a fact we already
+        # have, with nothing new in the same turn. Avoids the small chat LLM
+        # second-guessing itself on the acknowledge wording.
+        if (
+            route.get("route") == "general_question"
+            and persist_result["already_known"]
+            and not persist_result["stored"]
+        ):
+            return self._already_known_response(persist_result["already_known"])
 
         introduced_name = _extract_introduction_name(message)
 
@@ -3180,17 +3195,19 @@ User message:
                     return str(det_id)
         return None
 
-    def persist_user_facts(self, message: str, state: dict | None = None) -> list[dict]:
+    def persist_user_facts(self, message: str, state: dict | None = None) -> dict:
         """Extract any speaker-facts from the message and write them to the
-        identity-scoped memory store. Returns the list of stored records."""
+        identity-scoped memory store. Returns {"stored": [...], "already_known": [...]}.
+        already_known entries are facts whose semantic neighbour was already
+        present in the speaker's namespace (duplicate)."""
+        result = {"stored": [], "already_known": []}
         if not self.memory_store:
-            return []
+            return result
         facts = self.extract_user_facts(message)
         if not facts:
-            return []
+            return result
         identity = self.active_identity
         unidentified_face_ref = None if identity else self._unidentified_face_ref(state)
-        stored = []
         for fact in facts:
             try:
                 res = self.memory_store.add(
@@ -3200,11 +3217,50 @@ User message:
                     category="fact",
                     source_message=message,
                 )
-                if res.get("ok"):
-                    stored.append(res["record"])
+                if not res.get("ok"):
+                    continue
+                if res.get("duplicate"):
+                    result["already_known"].append(res["record"])
+                else:
+                    result["stored"].append(res["record"])
             except Exception as exc:
                 print(f"[memory_store] write failed: {exc}")
-        return stored
+        return result
+
+    @staticmethod
+    def _third_to_second_person(text: str) -> str:
+        """Coarse third->second person rewrite for fact strings stored in
+        the 'the user X' / 'the user's X' canonical form."""
+        if not text:
+            return text
+        # "the user's foo" -> "your foo"
+        text = re.sub(r"\bthe user's\s+", "your ", text, flags=re.I)
+        # "the user is" -> "you are", "the user has" -> "you have",
+        # "the user likes/lives/works/..." -> "you like/live/work/..."
+        verb_map = {"is": "are", "has": "have", "was": "were", "does": "do"}
+        def fix_verb(match: re.Match) -> str:
+            verb = match.group(1).lower()
+            replacement = verb_map.get(verb)
+            if replacement is not None:
+                return f"you {replacement}"
+            # Naive present-3rd-singular -> base form: strip trailing 's' when
+            # the word is at least 4 chars and ends in single 's'.
+            if len(verb) >= 4 and verb.endswith("s") and not verb.endswith("ss"):
+                return f"you {verb[:-1]}"
+            return f"you {verb}"
+        text = re.sub(r"\bthe user\s+([A-Za-z]+)", fix_verb, text, flags=re.I)
+        return text
+
+    def _already_known_response(self, already_known: list[dict]) -> str:
+        if not already_known:
+            return "I already have that recorded."
+        if len(already_known) == 1:
+            phrase = self._third_to_second_person(already_known[0]["content"])
+            return f"I already have that — {phrase}."
+        phrases = ", ".join(
+            self._third_to_second_person(r["content"]) for r in already_known
+        )
+        return f"I already have those: {phrases}."
 
     def recall_user_facts(self, query: str, top_k: int = 5) -> list[dict]:
         if not self.memory_store:
@@ -3225,6 +3281,8 @@ User message:
         response_context = self.response_context(state)
         conversation_context = _presence_conversation_context(presence_context)
         recalled_facts = [r["content"] for r in self.recall_user_facts(message, top_k=5)]
+        persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
+        facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -3239,10 +3297,12 @@ Context:
     "active_identity": active_identity_context or "unknown",
     "tracking_memory": state.get("object_memory", [])[:4],
     "remembered_user_facts": recalled_facts,
+    "facts_just_stored": facts_just_stored,
 }, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts.
-If the user is asking about something in remembered_user_facts, answer from those facts directly.
+If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
+If the user is asking about something in remembered_user_facts, answer from those facts directly using second person ("your", "you").
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
