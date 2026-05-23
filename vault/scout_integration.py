@@ -2835,6 +2835,12 @@ Do not mention provenance unless asked.
         state = state or {}
         name = self.identity_profile.get("name") or "Luhkas"
         role = self.identity_profile.get("role") or ""
+        # Name-only short-circuit: "what's your name" / "what is your name"
+        # / "your name" deserve a terse one-liner, not a personality dump.
+        text_canon = _normalize_command_text(message or "")
+        if _asks_assistant_name(text_canon):
+            self._current_assistant_facts = [f"my name is {name}"]
+            return f"I'm {name}."
         # Pull assistant-identity facts from MemoryStore. We rewrite them to
         # first-person here so the LLM doesn't have to map "the assistant"
         # to itself.
@@ -2860,9 +2866,15 @@ Facts you know about yourself (from your memory):
 Reply in FIRST PERSON only -- start with "I am {name}" or "I'm {name}".
 1-2 short sentences. Draw on the facts above for content. Describe yourself, not the user.
 
+IDENTITY RULE: You are an AI presence, not a rover. The rover ("Scout") is
+a separate edge module you operate through. NEVER say "I am a rover" or
+"I am a Scout" -- you can mention Scout only as something you connect to
+or operate. If asked what you ARE, say "AI", "AI assistant", "AI presence",
+or similar.
+
 STRICT WORD RULES:
 - Do NOT use the word "you", "you're", "you are", "your", or "yours" anywhere.
-- Do NOT mention your creator, body, hardware, node, scout, vault, or any user's name unless it appears in the facts above.
+- Do NOT mention your creator, body, hardware, node, scout, vault, or any user's name unless the user's question is specifically about that topic.
 - No emojis. No trailing offer ("how can I help" etc).
 """
         # Call the chat model directly rather than going through
@@ -3651,7 +3663,13 @@ Output JSON only:
             seeds.append(f"the assistant was created by {creator}")
         body = (prof.get("body") or "").strip()
         if body:
-            seeds.append(f"the assistant's body is {body}")
+            # Reframe the body field: Luhkas is the AI presence, NOT the
+            # rover. The rover is Scout, a connected edge module the
+            # assistant operates through. This avoids "I am a rover" drift.
+            seeds.append(
+                f"the assistant operates through a connected Scout edge module ({body})"
+            )
+            seeds.append("the assistant is the AI presence, not the rover; the rover is the Scout edge module")
         primary_user = (prof.get("primary_user") or "").strip()
         if primary_user:
             seeds.append(f"the assistant's primary user is {primary_user}")
