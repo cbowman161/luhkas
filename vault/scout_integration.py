@@ -5967,13 +5967,49 @@ def _single_route_token(text: str, route_options=None):
     return None
 
 
+_NAME_STOPWORDS = {
+    "a", "an", "the", "very", "really", "just", "still", "also",
+    "going", "trying", "thinking", "feeling",
+    # common adjectives that follow "I am" but aren't names
+    "tired", "happy", "sad", "hungry", "thirsty", "bored", "busy",
+    "old", "young", "new", "ready", "fine", "good", "okay", "ok",
+    "here", "there", "home", "back", "in", "out", "on", "off", "up", "down",
+    # nouns/professions that follow "I am a" but are caught above; this list
+    # covers stray cases where "a/an" is dropped colloquially ("I am librarian")
+    "librarian", "engineer", "doctor", "teacher", "nurse", "developer",
+    "designer", "manager", "lawyer", "accountant", "writer", "artist",
+    "student", "parent", "father", "mother", "single", "married",
+}
+
 def _extract_introduction_name(message: str):
+    """Return the spoken name if the message is an unambiguous introduction
+    ("I'm Chris", "my name is Chris"). Filters out articles/adjectives/
+    common professions so "I am a librarian" doesn't return "a" or
+    "librarian" as the name."""
     tokens = message.replace(",", " ").replace(".", " ").split()
     lowered = [token.lower() for token in tokens]
-    for phrase in (("i", "am"), ("i'm",), ("im",), ("my", "name", "is")):
+    for phrase in (("i", "am"), ("i'm",), ("im",), ("my", "name", "is"), ("call", "me")):
         for index in range(0, len(tokens) - len(phrase) + 1):
             if tuple(lowered[index:index + len(phrase)]) == phrase and index + len(phrase) < len(tokens):
-                return tokens[index + len(phrase)].strip()[:64]
+                candidate = tokens[index + len(phrase)].strip()[:64]
+                cand_lower = candidate.lower().rstrip(".!?,")
+                if not candidate:
+                    continue
+                # Reject articles / stopwords / common adjectives & roles
+                if cand_lower in _NAME_STOPWORDS:
+                    return None
+                # Reject if candidate isn't capitalized (likely not a proper
+                # name); allow lowercased only if the whole message is
+                # lowercased (mobile typing).
+                msg_all_lower = message == message.lower()
+                if not msg_all_lower and not candidate[0].isupper():
+                    return None
+                # Reject if candidate has non-letter chars beyond
+                # apostrophe/hyphen (proper names like O'Brien or Mary-Jane
+                # are fine).
+                if not re.match(r"^[A-Za-z][A-Za-z'\-]*$", candidate):
+                    return None
+                return candidate
     return None
 
 
