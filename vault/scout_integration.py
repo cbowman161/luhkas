@@ -678,12 +678,32 @@ class ScoutVaultBridge:
             },
         ]
         if route_name == "general_question":
-            sources.append({
-                "name": "model_prior_knowledge",
-                "role": "model prior knowledge",
-                "ok": True,
-                "note": "No more specific runtime data source was selected for this answer.",
-            })
+            mem_src = getattr(self, "_current_memory_sources", None) or {}
+            recalled = mem_src.get("recalled_facts") or []
+            chat_turn_count = mem_src.get("recent_chat_turns") or 0
+            identity_scope = mem_src.get("identity_scope") or "unknown"
+            if recalled:
+                sources.append({
+                    "name": "memory_store",
+                    "role": "identity-scoped semantic memory (LanceDB)",
+                    "ok": True,
+                    "identity": identity_scope,
+                    "facts_consulted": recalled,
+                })
+            if chat_turn_count:
+                sources.append({
+                    "name": "session_chat",
+                    "role": "recent conversation turns in this session",
+                    "ok": True,
+                    "turns_consulted": chat_turn_count,
+                })
+            if not recalled and not chat_turn_count:
+                sources.append({
+                    "name": "model_prior_knowledge",
+                    "role": "model prior knowledge",
+                    "ok": True,
+                    "note": "No more specific runtime data source was selected for this answer.",
+                })
         elif route_name == "greeting":
             sources.append({
                 "name": "response_style",
@@ -3187,61 +3207,78 @@ Do not mention provenance unless asked.
         return None
 
     _FACT_EXTRACTOR_PROMPT = """Extract any personal facts the SPEAKER stated about THEMSELVES in this message.
-Return a compact JSON list of fact statements rewritten in third person referring
-to "the user" (e.g. "the user's pet is named Salem", "the user lives in Austin").
+Output JSON: {{"facts": [...]}} where each fact is a short standalone sentence
+in third person referring to "the user" (e.g. "the user's pet is named Salem",
+"the user lives in Austin").
 
 Rules:
-- Only extract things the user said about themselves: their possessions,
-  preferences (favorite color/food/music/etc.), relationships, location,
-  job, hobbies, plans, or activities.
+- Extract anything the user said about themselves: their possessions,
+  preferences (favorite ANYTHING — color, food, drink, movie, season,
+  music, sport, book, etc.), relationships, location, job, hobbies,
+  plans, or activities.
 - Do NOT extract questions, commands, requests, observations about the
   assistant, or external/world facts.
-- Each fact must be a short standalone sentence starting with "the user"
-  or "the user's".
-- If no personal facts are present, return [].
-- Output JSON list only. No markdown, no prose.
+- Each fact must start with "the user" or "the user's".
+- If no personal facts are present, return {{"facts": []}}.
+- Output JSON object only. No markdown, no prose.
 
-Examples:
-- "my name is Chris"               -> ["the user's name is Chris"]
-- "I'm Chris"                       -> ["the user's name is Chris"]
-- "I am Chris"                      -> ["the user's name is Chris"]
-- "call me Chris"                   -> ["the user's name is Chris"]
-- "my pet's name is Salem"        -> ["the user's pet is named Salem"]
-- "I live in Austin"               -> ["the user lives in Austin"]
-- "my favorite color is blue"      -> ["the user's favorite color is blue"]
-- "I like jazz music"              -> ["the user likes jazz music"]
-- "remember I like blue"           -> ["the user likes blue"]
-- "I'm a software engineer"        -> ["the user is a software engineer"]
-- "I have a cat"                   -> ["the user has a cat"]
-- "what's my pet's name"           -> []
-- "what's my favorite color"       -> []
-- "what's my name"                 -> []
-- "who am I"                       -> []
-- "good morning"                   -> []
-- "what's the capital of japan"    -> []
+Examples (input → output):
+- "my name is Chris"               → {{"facts": ["the user's name is Chris"]}}
+- "I'm Chris"                       → {{"facts": ["the user's name is Chris"]}}
+- "my pet's name is Salem"        → {{"facts": ["the user's pet is named Salem"]}}
+- "I live in Austin"               → {{"facts": ["the user lives in Austin"]}}
+- "my favorite color is blue"      → {{"facts": ["the user's favorite color is blue"]}}
+- "my favorite drink is coffee"    → {{"facts": ["the user's favorite drink is coffee"]}}
+- "my favorite movie is Inception" → {{"facts": ["the user's favorite movie is Inception"]}}
+- "my favorite season is autumn"   → {{"facts": ["the user's favorite season is autumn"]}}
+- "I like jazz music"              → {{"facts": ["the user likes jazz music"]}}
+- "I'm a software engineer"        → {{"facts": ["the user is a software engineer"]}}
+- "I have a cat"                   → {{"facts": ["the user has a cat"]}}
+- "what's my pet's name"           → {{"facts": []}}
+- "what's my favorite color"       → {{"facts": []}}
+- "who am I"                       → {{"facts": []}}
+- "good morning"                   → {{"facts": []}}
+- "what's the capital of japan"    → {{"facts": []}}
 - "I work as an SRE and I have a cat named Whiskers"
-                                   -> ["the user works as an SRE", "the user has a cat named Whiskers"]
+                                   → {{"facts": ["the user works as an SRE", "the user has a cat named Whiskers"]}}
 
 User message:
 {message}
 """
 
+    _FACT_EXTRACTOR_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "facts": {
+                "type": "array",
+                "items": {"type": "string"},
+            }
+        },
+        "required": ["facts"],
+    }
+
     def extract_user_facts(self, message: str) -> list[str]:
-        """Use the small router model to pull declarative speaker-facts out of a turn.
-        Returns a (possibly empty) list of third-person fact sentences."""
+        """Pull declarative speaker-facts out of a turn.
+        Returns a (possibly empty) list of third-person fact sentences.
+
+        Uses chat_model (qwen3:8b) with structured output -- the 3B router
+        model was dropping common preferences ("favorite drink", "favorite
+        movie", "favorite season") even with examples in the prompt. Cost is
+        ~300ms per general_question/direction turn, which is acceptable for
+        the reliability gain (silently losing facts corrupts memory)."""
         if not message or not message.strip():
             return []
         # Deterministic fast-path: name introductions ("my name is X", "I'm X",
-        # "I am X"). The 3B extractor model has been unreliable on these and
-        # they're unambiguous enough to grab directly.
+        # "I am X"). Unambiguous enough to grab directly without an LLM.
         introduced = _extract_introduction_name(message)
         if introduced:
             return [f"the user's name is {introduced}"]
         prompt = self._FACT_EXTRACTOR_PROMPT.format(message=message.strip())
         try:
-            raw = self.route_model.generate(
+            raw = self.chat_model.generate(
                 prompt,
-                options={"num_predict": 120, "temperature": 0.0, "top_p": 0.9},
+                options={"num_predict": 200, "temperature": 0.0, "top_p": 0.9},
+                response_format=self._FACT_EXTRACTOR_SCHEMA,
                 timeout=30,
                 allow_empty=True,
             )
@@ -3250,7 +3287,8 @@ User message:
         if not raw:
             return []
         text = raw.strip()
-        match = re.search(r"\[.*\]", text, re.DOTALL)
+        # The schema gives us {"facts": [...]} — find the first object.
+        match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             return []
         try:
@@ -3258,7 +3296,7 @@ User message:
         except json.JSONDecodeError:
             return []
         facts = []
-        for item in data if isinstance(data, list) else []:
+        for item in (data.get("facts") if isinstance(data, dict) else []) or []:
             if isinstance(item, str) and item.strip():
                 facts.append(item.strip())
         return facts
@@ -3502,6 +3540,24 @@ Output JSON only:
             print(f"[memory_store] search failed: {exc}")
             return []
 
+    def _recent_chat_for_recall(self, limit: int = 6) -> list[dict]:
+        """Return the most recent N session turns as a compact list of
+        {user, assistant} pairs for injection into the recall prompt.
+        Recent chat wins over stored memory when they disagree."""
+        out = []
+        for turn in self.turns[-limit:]:
+            if not isinstance(turn, dict):
+                continue
+            msg = (turn.get("message") or "").strip()
+            resp = turn.get("response") or ""
+            if isinstance(resp, dict):
+                resp = resp.get("message") or resp.get("text") or ""
+            resp = str(resp).strip()
+            if not msg and not resp:
+                continue
+            out.append({"user": msg, "assistant": resp[:200]})
+        return out
+
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
@@ -3513,6 +3569,14 @@ Output JSON only:
         recalled_facts = [r["content"] for r in self.recall_user_facts(message, top_k=5)]
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
+        recent_chat = self._recent_chat_for_recall(limit=6)
+        # Annotate the running answer with the sources we consulted so the
+        # outer provenance builder can surface them deterministically.
+        self._current_memory_sources = {
+            "recalled_facts": recalled_facts,
+            "recent_chat_turns": len(recent_chat),
+            "identity_scope": (self.active_identity or "unknown"),
+        }
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -3523,6 +3587,7 @@ Context:
     "identity_context": identity_context,
     "response_guidance": self._format_response_lessons_for_prompt(response_context.get("response_lessons", []))[-5:],
     "conversation_context": conversation_context,
+    "recent_chat": recent_chat,
     "tracking_available": bool(state.get("ok")),
     "active_identity": active_identity_context or "unknown",
     "tracking_memory": state.get("object_memory", [])[:4],
@@ -3530,9 +3595,13 @@ Context:
     "facts_just_stored": facts_just_stored,
 }, separators=(",", ":"), default=str)}
 
-Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts.
+Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
-If the user is asking about something in remembered_user_facts, answer from those facts directly using second person ("your", "you").
+For recall about the SPEAKER (their name, possessions, preferences, plans):
+  1. Check recent_chat for what the speaker said in this conversation — that is the freshest source and wins over older memory if they disagree.
+  2. Then check remembered_user_facts for older stored facts.
+  3. If neither has the information being asked, say plainly "I don't have that stored." Do NOT guess or fabricate a value.
+Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
