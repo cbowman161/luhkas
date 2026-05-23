@@ -1628,6 +1628,15 @@ class ScoutVaultBridge:
         # Reset per-turn transient sources so provenance for this turn doesn't
         # carry recall results from a prior turn that bypassed answer_with_context.
         self._current_memory_sources = {"recalled_facts": [], "recent_chat_turns": 0, "identity_scope": (self.active_identity or "unknown")}
+
+        # Forget short-circuit: "forget my X", "delete my X", etc. Runs before
+        # persist so the request itself isn't extracted as a new fact.
+        if route.get("route") in {"general_question", "direction"}:
+            forget_reply = self.maybe_handle_forget(message)
+            if forget_reply is not None:
+                actions.append({"name": "forget_user_fact", "ok": True, "result": forget_reply})
+                return forget_reply
+
         persist_result = {"stored": [], "already_known": [], "conflicts": []}
         if route.get("route") in {"general_question", "direction"}:
             persist_result = self.persist_user_facts(message, state)
@@ -3543,6 +3552,60 @@ Output JSON only:
             print(f"[memory_store] search failed: {exc}")
             return []
 
+    _FORGET_PATTERN = re.compile(
+        r"^\s*(?:please\s+)?(?:forget|delete|remove|drop)\s+(?:that\s+|about\s+)?(?:my\s+|the\s+)?(?P<topic>.+?)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+
+    def maybe_handle_forget(self, message: str) -> str | None:
+        """If the user asks to forget/delete a stored fact, find the best
+        matching fact in their identity namespace and delete it. Returns a
+        confirmation string, or None if the message wasn't a forget request.
+
+        Embedding similarity ranks "favorite movie" close to "favorite drink"
+        ("favorite X is Y" pattern dominates), so we require BOTH a tight
+        cosine distance AND an LLM relation check to confirm the candidate
+        is actually about the topic the user wanted to forget."""
+        if not self.memory_store:
+            return None
+        m = self._FORGET_PATTERN.match(message or "")
+        if not m:
+            return None
+        topic = m.group("topic").strip()
+        if not topic:
+            return None
+        identity = self.active_identity or "unknown"
+        query_fact = f"the user's {topic}"
+        try:
+            candidates = self.memory_store.search(
+                query_fact,
+                identity=identity,
+                top_k=5,
+                distance_max=0.7,
+            )
+        except Exception as exc:
+            return f"I couldn't search memory to forget that ({exc})."
+        # Verify candidate actually mentions the topic. Vector search ranks
+        # "favorite drink" close to "favorite movie" because the template
+        # dominates the embedding, so we require the topic's key nouns to
+        # appear in the stored fact text.
+        topic_tokens = [t for t in re.findall(r"[a-zA-Z]+", topic.lower()) if len(t) >= 3 and t not in {"the", "and", "for", "with", "from", "favorite", "preferred"}]
+        if not topic_tokens:
+            topic_tokens = [t for t in re.findall(r"[a-zA-Z]+", topic.lower()) if len(t) >= 3]
+        matched = None
+        for cand in candidates:
+            content_lower = (cand.get("content") or "").lower()
+            if all(tok in content_lower for tok in topic_tokens):
+                matched = cand
+                break
+        if matched is None:
+            return f"I don't have anything about your {topic} stored."
+        ok = self.memory_store.delete_by_id(matched.get("id"))
+        if not ok:
+            return "I tried to forget that but the store didn't confirm the delete."
+        phrase = self._third_to_second_person(matched.get("content") or "")
+        return f"Forgotten — {phrase} is no longer stored."
+
     def _recent_chat_for_recall(self, limit: int = 6) -> list[dict]:
         """Return the most recent N session turns as a compact list of
         {user, assistant} pairs for injection into the recall prompt.
@@ -3603,11 +3666,12 @@ Context:
 }, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
+Answer ONLY the specific thing the user asked. Do NOT volunteer unrelated stored facts. If they asked "what's my name", answer with the name and nothing else — do not append their location or snack preference.
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
 For recall about the SPEAKER (their name, possessions, preferences, plans):
-  1. remembered_user_facts is the AUTHORITATIVE source. Always use its values verbatim when it has anything relevant; never override it with another value.
+  1. remembered_user_facts is the AUTHORITATIVE source. Pick the SINGLE fact from that list that matches what was asked and use its value verbatim. Ignore the others.
   2. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
-  3. If neither has the information being asked, say plainly "I don't have that stored." Do NOT guess or fabricate a value.
+  3. If none of remembered_user_facts actually matches what was asked (e.g. user asked for their name but only location/snack are stored), say plainly "I don't have that stored." Do NOT substitute an unrelated fact.
 Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
