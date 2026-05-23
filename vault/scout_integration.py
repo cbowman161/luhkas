@@ -1288,6 +1288,7 @@ class ScoutVaultBridge:
             return {"ok": True, **turn}
 
         state = self.scout_state()
+        self._adopt_identity_from_state(state)
 
         if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
             if _source_is_scout(source):
@@ -3198,6 +3199,57 @@ User message:
             if isinstance(item, str) and item.strip():
                 facts.append(item.strip())
         return facts
+
+    @staticmethod
+    def _pick_identity_from_state(state: dict | None, min_confidence: float = 0.6) -> str | None:
+        """Return the highest-confidence face-recognized identity currently
+        visible in the scout state, or None if no confident identification.
+        Voice cross-check will be layered on top later."""
+        if not state:
+            return None
+        best_name = None
+        best_conf = 0.0
+        for det in state.get("detections", []) or []:
+            label = str(det.get("label", "")).lower()
+            if label != "person" and "face" not in label:
+                continue
+            identity = det.get("identity")
+            if not identity:
+                continue
+            conf = float(det.get("identity_confidence") or 0.0)
+            if conf < min_confidence:
+                continue
+            if conf > best_conf:
+                best_conf = conf
+                best_name = str(identity).strip()
+        if best_name:
+            return best_name
+        # Fall back to tracker object_memory if detections didn't include a
+        # face-recognized person this tick (some scout configurations only
+        # surface identity through object_memory).
+        for mem in state.get("object_memory", []) or []:
+            if mem.get("label") != "person":
+                continue
+            identity = mem.get("identity")
+            if not identity:
+                continue
+            conf = float(mem.get("identity_confidence") or 0.0)
+            if conf < min_confidence:
+                continue
+            if conf > best_conf:
+                best_conf = conf
+                best_name = str(identity).strip()
+        return best_name
+
+    def _adopt_identity_from_state(self, state: dict | None) -> None:
+        """If the camera currently sees a recognized person, adopt that as the
+        active identity for this turn. Sticky: we do NOT clear active_identity
+        when nobody is visible — that lets the user step out briefly without
+        the session losing context. Voice recognition will arbitrate conflicts
+        once it lands."""
+        picked = self._pick_identity_from_state(state)
+        if picked and (not self.active_identity or self.active_identity.lower() != picked.lower()):
+            self.active_identity = picked
 
     def _unidentified_face_ref(self, state: dict | None) -> str | None:
         """Best-effort handle for the unknown-bucket: most-confident visible
