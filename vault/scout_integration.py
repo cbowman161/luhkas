@@ -1637,6 +1637,15 @@ class ScoutVaultBridge:
                 actions.append({"name": "forget_user_fact", "ok": True, "result": forget_reply})
                 return forget_reply
 
+        # Recall short-circuit: "do you know my X" / "what's my X" with a
+        # matching stored fact. The chat LLM has been unreliable on the
+        # yes/no recall form, so a deterministic answer for clear hits.
+        if route.get("route") in {"general_question"}:
+            recall_reply = self.maybe_handle_recall(message)
+            if recall_reply is not None:
+                actions.append({"name": "recall_user_fact", "ok": True, "result": recall_reply})
+                return recall_reply
+
         persist_result = {"stored": [], "already_known": [], "conflicts": []}
         if route.get("route") in {"general_question", "direction"}:
             persist_result = self.persist_user_facts(message, state)
@@ -2000,10 +2009,10 @@ class ScoutVaultBridge:
         import deterministic_router as _dr
         fast = _fast_route_message(message)
         if fast is not None:
-            return fast
+            return _pronoun_route_guard(message, fast)
         cached = _dr.lookup(message)
         if cached is not None:
-            return {**cached, "from_cache": True}
+            return _pronoun_route_guard(message, {**cached, "from_cache": True})
 
         prompt = self._route_prompt(message, state)
         raw_attempts = []
@@ -2032,13 +2041,13 @@ class ScoutVaultBridge:
             confidence = float(confidence)
         except (TypeError, ValueError):
             confidence = 0.0
-        return {
+        return _pronoun_route_guard(message, {
             "ok": True,
             "route": route,
             "confidence": max(0.0, min(1.0, confidence)),
             "reason": str(data.get("reason", ""))[:240],
             "attempts": len(raw_attempts),
-        }
+        })
 
     def _generate_route_response(self, prompt: str, structured: bool, route_options=None):
         route_options = route_options or ROUTE_OPTIONS
@@ -3557,6 +3566,52 @@ Output JSON only:
         re.IGNORECASE,
     )
 
+    # Recall fast-path: "do you know my X" / "do you remember my X" / "what's
+    # my X". The chat LLM has been unreliable on the yes/no form ("do you
+    # know my name" → "I don't know your name" even with name in
+    # remembered_user_facts), so we handle these deterministically.
+    _RECALL_QUESTION_PATTERN = re.compile(
+        r"^\s*(?:hey[, ]+)?(?:do\s+you\s+(?:know|remember|have|recall)\s+|what(?:'?s| is| are)\s+(?:is\s+)?|tell\s+me\s+(?:about\s+)?)"
+        r"(?:my\s+)(?P<topic>.+?)\s*[.!?]?\s*$",
+        re.IGNORECASE,
+    )
+
+    def maybe_handle_recall(self, message: str) -> str | None:
+        """Deterministic recall for "do you know/remember my X" and "what's my
+        X" — looks up matching speaker-fact in MemoryStore and answers from
+        it directly. Returns the canned response string, or None when the
+        pattern doesn't match or no fact exists (LLM-composed answer takes
+        over in the no-match case)."""
+        if not self.memory_store:
+            return None
+        m = self._RECALL_QUESTION_PATTERN.match(message or "")
+        if not m:
+            return None
+        topic = m.group("topic").strip()
+        if not topic:
+            return None
+        identity = self.active_identity or "unknown"
+        try:
+            candidates = self.memory_store.search(
+                f"the user's {topic}",
+                identity=identity,
+                top_k=5,
+                distance_max=1.2,
+            )
+        except Exception:
+            return None
+        topic_tokens = [t for t in re.findall(r"[a-zA-Z]+", topic.lower()) if len(t) >= 3 and t not in {"favorite", "preferred"}]
+        if not topic_tokens:
+            topic_tokens = [t for t in re.findall(r"[a-zA-Z]+", topic.lower()) if len(t) >= 3]
+        for cand in candidates:
+            content_lower = (cand.get("content") or "").lower()
+            if all(tok in content_lower for tok in topic_tokens):
+                phrase = self._third_to_second_person(cand.get("content") or "").rstrip(".")
+                if phrase:
+                    phrase = phrase[0].upper() + phrase[1:]
+                return f"{phrase}."
+        return None
+
     def maybe_handle_forget(self, message: str) -> str | None:
         """If the user asks to forget/delete a stored fact, find the best
         matching fact in their identity namespace and delete it. Returns a
@@ -3632,7 +3687,14 @@ Output JSON only:
         identity_context = self.response_identity_context(state)
         response_context = self.response_context(state)
         conversation_context = _presence_conversation_context(presence_context)
-        recalled_facts = [r["content"] for r in self.recall_user_facts(message, top_k=5)]
+        # Convert stored 3rd-person facts to 2nd person before injecting so
+        # the chat LLM never has to mentally map "the user" -> "you". The
+        # small chat model has misread "the user's name is Chris" as being
+        # about some other person and then answered "I don't know your name".
+        recalled_facts = [
+            self._third_to_second_person(r["content"])
+            for r in self.recall_user_facts(message, top_k=5)
+        ]
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
         # Only inject recent_chat as a fallback when memory has nothing for
@@ -3670,8 +3732,9 @@ Answer ONLY the specific thing the user asked. Do NOT volunteer unrelated stored
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
 For recall about the SPEAKER (their name, possessions, preferences, plans):
   1. remembered_user_facts is the AUTHORITATIVE source. Pick the SINGLE fact from that list that matches what was asked and use its value verbatim. Ignore the others.
-  2. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
-  3. If none of remembered_user_facts actually matches what was asked (e.g. user asked for their name but only location/snack are stored), say plainly "I don't have that stored." Do NOT substitute an unrelated fact.
+  2. Questions phrased as "do you know my X", "do you remember my X", "do I have an X", "what's my X" all ask for the VALUE of X. If a fact about X exists in remembered_user_facts, answer with the value (e.g. "Your name is Chris."), not a yes/no.
+  3. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
+  4. If none of remembered_user_facts actually matches what was asked (e.g. user asked for their name but only location/snack are stored), say plainly "I don't have that stored." Do NOT substitute an unrelated fact.
 Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
@@ -4751,6 +4814,65 @@ def _personality_preference_answer(message: str) -> str | None:
             "Which direction should I learn from first: stark architecture, strange portraits, luminous landscapes, or rough experimental work?"
         )
     return None
+
+
+# Speaker-attribute question patterns: "what's/where's/when's/how's MY X",
+# "what is MY X", "where do I X", etc. These are unambiguously asking for
+# the speaker's own stored facts and should always route to general_question
+# regardless of what the LLM said. Used by _pronoun_route_guard below.
+_SPEAKER_ATTR_PATTERNS = [
+    re.compile(r"^\s*(?:hey[, ]+)?what(?:'?s| is| are)\s+(?:is\s+)?my\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:hey[, ]+)?where\s+(?:is\s+)?(?:do\s+i|am\s+i|did\s+i)\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:hey[, ]+)?where\s+(?:is\s+)?my\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:hey[, ]+)?when\s+(?:do|did|am)\s+i\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:hey[, ]+)?how\s+(?:do|did|am)\s+i\b", re.IGNORECASE),
+    re.compile(r"^\s*(?:hey[, ]+)?tell\s+me\s+(?:about\s+)?my\b", re.IGNORECASE),
+    # "do you know my X" / "do you remember my X" — asks the assistant to
+    # surface a stored speaker-attribute, distinct from "do you know me"
+    # (recognition) which is in the identity carve-out below.
+    re.compile(r"^\s*(?:hey[, ]+)?do\s+you\s+(?:know|remember|have|recall)\s+my\b", re.IGNORECASE),
+]
+# Carve-outs: identity-recognition questions where self_question/user_identity
+# IS the right route even though "my"/"I"/"me" is present. The user is asking
+# whether the ASSISTANT recognizes them, not asking about a stored attribute.
+_IDENTITY_RECOGNITION_PHRASES = {
+    "who am i", "who am i?",
+    "do you know me", "do you know me?",
+    "do you recognize me", "do you recognize me?",
+    "have we met", "have we met?",
+    "what do you know about me", "what do you know about me?",
+    "am i chris", "am i chris?",
+}
+
+
+def _pronoun_route_guard(message: str, route_result: dict) -> dict:
+    """Enforce the pronoun convention from the router prompt: questions about
+    the SPEAKER's own attributes ("what's my X", "where do I X") are
+    general_question — NEVER self_question. The small router model has been
+    flickering on this, especially when a trailing '?' is present, so we
+    override deterministically after the LLM responds.
+
+    Identity-recognition questions ("who am I", "do you know me") are
+    carved out: those genuinely ask about the assistant's recognition of
+    the speaker and belong on self_question/user_identity."""
+    if not isinstance(route_result, dict):
+        return route_result
+    text = (message or "").strip().lower().rstrip(".!?,")
+    if text in _IDENTITY_RECOGNITION_PHRASES or text + "?" in _IDENTITY_RECOGNITION_PHRASES:
+        return route_result
+    if not any(p.match(message or "") for p in _SPEAKER_ATTR_PATTERNS):
+        return route_result
+    current = route_result.get("route")
+    if current == "general_question":
+        return route_result
+    # Override
+    return {
+        **route_result,
+        "route": "general_question",
+        "confidence": max(float(route_result.get("confidence") or 0.0), 0.95),
+        "reason": "pronoun guard: speaker-attribute question → general_question",
+        "pronoun_guard_override": current,
+    }
 
 
 def _fast_route_message(message: str) -> dict | None:
