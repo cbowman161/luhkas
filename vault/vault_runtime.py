@@ -300,6 +300,11 @@ class VaultRuntime:
             if audit_flow is not None:
                 return audit_flow
 
+        if isinstance(pending, dict) and pending.get("type") == "memory_update_confirmation":
+            memory_flow = self._handle_memory_update_confirmation(user_input, node_id)
+            if memory_flow is not None:
+                return memory_flow
+
         # Requirements gathering and review sessions receive raw user text — no intent
         # classification needed since the agents handle their own conversation logic.
         if pending and pending.get("type") in {
@@ -444,11 +449,12 @@ class VaultRuntime:
                 # normally; the short-circuit will re-arm if it's a vision ask.
                 self._clear_pending()
         # Clear any prior short-circuit marker on scout before calling.
-        if hasattr(self.scout, "_stash_vision_short_circuit_marker"):
-            try:
-                delattr(self.scout, "_stash_vision_short_circuit_marker")
-            except Exception:
-                pass
+        for attr in ("_stash_vision_short_circuit_marker", "_stash_memory_conflict_marker"):
+            if hasattr(self.scout, attr):
+                try:
+                    delattr(self.scout, attr)
+                except Exception:
+                    pass
         result = self.scout.handle_message(
             message,
             source=node_id,
@@ -468,6 +474,20 @@ class VaultRuntime:
             })
             try:
                 delattr(self.scout, "_stash_vision_short_circuit_marker")
+            except Exception:
+                pass
+        # If scout detected a memory conflict (new fact contradicts stored one),
+        # install pending state so the next turn's yes/no replaces or keeps.
+        mem_marker = getattr(self.scout, "_stash_memory_conflict_marker", None)
+        if isinstance(mem_marker, dict) and mem_marker.get("new_fact"):
+            self._set_pending({
+                "type": "memory_update_confirmation",
+                "original_message": message,
+                "conflict": mem_marker,
+                "node_id": node_id,
+            })
+            try:
+                delattr(self.scout, "_stash_memory_conflict_marker")
             except Exception:
                 pass
         # Scout bridge stores the reply text in "response" and the input in "message"
@@ -506,6 +526,10 @@ class VaultRuntime:
         audit_flow = self._handle_audit_merge_confirmation(message, node_id)
         if audit_flow is not None:
             return audit_flow
+
+        memory_flow = self._handle_memory_update_confirmation(message, node_id)
+        if memory_flow is not None:
+            return memory_flow
 
         pending = self.blackboard.get_pending_decision()
         if pending and pending.get("type") in {
@@ -1060,6 +1084,79 @@ class VaultRuntime:
             "active_task_id": self.active_task_id,
             "deterministic": True,
             "deterministic_source": "audit_caps_complete",
+            "compose": False,
+            "response_composed": True,
+        })
+
+    def _handle_memory_update_confirmation(self, message: str, node_id: str) -> dict | None:
+        """One-turn handler for 'Oh, I thought you said X — should I update to Y?'
+        prompts triggered when a new speaker-fact contradicts a stored one.
+
+        - affirm → replace the old fact with the new fact in the speaker's namespace.
+        - deny   → discard the new fact, keep the old one.
+        - anything else → clear pending and fall through.
+        """
+        pending = self.blackboard.get_pending_decision()
+        if not isinstance(pending, dict) or pending.get("type") != "memory_update_confirmation":
+            return None
+        conflict = pending.get("conflict") or {}
+        new_fact = conflict.get("new_fact") or ""
+        old_fact = conflict.get("old_fact") or ""
+        old_id = conflict.get("old_id") or ""
+
+        store = getattr(self.scout, "memory_store", None)
+        if store is None or not new_fact or not old_id:
+            self._clear_pending()
+            return None
+
+        bridge = self.scout
+        old_phrase = bridge._third_to_second_person(old_fact)
+        new_phrase = bridge._third_to_second_person(new_fact)
+
+        if _is_denial(message):
+            self._clear_pending()
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"OK, I'll keep it as {old_phrase}.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "memory_update_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        if not _is_affirmative(message):
+            # Treat anything else as backing out — don't risk silently
+            # rewriting memory on an ambiguous reply.
+            self._clear_pending()
+            return None
+
+        result = store.replace(
+            old_id,
+            new_fact,
+            identity=conflict.get("identity"),
+            unidentified_face_ref=conflict.get("unidentified_face_ref"),
+            category="fact",
+            source_message=conflict.get("source_message", ""),
+        )
+        self._clear_pending()
+        if not result.get("ok"):
+            return self._remember_active({
+                "mode": "direct",
+                "message": f"I couldn't update that ({result.get('error', 'unknown error')}).",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "memory_update_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+        return self._remember_active({
+            "mode": "direct",
+            "message": f"Got it — updated. {new_phrase}.",
+            "data": {"replaced": old_phrase, "now": new_phrase},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "memory_update_confirmation",
             "compose": False,
             "response_composed": True,
         })

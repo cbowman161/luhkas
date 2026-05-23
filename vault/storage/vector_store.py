@@ -143,6 +143,91 @@ class MemoryStore:
             })
         return out
 
+    def find_conflict_candidates(
+        self,
+        content: str,
+        identity: str | None = None,
+        distance_min: float = 0.25,
+        distance_max: float = 0.65,
+        top_k: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return facts in the speaker's namespace that are close enough to be
+        about the same subject (could contradict) but not so close that they
+        are already-known duplicates. Caller verifies actual contradiction
+        with an LLM classifier."""
+        content = (content or "").strip()
+        if not content:
+            return []
+        vec = self._embed(content)
+        ident = _norm_identity(identity)
+        with self._lock:
+            res = (
+                self._table.search(vec)
+                .where(f"identity = '{ident}'", prefilter=True)
+                .limit(top_k + 5)
+                .to_list()
+            )
+        out = []
+        for row in res:
+            dist = row.get("_distance")
+            if dist is None:
+                continue
+            if dist <= distance_min:
+                continue
+            if dist > distance_max:
+                continue
+            out.append({
+                "id": row.get("id"),
+                "identity": row.get("identity"),
+                "content": row.get("content"),
+                "category": row.get("category"),
+                "source_message": row.get("source_message"),
+                "created_at": row.get("created_at"),
+                "distance": dist,
+            })
+            if len(out) >= top_k:
+                break
+        return out
+
+    def delete_by_id(self, fact_id: str) -> bool:
+        if not fact_id:
+            return False
+        with self._lock:
+            try:
+                self._table.delete(f"id = '{fact_id}'")
+                return True
+            except Exception:
+                return False
+
+    def replace(
+        self,
+        old_id: str,
+        content: str,
+        identity: str | None = None,
+        unidentified_face_ref: str | None = None,
+        category: str = "fact",
+        source_message: str = "",
+    ) -> dict[str, Any]:
+        """Delete the old record by id and insert the new content as a fresh
+        record (no duplicate check — caller already classified the relation)."""
+        self.delete_by_id(old_id)
+        content = (content or "").strip()
+        if not content:
+            return {"ok": False, "error": "empty_content"}
+        record = {
+            "id": str(uuid.uuid4()),
+            "identity": _norm_identity(identity),
+            "unidentified_face_ref": (unidentified_face_ref or "").strip(),
+            "content": content,
+            "category": category or "fact",
+            "source_message": (source_message or "").strip(),
+            "created_at": time.time(),
+            "vector": self._embed(content),
+        }
+        with self._lock:
+            self._table.add([record])
+        return {"ok": True, "replaced_id": old_id, "record": {k: v for k, v in record.items() if k != "vector"}}
+
     def list_for_identity(self, identity: str | None, limit: int = 200) -> list[dict[str, Any]]:
         ident = _norm_identity(identity)
         with self._lock:

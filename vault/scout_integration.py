@@ -1585,19 +1585,33 @@ class ScoutVaultBridge:
                 "routing_error", message, state, {"route": route}, max_tokens=100
             )
 
-        persist_result = {"stored": [], "already_known": []}
+        persist_result = {"stored": [], "already_known": [], "conflicts": []}
         if route.get("route") in {"general_question", "direction"}:
             persist_result = self.persist_user_facts(message, state)
-            if persist_result["stored"] or persist_result["already_known"]:
+            if persist_result["stored"] or persist_result["already_known"] or persist_result["conflicts"]:
                 actions.append({
                     "name": "persist_user_facts",
                     "ok": True,
                     "result": {
                         "stored": [r["content"] for r in persist_result["stored"]],
                         "already_known": [r["content"] for r in persist_result["already_known"]],
+                        "conflicts": [c["new_fact"] for c in persist_result["conflicts"]],
                     },
                 })
         self._current_persist_result = persist_result
+
+        # Conflict short-circuit: a new fact contradicts an existing one.
+        # Stash for vault_runtime to install a memory_update_confirmation
+        # pending state, and reply with the deterministic "Oh, I thought..."
+        # question.
+        if route.get("route") in {"general_question", "direction"} and persist_result["conflicts"]:
+            conflict = persist_result["conflicts"][0]
+            self._stash_memory_conflict_marker = conflict
+            old_phrase = self._third_to_second_person(conflict["old_fact"])
+            new_phrase = self._third_to_second_person(conflict["new_fact"])
+            return (
+                f"Oh, I thought {old_phrase}. Has that changed — should I update it to {new_phrase}?"
+            )
 
         # Deterministic short-circuit: user just restated a fact we already
         # have, with nothing new in the same turn. Avoids the small chat LLM
@@ -3125,8 +3139,9 @@ Return a compact JSON list of fact statements rewritten in third person referrin
 to "the user" (e.g. "the user's pet is named Salem", "the user lives in Austin").
 
 Rules:
-- Only extract things the user said about themselves, their possessions,
-  preferences, relationships, location, plans, or activities.
+- Only extract things the user said about themselves: their possessions,
+  preferences (favorite color/food/music/etc.), relationships, location,
+  job, hobbies, plans, or activities.
 - Do NOT extract questions, commands, requests, observations about the
   assistant, or external/world facts.
 - Each fact must be a short standalone sentence starting with "the user"
@@ -3135,14 +3150,19 @@ Rules:
 - Output JSON list only. No markdown, no prose.
 
 Examples:
-- "my pet's name is Salem"     -> ["the user's pet is named Salem"]
-- "I live in Austin"            -> ["the user lives in Austin"]
-- "what's my pet's name"        -> []
-- "remember I like blue"        -> ["the user likes blue"]
-- "good morning"                -> []
-- "what's the capital of japan" -> []
+- "my pet's name is Salem"        -> ["the user's pet is named Salem"]
+- "I live in Austin"               -> ["the user lives in Austin"]
+- "my favorite color is blue"      -> ["the user's favorite color is blue"]
+- "I like jazz music"              -> ["the user likes jazz music"]
+- "remember I like blue"           -> ["the user likes blue"]
+- "I'm a software engineer"        -> ["the user is a software engineer"]
+- "I have a cat"                   -> ["the user has a cat"]
+- "what's my pet's name"           -> []
+- "what's my favorite color"       -> []
+- "good morning"                   -> []
+- "what's the capital of japan"    -> []
 - "I work as an SRE and I have a cat named Whiskers"
-                                -> ["the user works as an SRE", "the user has a cat named Whiskers"]
+                                   -> ["the user works as an SRE", "the user has a cat named Whiskers"]
 
 User message:
 {message}
@@ -3195,12 +3215,53 @@ User message:
                     return str(det_id)
         return None
 
+    _FACT_RELATION_PROMPT = """You are checking the relation between a NEW fact the user just stated and an OLD fact already on file.
+
+OLD fact (already stored): {old}
+NEW fact (just stated):    {new}
+
+Classify the relation as exactly one of:
+- "duplicate": the new fact says the SAME thing as the old fact (same subject, same predicate, same value). Different wording is fine as long as the meaning is identical (e.g. "the user's pet is Salem" vs "the user has a pet named Salem").
+- "contradicts": the new fact is about the SAME subject + predicate as the old fact but with a DIFFERENT value (e.g. lives in Austin vs. lives in Ocala; favorite color is blue vs. favorite color is green; pet is Salem vs. pet is Whiskers). The new fact REPLACES the old.
+- "extends": the new fact adds to or refines the old fact without contradicting it (e.g. user has a cat -> user has a cat named Whiskers).
+- "unrelated": the facts are about different subjects/predicates entirely.
+
+Output JSON only:
+{{"relation":"duplicate|contradicts|extends|unrelated","reason":"short"}}
+"""
+
+    def classify_fact_relation(self, new_fact: str, old_fact: str) -> str:
+        prompt = self._FACT_RELATION_PROMPT.format(old=old_fact, new=new_fact)
+        try:
+            raw = self.route_model.generate(
+                prompt,
+                options={"num_predict": 60, "temperature": 0.0, "top_p": 0.9},
+                timeout=30,
+                allow_empty=True,
+            )
+        except Exception:
+            return "unrelated"
+        if not raw:
+            return "unrelated"
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return "unrelated"
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return "unrelated"
+        rel = str(data.get("relation", "")).strip().lower()
+        if rel in {"duplicate", "contradicts", "extends", "unrelated"}:
+            return rel
+        return "unrelated"
+
     def persist_user_facts(self, message: str, state: dict | None = None) -> dict:
         """Extract any speaker-facts from the message and write them to the
-        identity-scoped memory store. Returns {"stored": [...], "already_known": [...]}.
-        already_known entries are facts whose semantic neighbour was already
-        present in the speaker's namespace (duplicate)."""
-        result = {"stored": [], "already_known": []}
+        identity-scoped memory store. Returns
+        {"stored": [...], "already_known": [...], "conflicts": [...]}.
+        conflicts are NEW facts that contradict an existing one — they are
+        NOT written; the caller must resolve via a confirmation flow."""
+        result = {"stored": [], "already_known": [], "conflicts": []}
         if not self.memory_store:
             return result
         facts = self.extract_user_facts(message)
@@ -3210,12 +3271,49 @@ User message:
         unidentified_face_ref = None if identity else self._unidentified_face_ref(state)
         for fact in facts:
             try:
+                # Single LLM-arbitrated path: pull the top-1 nearest neighbour
+                # in the speaker's namespace within a wide distance band, and
+                # let the LLM classify the relation (duplicate / contradicts /
+                # extends / unrelated). Distance-only thresholds can't tell
+                # blue from green when only one token differs.
+                candidates = self.memory_store.find_conflict_candidates(
+                    fact, identity=identity, distance_min=0.0, distance_max=0.7, top_k=1,
+                )
+                relation = None
+                old = None
+                if candidates:
+                    old = candidates[0]
+                    relation = self.classify_fact_relation(fact, old["content"])
+                if relation == "contradicts" and old is not None:
+                    result["conflicts"].append({
+                        "new_fact": fact,
+                        "old_fact": old["content"],
+                        "old_id": old["id"],
+                        "identity": identity,
+                        "unidentified_face_ref": unidentified_face_ref,
+                        "source_message": message,
+                    })
+                    continue
+                if relation == "duplicate" and old is not None:
+                    result["already_known"].append({
+                        "id": old["id"],
+                        "identity": old["identity"],
+                        "content": old["content"],
+                        "category": old.get("category"),
+                        "source_message": old.get("source_message"),
+                        "created_at": old.get("created_at"),
+                    })
+                    continue
+                # extends or unrelated → write the new fact. Use a tight
+                # in-store duplicate guard (≤ 0.05) as a final safety net
+                # against true exact-string duplicates the LLM disagreed with.
                 res = self.memory_store.add(
                     fact,
                     identity=identity,
                     unidentified_face_ref=unidentified_face_ref,
                     category="fact",
                     source_message=message,
+                    duplicate_distance=0.05,
                 )
                 if not res.get("ok"):
                     continue
