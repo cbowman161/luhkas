@@ -151,10 +151,17 @@ Output strict JSON: {"topic": <topic_noun_or_none>, "aspect": <aspect_noun_or_no
 - "topic" is a SINGULAR LOWERCASE one-word noun for what the user is asking
   about. Use the most natural common noun. Some examples (not an exhaustive
   list): cpu, memory, gpu, disk, uptime, os, kernel, hostname, python,
-  process, network, port, service, temperature, fan, user, login, log,
+  process, network, port, service, temperature, fan, log,
   package, time, timezone, locale, drive, partition, mount, volume, ip,
   route, dns, firewall, battery, bluetooth, wifi, audio, usb, pci, sensor,
   cgroup, namespace, swap, gpu, nvidia, vault, scout.
+
+  IDENTITY questions are NEVER a system-state topic. "who am I", "what is
+  my name", "do you know me", "who's there", "do you recognize me", "am I
+  Chris", "what do you know about me" — these all ask about the assistant's
+  recognition of the SPEAKER, which is handled by self_question, not by
+  learned capabilities. Always return {"topic": "none", "aspect": "none"}
+  for these.
 
   IMPORTANT: if the user names a specific Linux command/tool in their
   message (e.g. "show me iotop output", "run lsof", "use nmap to scan",
@@ -195,6 +202,21 @@ INPUT: "what is my favorite color"
 OUTPUT: {"topic": "none", "aspect": "none"}
 
 INPUT: "remember that my code is 4321"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "who am I"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "what is my name"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "do you know me"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "do you recognize me"
+OUTPUT: {"topic": "none", "aspect": "none"}
+
+INPUT: "am I Chris"
 OUTPUT: {"topic": "none", "aspect": "none"}
 
 INPUT: "what's eating my disk"

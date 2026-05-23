@@ -1673,13 +1673,32 @@ class ScoutVaultBridge:
             )
 
         if route["route"] == "direction" and introduced_name:
-            return self.generate_response(
-                "identity_binding_blocked", message, state,
-                {"introduced_name": introduced_name,
-                 "reason": "no visible person or face is available to bind",
-                 "identity_was_saved": False},
-                max_tokens=120,
-            )
+            # No visible face to bind to. Still store the name as a regular
+            # speaker-fact in the current identity's namespace so "what is my
+            # name" recall works. Face-bind can happen later when the user
+            # is in front of the camera.
+            fact = f"the user's name is {introduced_name}"
+            stored = False
+            if self.memory_store:
+                try:
+                    res = self.memory_store.add(
+                        fact,
+                        identity=self.active_identity,
+                        unidentified_face_ref=None if self.active_identity else self._unidentified_face_ref(state),
+                        category="fact",
+                        source_message=message,
+                    )
+                    stored = bool(res.get("ok"))
+                    actions.append({
+                        "name": "store_name_fact",
+                        "ok": stored,
+                        "result": {"name": introduced_name, "duplicate": res.get("duplicate")},
+                    })
+                except Exception as exc:
+                    print(f"[memory_store] name fact write failed: {exc}")
+            if stored:
+                return f"Got it, {introduced_name}. I'll remember your name. I'll bind it to your face the next time you're in front of the camera."
+            return f"Got it, {introduced_name}."
 
         standalone_confirmation = _standalone_confirmation_answer(message)
         if standalone_confirmation is not None:
@@ -2673,7 +2692,20 @@ Do not mention provenance unless asked.
             )
         if route_name == "user_identity":
             identity = self.active_identity
-            return f"You are {identity}." if identity else "I don't know who you are yet."
+            if identity:
+                return f"You are {identity}."
+            # No face-recognized identity yet — fall back to a stored name
+            # fact ("the user's name is Chris") in MemoryStore so the speaker
+            # can still get a useful answer.
+            recalled = self.recall_user_facts("the user's name", top_k=3)
+            for r in recalled:
+                content = (r.get("content") or "").lower()
+                if "the user's name is " in content or "the user name is " in content:
+                    name = (r.get("content") or "")
+                    name = name.split(" is ", 1)[-1].strip().rstrip(".")
+                    if name:
+                        return f"You told me your name is {name}, but I haven't matched a face yet. Step in front of the camera to bind it."
+            return "I don't know who you are yet. Tell me your name and I'll remember it."
         if route_name == "capabilities" and _asks_skill_inventory(text):
             return self._registered_skills_answer()
         if route_name == "capabilities" and _asks_capability_inventory(text):
@@ -3170,6 +3202,10 @@ Rules:
 - Output JSON list only. No markdown, no prose.
 
 Examples:
+- "my name is Chris"               -> ["the user's name is Chris"]
+- "I'm Chris"                       -> ["the user's name is Chris"]
+- "I am Chris"                      -> ["the user's name is Chris"]
+- "call me Chris"                   -> ["the user's name is Chris"]
 - "my pet's name is Salem"        -> ["the user's pet is named Salem"]
 - "I live in Austin"               -> ["the user lives in Austin"]
 - "my favorite color is blue"      -> ["the user's favorite color is blue"]
@@ -3179,6 +3215,8 @@ Examples:
 - "I have a cat"                   -> ["the user has a cat"]
 - "what's my pet's name"           -> []
 - "what's my favorite color"       -> []
+- "what's my name"                 -> []
+- "who am I"                       -> []
 - "good morning"                   -> []
 - "what's the capital of japan"    -> []
 - "I work as an SRE and I have a cat named Whiskers"
@@ -3193,6 +3231,12 @@ User message:
         Returns a (possibly empty) list of third-person fact sentences."""
         if not message or not message.strip():
             return []
+        # Deterministic fast-path: name introductions ("my name is X", "I'm X",
+        # "I am X"). The 3B extractor model has been unreliable on these and
+        # they're unambiguous enough to grab directly.
+        introduced = _extract_introduction_name(message)
+        if introduced:
+            return [f"the user's name is {introduced}"]
         prompt = self._FACT_EXTRACTOR_PROMPT.format(message=message.strip())
         try:
             raw = self.route_model.generate(
