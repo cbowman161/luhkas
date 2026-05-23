@@ -2818,8 +2818,37 @@ Do not mention provenance unless asked.
         return self.response_composer.varied_fallback(fallback, recent)
 
     def _assistant_identity_answer(self, state: dict | None = None, message: str = "") -> str:
+        """LLM-compose the assistant identity answer so personality, mood,
+        and style directives actually apply. Falls back to a short factual
+        statement if the chat model returns nothing usable."""
+        state = state or {}
         name = self.identity_profile.get("name") or "Luhkas"
-        return _assistant_intro_statement(name)
+        role = self.identity_profile.get("role") or ""
+        prompt = f"""You are an AI assistant named {name}.
+{("Your role: " + role + ".") if role else ""}
+The user asked: "{message or 'Who are you?'}"
+
+Reply in FIRST PERSON only -- start with "I am {name}" or "I'm {name}".
+1-2 short sentences. Describe yourself, not the user.
+
+STRICT WORD RULES:
+- Do NOT use the word "you", "you're", "you are", "your", or "yours" anywhere.
+- Do NOT mention your creator, body, hardware, node, scout, vault, or any user's name.
+- No emojis. No trailing offer ("how can I help" etc).
+"""
+        try:
+            reply = self.generate_guarded_response(
+                "assistant_identity",
+                prompt,
+                state,
+                options={"num_predict": 60, "temperature": 0.6, "top_p": 0.9},
+            )
+        except Exception:
+            reply = None
+        if reply and isinstance(reply, str) and reply.strip():
+            return reply.strip()
+        # Fallback: terse factual statement if LLM unavailable.
+        return f"I'm {name}."
 
     def _assistant_status_answer(
         self,
