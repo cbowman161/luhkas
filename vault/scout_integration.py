@@ -3740,10 +3740,17 @@ Output JSON only:
 
     def maybe_handle_recall(self, message: str) -> str | None:
         """Deterministic recall for "do you know/remember my X" and "what's my
-        X" — looks up matching speaker-fact in MemoryStore and answers from
-        it directly. Returns the canned response string, or None when the
-        pattern doesn't match or no fact exists (LLM-composed answer takes
-        over in the no-match case)."""
+        X" — looks up matching speaker-fact in MemoryStore.
+
+        Returns:
+          - the canned response string when a matching fact is found (with
+            provenance populated).
+          - "I don't have that stored." when the pattern matches but no
+            matching fact exists. Critical for preventing the LLM from
+            confabulating ("what's my favorite hobby" -> "Your favorite
+            hobby is fishing" from prior knowledge).
+          - None when the pattern doesn't match (LLM-composed answer takes
+            over)."""
         if not self.memory_store:
             return None
         m = self._RECALL_QUESTION_PATTERN.match(message or "")
@@ -3771,8 +3778,22 @@ Output JSON only:
                 phrase = self._third_to_second_person(cand.get("content") or "").rstrip(".")
                 if phrase:
                     phrase = phrase[0].upper() + phrase[1:]
+                # Populate provenance: this turn DID consult memory.
+                self._current_memory_sources = {
+                    "recalled_facts": [cand.get("content")],
+                    "recent_chat_turns": 0,
+                    "identity_scope": identity,
+                }
                 return f"{phrase}."
-        return None
+        # Pattern matched (user asked about a specific speaker attribute)
+        # but no fact about that attribute exists. Answer deterministically
+        # rather than letting the LLM confabulate.
+        self._current_memory_sources = {
+            "recalled_facts": [],
+            "recent_chat_turns": 0,
+            "identity_scope": identity,
+        }
+        return "I don't have that stored."
 
     def maybe_handle_forget(self, message: str) -> str | None:
         """If the user asks to forget/delete a stored fact, find the best
