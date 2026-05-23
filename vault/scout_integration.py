@@ -452,6 +452,14 @@ class ScoutVaultBridge:
             print(f"[memory_store] disabled: {exc}")
             self.embed_model = None
             self.memory_store = None
+        # Seed the "assistant" identity bucket from identity_profile +
+        # self/identity.json so recall about Luhkas itself goes through the
+        # same vector path as recall about users. Duplicate guard prevents
+        # bloat on repeated startups.
+        try:
+            self._seed_assistant_memory()
+        except Exception as exc:
+            print(f"[memory_store] assistant seed failed: {exc}")
 
     def capabilities(self):
         scout_capabilities = self.scout_node_capabilities()
@@ -2819,30 +2827,59 @@ Do not mention provenance unless asked.
 
     def _assistant_identity_answer(self, state: dict | None = None, message: str = "") -> str:
         """LLM-compose the assistant identity answer so personality, mood,
-        and style directives actually apply. Falls back to a short factual
-        statement if the chat model returns nothing usable."""
+        and style directives actually apply. Pulls facts about itself from
+        the assistant memory bucket (seeded from identity_profile +
+        self/identity.json on bridge init) so recall is consistent with user
+        facts. Falls back to a short factual statement if the chat model
+        returns nothing usable."""
         state = state or {}
         name = self.identity_profile.get("name") or "Luhkas"
         role = self.identity_profile.get("role") or ""
+        # Pull assistant-identity facts from MemoryStore. We rewrite them to
+        # first-person here so the LLM doesn't have to map "the assistant"
+        # to itself.
+        recalled = self.recall_assistant_facts(message or "who are you", top_k=6)
+        assistant_facts: list[str] = []
+        for r in recalled:
+            content = (r.get("content") or "").strip()
+            if not content:
+                continue
+            first_person = re.sub(r"\bthe assistant's\s+", "my ", content, flags=re.I)
+            first_person = re.sub(r"\bthe assistant\s+", "I ", first_person, flags=re.I)
+            assistant_facts.append(first_person)
+        # Track for provenance.
+        self._current_assistant_facts = assistant_facts
+        facts_block = "\n".join(f"- {f}" for f in assistant_facts) if assistant_facts else "(no stored facts)"
         prompt = f"""You are an AI assistant named {name}.
 {("Your role: " + role + ".") if role else ""}
 The user asked: "{message or 'Who are you?'}"
 
+Facts you know about yourself (from your memory):
+{facts_block}
+
 Reply in FIRST PERSON only -- start with "I am {name}" or "I'm {name}".
-1-2 short sentences. Describe yourself, not the user.
+1-2 short sentences. Draw on the facts above for content. Describe yourself, not the user.
 
 STRICT WORD RULES:
 - Do NOT use the word "you", "you're", "you are", "your", or "yours" anywhere.
-- Do NOT mention your creator, body, hardware, node, scout, vault, or any user's name.
+- Do NOT mention your creator, body, hardware, node, scout, vault, or any user's name unless it appears in the facts above.
 - No emojis. No trailing offer ("how can I help" etc).
 """
+        # Call the chat model directly rather than going through
+        # generate_guarded_response/response_composer, which wraps the
+        # prompt in its own scaffolding that drowns out the strict word
+        # rules. We still run the identity violation validator manually.
+        reply = None
         try:
-            reply = self.generate_guarded_response(
-                "assistant_identity",
+            raw = self.chat_model.generate(
                 prompt,
-                state,
-                options={"num_predict": 60, "temperature": 0.6, "top_p": 0.9},
+                options={"num_predict": 220, "temperature": 0.55, "top_p": 0.9},
+                think=False,
+                timeout=30,
             )
+            raw = _sanitize_generated_response(str(raw or "")).strip()
+            if raw and not _assistant_identity_response_violation(raw):
+                reply = raw
         except Exception:
             reply = None
         if reply and isinstance(reply, str) and reply.strip():
@@ -3588,6 +3625,81 @@ Output JSON only:
             return self.memory_store.search(query, identity=identity, top_k=top_k)
         except Exception as exc:
             print(f"[memory_store] search failed: {exc}")
+            return []
+
+    ASSISTANT_MEMORY_IDENTITY = "assistant"
+
+    def _seed_assistant_memory(self) -> None:
+        """Seed the assistant identity bucket from identity_profile +
+        self/identity.json. Idempotent: the store's duplicate guard collapses
+        re-runs.
+
+        identity_profile.json stays the canonical source for structured
+        access (name, role, creator); MemoryStore is a semantic-recall view."""
+        if not self.memory_store:
+            return
+        seeds: list[str] = []
+        prof = self.identity_profile or {}
+        name = (prof.get("name") or "").strip()
+        if name:
+            seeds.append(f"the assistant's name is {name}")
+        role = (prof.get("role") or "").strip()
+        if role:
+            seeds.append(f"the assistant's role is {role}")
+        creator = (prof.get("creator") or "").strip()
+        if creator:
+            seeds.append(f"the assistant was created by {creator}")
+        body = (prof.get("body") or "").strip()
+        if body:
+            seeds.append(f"the assistant's body is {body}")
+        primary_user = (prof.get("primary_user") or "").strip()
+        if primary_user:
+            seeds.append(f"the assistant's primary user is {primary_user}")
+        for trait in prof.get("personality") or []:
+            t = str(trait or "").strip()
+            if t:
+                seeds.append(f"the assistant's personality is {t}")
+        for b in prof.get("boundaries") or []:
+            bt = str(b or "").strip()
+            if bt:
+                seeds.append(f"the assistant follows the boundary: {bt}")
+        # self/identity.json -- pre-authored fact list
+        try:
+            self_identity_path = self.self_dir / "identity.json"
+            if self_identity_path.exists():
+                data = self._load_json_file(self_identity_path)
+                if isinstance(data, dict):
+                    for fact in data.get("facts") or []:
+                        ft = str(fact or "").strip()
+                        if ft:
+                            seeds.append(ft)
+        except Exception:
+            pass
+        for fact in seeds:
+            try:
+                self.memory_store.add(
+                    fact,
+                    identity=self.ASSISTANT_MEMORY_IDENTITY,
+                    category="identity",
+                    source_message="bridge_seed",
+                    duplicate_distance=0.15,
+                )
+            except Exception:
+                pass
+
+    def recall_assistant_facts(self, query: str, top_k: int = 6) -> list[dict]:
+        """Pull facts about the assistant itself (name, role, personality,
+        boundaries, etc.) from the assistant identity bucket. Used by
+        _assistant_identity_answer so identity questions get a recall-driven
+        answer rather than a canned one."""
+        if not self.memory_store:
+            return []
+        try:
+            return self.memory_store.search(
+                query, identity=self.ASSISTANT_MEMORY_IDENTITY, top_k=top_k,
+            )
+        except Exception as exc:
+            print(f"[memory_store] assistant search failed: {exc}")
             return []
 
     _FORGET_PATTERN = re.compile(
@@ -5117,12 +5229,12 @@ def _assistant_intro_statement(name: str | None = None) -> str:
 
 
 def _assistant_identity_response_violation(text: str) -> bool:
-    lowered = str(text or "").casefold()
-    if "chris" in lowered or "scout" in lowered:
-        return True
-    if re.search(r"\byou(?:'re| are| are not| aren't|re not)\b", lowered):
-        return True
-    if re.search(r"\bcreator|built me|made me|body|node\b", lowered):
+    """Reject only the unambiguous failure mode: the LLM addressing the
+    USER as the assistant ("you are Luhkas"). Other content (creator name,
+    body, node references) is now allowed because the assistant identity
+    answer composes from MemoryStore-backed facts that explicitly include
+    those — blocking them would force the LLM to lie or refuse."""
+    if re.search(r"\byou(?:'re| are| are not| aren't|re not)\b", str(text or "").casefold()):
         return True
     return False
 
