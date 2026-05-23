@@ -3301,12 +3301,29 @@ Output JSON only:
 {{"relation":"duplicate|contradicts|extends|unrelated","reason":"short"}}
 """
 
+    _FACT_RELATION_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "relation": {
+                "type": "string",
+                "enum": ["duplicate", "contradicts", "extends", "unrelated"],
+            },
+            "reason": {"type": "string"},
+        },
+        "required": ["relation"],
+    }
+
     def classify_fact_relation(self, new_fact: str, old_fact: str) -> str:
+        """Use the chat model (qwen3:8b) for this — the smaller router model
+        was flickering between contradicts/duplicate/extends on near-identical
+        embeddings, and getting this wrong silently loses or corrupts memory.
+        Structured-output mode prevents free-form regressions."""
         prompt = self._FACT_RELATION_PROMPT.format(old=old_fact, new=new_fact)
         try:
-            raw = self.route_model.generate(
+            raw = self.chat_model.generate(
                 prompt,
                 options={"num_predict": 60, "temperature": 0.0, "top_p": 0.9},
+                response_format=self._FACT_RELATION_SCHEMA,
                 timeout=30,
                 allow_empty=True,
             )
@@ -5596,7 +5613,12 @@ def _extract_direct_response_lesson(message: str, recent_turns: list[dict] | Non
     elif "route" in lowered:
         scope = "routing"
         applies_when = "future route decisions"
-    avoid = text
+    # `avoid` must NOT be the user's raw correction text — the small chat
+    # model can read it as content and parrot it back as an answer. We leave
+    # avoid empty in the general case (the sanitizer that injects lessons
+    # into prompts only uses `prefer` anyway). The special-case branches
+    # below set both fields to proper directive strings when they fire.
+    avoid = ""
     prefer = "Follow the user's correction precisely and limit the answer to the requested scope."
     if "tracker" in lowered and ("don't" in lowered or "do not" in lowered):
         avoid = "Do not include tracker memory/details in visual answers unless the user asks for tracker data."
