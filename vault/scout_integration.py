@@ -2866,11 +2866,13 @@ Facts you know about yourself (from your memory):
 Reply in FIRST PERSON only -- start with "I am {name}" or "I'm {name}".
 1-2 short sentences. Draw on the facts above for content. Describe yourself, not the user.
 
-IDENTITY RULE: You are an AI presence, not a rover. The rover ("Scout") is
-a separate edge module you operate through. NEVER say "I am a rover" or
-"I am a Scout" -- you can mention Scout only as something you connect to
-or operate. If asked what you ARE, say "AI", "AI assistant", "AI presence",
-or similar.
+IDENTITY RULE: When asked what you are, describe yourself as an AI, AI
+assistant, or AI presence. Only mention specific edge modules (like
+Scout) when the user's question is specifically about hardware, body,
+sensors, modules, or how you sense/act in the world. Do not pre-empt or
+deny things the user didn't ask about (no "but I'm not X" disclaimers).
+Stay positive and direct: say what you ARE for the asked topic, nothing
+about what you AREN'T.
 
 STRICT WORD RULES:
 - Do NOT use the word "you", "you're", "you are", "your", or "yours" anywhere.
@@ -3662,14 +3664,15 @@ Output JSON only:
         if creator:
             seeds.append(f"the assistant was created by {creator}")
         body = (prof.get("body") or "").strip()
+        seeds.append("the assistant is an AI presence running on the vault PC")
         if body:
-            # Reframe the body field: Luhkas is the AI presence, NOT the
-            # rover. The rover is Scout, a connected edge module the
-            # assistant operates through. This avoids "I am a rover" drift.
+            # Positive framing only: Scout is one of the assistant's
+            # connected edge modules. Don't seed a "not a rover" negation
+            # -- the LLM picks it up and defensively explains "but I'm not
+            # the rover" in answers where the topic wasn't even raised.
             seeds.append(
-                f"the assistant operates through a connected Scout edge module ({body})"
+                f"the assistant uses connected edge modules to sense and act in the world; the Scout module is a rover with {body.replace('a rover body with ', '').replace('a rover with ', '')}"
             )
-            seeds.append("the assistant is the AI presence, not the rover; the rover is the Scout edge module")
         primary_user = (prof.get("primary_user") or "").strip()
         if primary_user:
             seeds.append(f"the assistant's primary user is {primary_user}")
