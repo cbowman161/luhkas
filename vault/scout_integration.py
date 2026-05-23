@@ -1625,6 +1625,9 @@ class ScoutVaultBridge:
                 "routing_error", message, state, {"route": route}, max_tokens=100
             )
 
+        # Reset per-turn transient sources so provenance for this turn doesn't
+        # carry recall results from a prior turn that bypassed answer_with_context.
+        self._current_memory_sources = {"recalled_facts": [], "recent_chat_turns": 0, "identity_scope": (self.active_identity or "unknown")}
         persist_result = {"stored": [], "already_known": [], "conflicts": []}
         if route.get("route") in {"general_question", "direction"}:
             persist_result = self.persist_user_facts(message, state)
@@ -3569,7 +3572,11 @@ Output JSON only:
         recalled_facts = [r["content"] for r in self.recall_user_facts(message, top_k=5)]
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
-        recent_chat = self._recent_chat_for_recall(limit=6)
+        # Only inject recent_chat as a fallback when memory has nothing for
+        # this query. Otherwise it can leak rejected-conflict statements
+        # ("I work as an architect" then "no, keep teacher" -> LLM still
+        # sees the architect statement and tends to use it).
+        recent_chat = self._recent_chat_for_recall(limit=6) if not recalled_facts else []
         # Annotate the running answer with the sources we consulted so the
         # outer provenance builder can surface them deterministically.
         self._current_memory_sources = {
@@ -3598,8 +3605,8 @@ Context:
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
 For recall about the SPEAKER (their name, possessions, preferences, plans):
-  1. Check recent_chat for what the speaker said in this conversation — that is the freshest source and wins over older memory if they disagree.
-  2. Then check remembered_user_facts for older stored facts.
+  1. remembered_user_facts is the AUTHORITATIVE source. Always use its values verbatim when it has anything relevant; never override it with another value.
+  2. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
   3. If neither has the information being asked, say plainly "I don't have that stored." Do NOT guess or fabricate a value.
 Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.

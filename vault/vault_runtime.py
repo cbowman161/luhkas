@@ -1122,7 +1122,12 @@ class VaultRuntime:
 
         - affirm → replace the old fact with the new fact in the speaker's namespace.
         - deny   → discard the new fact, keep the old one.
-        - anything else → clear pending and fall through.
+        - anything else → leave pending alive (TTL handles cleanup) and let
+          the message route normally. We DON'T clear on neutral messages
+          because the user might say something fact-related between the
+          conflict prompt and their decision — clearing would silently
+          forget the open question. The TTL on _set_pending caps how long
+          we keep it.
         """
         pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "memory_update_confirmation":
@@ -1154,9 +1159,9 @@ class VaultRuntime:
             })
 
         if not _is_affirmative(message):
-            # Treat anything else as backing out — don't risk silently
-            # rewriting memory on an ambiguous reply.
-            self._clear_pending()
+            # Leave pending alive; let the message route normally so the user
+            # can talk about something else without losing the open question.
+            # TTL on the pending will reclaim it if abandoned.
             return None
 
         result = store.replace(
