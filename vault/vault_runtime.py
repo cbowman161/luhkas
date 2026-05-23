@@ -278,7 +278,7 @@ class VaultRuntime:
                 "active_task_id": self.active_task_id,
             }
 
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
 
         if isinstance(pending, dict) and pending.get("type") == "learned_capability_confirmation":
             learned_flow = self._handle_learned_capability_confirmation(user_input, node_id)
@@ -423,7 +423,7 @@ class VaultRuntime:
         # Vision short-circuit: if a previous turn left us in
         # vision_full_analysis_confirmation, a yes here re-routes through
         # scout WITH force_full_vision so the heavy vision LLM runs.
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         force_full_vision = False
         if isinstance(pending, dict) and pending.get("type") == "vision_full_analysis_confirmation":
             if _is_affirmative(message):
@@ -531,7 +531,7 @@ class VaultRuntime:
         if memory_flow is not None:
             return memory_flow
 
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if pending and pending.get("type") in {
             "existing_skill",
             "modify_skill_details",
@@ -855,7 +855,15 @@ class VaultRuntime:
             self.learned_capabilities = engine
         return engine
 
-    def _set_pending(self, value: dict | None) -> None:
+    PENDING_TTL_SECONDS = 300  # 5 minutes — abandoned confirmations auto-expire
+
+    def _set_pending(self, value: dict | None, node_id: str | None = None) -> None:
+        if isinstance(value, dict):
+            # Tag with owner + TTL so abandoned confirmations can't trap
+            # other sessions or linger forever.
+            value = dict(value)
+            value.setdefault("_node_id", node_id or value.get("node_id"))
+            value["_expires_at"] = time.time() + self.PENDING_TTL_SECONDS
         if hasattr(self.blackboard, "set_pending_decision"):
             self.blackboard.set_pending_decision(value)
         else:
@@ -866,6 +874,26 @@ class VaultRuntime:
             self.blackboard.clear_pending_decision()
         else:
             self.blackboard.pending = None
+
+    def _get_pending(self, node_id: str | None = None) -> dict | None:
+        """Read pending decision scoped to a node. Returns None if the
+        pending was set by a different node OR if it has expired (in which
+        case the expired pending is cleared as a side-effect).
+
+        Pass node_id=None to bypass node scoping (still respects TTL) -- used
+        by background sweeps that need to see the raw state."""
+        raw = self.blackboard.get_pending_decision() if hasattr(self.blackboard, "get_pending_decision") else getattr(self.blackboard, "pending", None)
+        if not isinstance(raw, dict):
+            return raw
+        expires_at = raw.get("_expires_at")
+        if expires_at is not None and time.time() > expires_at:
+            self._clear_pending()
+            return None
+        if node_id is not None:
+            owner = raw.get("_node_id")
+            if owner is not None and owner != node_id:
+                return None
+        return raw
 
     def _learned_capability_pending_update(self) -> dict | None:
         engine = self._learned_engine()
@@ -981,7 +1009,7 @@ class VaultRuntime:
         )
 
     def _handle_audit_merge_confirmation(self, message: str, node_id: str) -> dict | None:
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "audit_merge_confirmation":
             return None
         queue = list(pending.get("queue") or [])
@@ -1096,7 +1124,7 @@ class VaultRuntime:
         - deny   → discard the new fact, keep the old one.
         - anything else → clear pending and fall through.
         """
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "memory_update_confirmation":
             return None
         conflict = pending.get("conflict") or {}
@@ -1168,7 +1196,7 @@ class VaultRuntime:
         - 'no' / denial → clear pending, tell user nothing was installed.
         - any other input → clear pending and fall through.
         """
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "learned_install_confirmation":
             return None
         engine = self._learned_engine()
@@ -1246,7 +1274,7 @@ class VaultRuntime:
         alias is removed and a new propose flow is started using the
         correction text. Any other message clears the review state and falls
         through to normal handling."""
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "learned_execution_review":
             return None
 
@@ -1359,7 +1387,7 @@ class VaultRuntime:
         })
 
     def _handle_learned_capability_confirmation(self, message: str, node_id: str) -> dict | None:
-        pending = self.blackboard.get_pending_decision()
+        pending = self._get_pending(node_id)
         if not isinstance(pending, dict) or pending.get("type") != "learned_capability_confirmation":
             return None
         engine = self._learned_engine()

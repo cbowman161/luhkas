@@ -807,6 +807,25 @@ class ScoutVaultBridge:
             return data
         return []
 
+    @staticmethod
+    def _format_response_lessons_for_prompt(lessons):
+        """Convert raw lessons into safe directive strings for LLM prompts.
+
+        Background: the lesson-recorder stores the user's correction verbatim
+        in the `avoid` field. The small chat model can confuse that for
+        content and parrot it back ("what's my name" -> "I don't have a pet").
+        We strip those raw user phrases and keep only the `prefer` directive
+        (which is positively-framed LLM-authored guidance)."""
+        out = []
+        for lsn in lessons or []:
+            if not isinstance(lsn, dict):
+                continue
+            prefer = str(lsn.get("prefer") or "").strip()
+            scope = str(lsn.get("scope") or "general").strip()
+            if prefer:
+                out.append(f"[{scope}] {prefer}")
+        return out
+
     def response_settings(self):
         path = self.self_dir / "response_settings.json"
         data = self._load_json_file(path)
@@ -3441,7 +3460,7 @@ User: {message}
 Context:
 {json.dumps({
     "identity_context": identity_context,
-    "response_lessons": response_context.get("response_lessons", [])[-5:],
+    "response_guidance": self._format_response_lessons_for_prompt(response_context.get("response_lessons", []))[-5:],
     "conversation_context": conversation_context,
     "tracking_available": bool(state.get("ok")),
     "active_identity": active_identity_context or "unknown",
