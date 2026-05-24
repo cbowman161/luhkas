@@ -1637,6 +1637,19 @@ class ScoutVaultBridge:
         # carry recall results from a prior turn that bypassed answer_with_context.
         self._current_memory_sources = {"recalled_facts": [], "recent_chat_turns": 0, "identity_scope": (self.active_identity or "unknown")}
 
+        # Translation short-circuit: "translate X to Spanish", "how do you
+        # say X in French", etc. Runs before persist so the source text isn't
+        # extracted as a speaker-fact ("how do you say I live in Boston in
+        # Spanish" would otherwise store 'the user lives in Boston').
+        # Routes that ask for translation can land on general_question,
+        # direction, or even analyze_vision (router occasionally mistakes
+        # "what's X in Spanish" for a visual question).
+        if route.get("route") in {"general_question", "direction", "analyze_vision"}:
+            trans_reply = self.maybe_handle_translation(message)
+            if trans_reply is not None:
+                actions.append({"name": "translate", "ok": True, "result": trans_reply[:200]})
+                return trans_reply
+
         # Forget short-circuit: "forget my X", "delete my X", etc. Runs before
         # persist so the request itself isn't extracted as a new fact.
         if route.get("route") in {"general_question", "direction"}:
@@ -3759,6 +3772,101 @@ Output JSON only:
     # my X". The chat LLM has been unreliable on the yes/no form ("do you
     # know my name" → "I don't know your name" even with name in
     # remembered_user_facts), so we handle these deterministically.
+    # Language aliases for the translation handler. Add more here as needed.
+    _TRANSLATE_LANGUAGES = {
+        "spanish": "Spanish",     "spanish.": "Spanish",
+        "español": "Spanish",     "espanol": "Spanish",
+        "french": "French",        "français": "French",
+        "german": "German",        "deutsch": "German",
+        "italian": "Italian",      "italiano": "Italian",
+        "portuguese": "Portuguese","português": "Portuguese",
+        "japanese": "Japanese",    "japonés": "Japanese",
+        "chinese": "Chinese",      "mandarin": "Chinese",
+        "korean": "Korean",        "russian": "Russian",
+        "dutch": "Dutch",          "swedish": "Swedish",
+    }
+
+    # Translation request patterns. Try in order; first match wins.
+    _TRANSLATE_PATTERNS = [
+        # "translate <src> (to|into) <lang>"
+        re.compile(r"^\s*translate\s+(?P<src>.+?)\s+(?:to|into)\s+(?P<lang>[A-Za-zÀ-ÿ]+)\s*[.!?]?\s*$", re.I),
+        # "translate (to|into) <lang>: <src>"  or  "translate (to|into) <lang>, <src>"
+        re.compile(r"^\s*translate\s+(?:to|into)\s+(?P<lang>[A-Za-zÀ-ÿ]+)\s*[:,]\s*(?P<src>.+?)\s*[.!?]?\s*$", re.I),
+        # "how do/can you say <src> in <lang>"
+        re.compile(r"^\s*how\s+(?:do|can)\s+(?:you|i)\s+say\s+(?P<src>.+?)\s+in\s+(?P<lang>[A-Za-zÀ-ÿ]+)\s*[.!?]?\s*$", re.I),
+        # "say <src> in <lang>"
+        re.compile(r"^\s*say\s+(?P<src>.+?)\s+in\s+(?P<lang>[A-Za-zÀ-ÿ]+)\s*[.!?]?\s*$", re.I),
+        # "what's/what is <src> in <lang>"
+        re.compile(r"^\s*what(?:'?s| is)\s+(?P<src>.+?)\s+in\s+(?P<lang>[A-Za-zÀ-ÿ]+)\s*[.!?]?\s*$", re.I),
+        # "<lang> for <src>"  (e.g. "spanish for thank you")
+        re.compile(r"^\s*(?P<lang>[A-Za-zÀ-ÿ]+)\s+(?:word\s+)?for\s+(?P<src>.+?)\s*[.!?]?\s*$", re.I),
+    ]
+
+    def maybe_handle_translation(self, message: str) -> str | None:
+        """Detect translation requests and answer via a tight prompt.
+        Returns the translated string, or None if the message isn't a
+        translation request. Uses chat_model (qwen3:8b) directly with
+        a translate-only prompt — the general_question composer was
+        unreliable on this (one test even routed 'what's X in Spanish'
+        to analyze_vision)."""
+        if not message:
+            return None
+        for pat in self._TRANSLATE_PATTERNS:
+            m = pat.match(message)
+            if not m:
+                continue
+            lang_raw = m.group("lang").strip().lower().rstrip(".")
+            src = m.group("src").strip()
+            # Strip surrounding quotes
+            for q in ('"', "'", "“", "”", "‘", "’"):
+                if src.startswith(q) and src.endswith(q) and len(src) >= 2:
+                    src = src[1:-1].strip()
+            if not src:
+                return None
+            lang_name = self._TRANSLATE_LANGUAGES.get(lang_raw)
+            if not lang_name:
+                # Pattern matched but language unknown — don't claim a handle.
+                return None
+            return self._llm_translate(src, lang_name)
+        return None
+
+    def _llm_translate(self, src: str, target_language: str) -> str:
+        """Call the chat model with a translate-only prompt. Output strips
+        common boilerplate (quotes around the answer, prefixes like
+        'Spanish:')."""
+        prompt = f"""You are a professional {target_language} translator.
+
+Translate the following English text into natural, idiomatic {target_language}.
+Do NOT translate word-for-word — use the phrasing a native {target_language}
+speaker would actually use. For example, "thank you very much" in Spanish
+is "muchas gracias", not "gracias mucho".
+
+Output ONLY the {target_language} translation. No quotes, no preamble,
+no explanation, no English. Just the translation.
+
+English:
+{src}
+
+{target_language}:"""
+        try:
+            raw = self.chat_model.generate(
+                prompt,
+                options={"num_predict": 200, "temperature": 0.3, "top_p": 0.9},
+                think=False,
+                timeout=30,
+            )
+        except Exception as exc:
+            return f"Translation failed: {exc}"
+        text = _sanitize_generated_response(str(raw or "")).strip()
+        # Strip "Spanish:" / "Translation:" style prefixes the model
+        # sometimes prepends despite instructions.
+        text = re.sub(rf"^(?:{target_language}\s*[:\-—]\s*|translation\s*[:\-—]\s*)", "", text, flags=re.I)
+        # Strip surrounding quotes
+        for q in ('"', "'", "“", "”", "‘", "’"):
+            if text.startswith(q) and text.endswith(q) and len(text) >= 2:
+                text = text[1:-1].strip()
+        return text or f"I couldn't produce a {target_language} translation."
+
     _RECALL_QUESTION_PATTERN = re.compile(
         r"^\s*(?:hey[, ]+)?(?:do\s+you\s+(?:know|remember|have|recall)\s+|what(?:'?s| is| are)\s+(?:is\s+)?|tell\s+me\s+(?:about\s+)?)"
         r"(?:my\s+)(?P<topic>.+?)\s*[.!?]?\s*$",
