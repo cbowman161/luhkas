@@ -3526,12 +3526,69 @@ Output JSON only:
             return rel
         return "unrelated"
 
+    def _classify_and_route_fact(self, fact: str, identity: str | None,
+                                  unidentified_face_ref: str | None,
+                                  message: str) -> tuple[str, dict] | None:
+        """Per-fact pipeline: candidate search → LLM relation classify →
+        store / mark-known / flag-conflict. Returns (kind, payload) where
+        kind ∈ {'stored', 'already_known', 'conflict'} or None on error.
+        Designed to be safe to run from a thread pool — MemoryStore owns
+        its own threading.Lock for vector ops, and Ollama handles
+        concurrent generate calls."""
+        try:
+            candidates = self.memory_store.find_conflict_candidates(
+                fact, identity=identity, distance_min=0.0, distance_max=0.7, top_k=1,
+            )
+            relation = None
+            old = None
+            if candidates:
+                old = candidates[0]
+                relation = self.classify_fact_relation(fact, old["content"])
+            if relation == "contradicts" and old is not None:
+                return ("conflict", {
+                    "new_fact": fact,
+                    "old_fact": old["content"],
+                    "old_id": old["id"],
+                    "identity": identity,
+                    "unidentified_face_ref": unidentified_face_ref,
+                    "source_message": message,
+                })
+            if relation == "duplicate" and old is not None:
+                return ("already_known", {
+                    "id": old["id"],
+                    "identity": old["identity"],
+                    "content": old["content"],
+                    "category": old.get("category"),
+                    "source_message": old.get("source_message"),
+                    "created_at": old.get("created_at"),
+                })
+            res = self.memory_store.add(
+                fact,
+                identity=identity,
+                unidentified_face_ref=unidentified_face_ref,
+                category="fact",
+                source_message=message,
+                duplicate_distance=0.05,
+            )
+            if not res.get("ok"):
+                return None
+            if res.get("duplicate"):
+                return ("already_known", res["record"])
+            return ("stored", res["record"])
+        except Exception as exc:
+            print(f"[memory_store] write failed: {exc}")
+            return None
+
     def persist_user_facts(self, message: str, state: dict | None = None) -> dict:
         """Extract any speaker-facts from the message and write them to the
         identity-scoped memory store. Returns
         {"stored": [...], "already_known": [...], "conflicts": [...]}.
         conflicts are NEW facts that contradict an existing one — they are
-        NOT written; the caller must resolve via a confirmation flow."""
+        NOT written; the caller must resolve via a confirmation flow.
+
+        Per-fact pipelines (candidate search + LLM relation classify +
+        store) run in PARALLEL when the extractor produces multiple facts.
+        Sequential single-fact path skips the thread overhead."""
         result = {"stored": [], "already_known": [], "conflicts": []}
         if not self.memory_store:
             return result
@@ -3540,60 +3597,30 @@ Output JSON only:
             return result
         identity = self.active_identity
         unidentified_face_ref = None if identity else self._unidentified_face_ref(state)
-        for fact in facts:
-            try:
-                # Single LLM-arbitrated path: pull the top-1 nearest neighbour
-                # in the speaker's namespace within a wide distance band, and
-                # let the LLM classify the relation (duplicate / contradicts /
-                # extends / unrelated). Distance-only thresholds can't tell
-                # blue from green when only one token differs.
-                candidates = self.memory_store.find_conflict_candidates(
-                    fact, identity=identity, distance_min=0.0, distance_max=0.7, top_k=1,
-                )
-                relation = None
-                old = None
-                if candidates:
-                    old = candidates[0]
-                    relation = self.classify_fact_relation(fact, old["content"])
-                if relation == "contradicts" and old is not None:
-                    result["conflicts"].append({
-                        "new_fact": fact,
-                        "old_fact": old["content"],
-                        "old_id": old["id"],
-                        "identity": identity,
-                        "unidentified_face_ref": unidentified_face_ref,
-                        "source_message": message,
-                    })
-                    continue
-                if relation == "duplicate" and old is not None:
-                    result["already_known"].append({
-                        "id": old["id"],
-                        "identity": old["identity"],
-                        "content": old["content"],
-                        "category": old.get("category"),
-                        "source_message": old.get("source_message"),
-                        "created_at": old.get("created_at"),
-                    })
-                    continue
-                # extends or unrelated → write the new fact. Use a tight
-                # in-store duplicate guard (≤ 0.05) as a final safety net
-                # against true exact-string duplicates the LLM disagreed with.
-                res = self.memory_store.add(
-                    fact,
-                    identity=identity,
-                    unidentified_face_ref=unidentified_face_ref,
-                    category="fact",
-                    source_message=message,
-                    duplicate_distance=0.05,
-                )
-                if not res.get("ok"):
-                    continue
-                if res.get("duplicate"):
-                    result["already_known"].append(res["record"])
-                else:
-                    result["stored"].append(res["record"])
-            except Exception as exc:
-                print(f"[memory_store] write failed: {exc}")
+
+        if len(facts) == 1:
+            outcome = self._classify_and_route_fact(facts[0], identity, unidentified_face_ref, message)
+            if outcome:
+                kind, payload = outcome
+                result[kind].append(payload) if kind != "conflict" else result["conflicts"].append(payload)
+            return result
+
+        # Multi-fact: fan out the per-fact pipelines. Each runs an
+        # independent LLM classify call; the bottleneck on the slowest
+        # ~7s "multi-fact extraction" turn was the SECOND classify
+        # waiting for the FIRST to return.
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(len(facts), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            outcomes = list(pool.map(
+                lambda f: self._classify_and_route_fact(f, identity, unidentified_face_ref, message),
+                facts,
+            ))
+        for outcome in outcomes:
+            if not outcome:
+                continue
+            kind, payload = outcome
+            (result["conflicts"] if kind == "conflict" else result[kind]).append(payload)
         return result
 
     @staticmethod
