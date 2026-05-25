@@ -1,10 +1,20 @@
-# Luhkas Scout Runtime Documentation
+# Luhkas Node Runtime Documentation
 
-This is the canonical documentation for `scout_runtime`, the rover-side runtime
-that lives outside `~/hailo-apps`. The vendor Hailo install stays clean; this
-repo owns camera capture, Hailo inference integration, tracking, behavior,
-manual control, robot serial control, telemetry, local memory caches, and rover
-HTTP APIs.
+> **Where the code lives now.** The canonical source is `node/` in the Luhkas
+> monorepo. On a node host (e.g. `luhkas-scout`), the deployed copy is rsynced
+> from vault to `~/luhkas/node/` by `vault/sync_manager.py` (triggered on
+> vault restart and on the `vault-autosync.timer` cadence). The older
+> `~/scout_runtime` directory is legacy/reference only.
+
+This document covers the node-side runtime: camera capture, Hailo inference,
+tracking, behavior, manual control, robot serial control, telemetry, local
+memory caches, and node-side HTTP APIs. The vendor Hailo install
+(`~/hailo-apps`) stays clean; the node runtime activates it at service start.
+
+For the **vault side** (chat, routing, identity, memory, learned capabilities,
+Code Monkey, translation, etc.), see [`vault/VAULT_RUNTIME.md`](../vault/VAULT_RUNTIME.md).
+
+For the project-wide stack overview, see [`STACKS.md`](../STACKS.md).
 
 ## Hardware And Network
 

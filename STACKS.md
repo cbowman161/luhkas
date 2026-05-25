@@ -1,89 +1,131 @@
-# Luhkas Code Stacks
+# Luhkas Project — Code Stacks
 
-## Current Stack
-
-The active stack lives in this repository.
+Luhkas is a distributed robotics brain. The **vault** owns reasoning, memory,
+identity, and orchestration; **nodes** (edge devices like Scout) own sensing
+and actuation. Everything runs locally — no cloud dependency.
 
 ```text
 luhkas/
-  vault/   Brain/runtime code for luhkas-vault
-  node/    Deployable node runtime copied to luhkas-scout and future nodes
+  vault/    Brain runtime for luhkas-vault PC (chat, routing, memory, capabilities, code monkey)
+  node/     Deployable node runtime, copied to luhkas-scout and future nodes
+  scripts/  Bootstrap and admin scripts
+  tests/    Repo-level test harnesses
 ```
 
-`vault/` owns chat, model routing, memory, node registration, guard alert
-routing, Code Monkey orchestration, and the public brain HTTP API on port 7000.
+---
 
-`node/` owns the Scout-side services:
+## Where to read next
 
-- `services/vision_service.py` on port 5000
-- `services/robot_api.py` on port 5001
-- `services/presence_client_service.py` on port 5002
+| Topic | Doc |
+|---|---|
+| Full vault feature reference (routing, memory, identity, capabilities, scout integration, code monkey, translate, etc.) | [`vault/VAULT_RUNTIME.md`](vault/VAULT_RUNTIME.md) |
+| Node-side service map (vision, robot API, presence proxy) | [`node/DOCUMENTATION.md`](node/DOCUMENTATION.md) |
+| Camera node specifics | [`node/camera_node/README.md`](node/camera_node/README.md) |
+| Node config layout | [`node/config/README.md`](node/config/README.md) |
+| Legacy stack notes | [`vault/legacy/README.md`](vault/legacy/README.md) |
 
-Node code is modularized into reusable packages:
+---
 
-- `camera_node`
-- `pantilt_node`
-- `rover_node`
-- `light_node`
-- `luhkas_node`
+## Service ownership
 
-The vault copy of `node/` is the source of truth. Scout runs a synchronized copy
-at `~/luhkas/node`.
+| Owner | Hardware | What it runs |
+|---|---|---|
+| Vault PC (`luhkas-vault`) | RTX 3090, 96GB DDR5 | `vault-runtime.service` (port 7000), `code-monkey.service` (port 8765 localhost), `vault-autosync.timer`, Ollama, LanceDB |
+| Scout (`luhkas-scout`) | Raspberry Pi 5, 16GB RAM, Hailo HAT+ | `scout-vision.service` (port 5000), `scout-robot-api.service` (port 5001), `scout-presence.service` (port 5002) |
 
-## Deployment And Sync
+Edge devices send user input to vault's `POST /presence/message` (or `/ui` for
+the UI client). Vault decides everything: route, memory writes, identity
+adoption, capability dispatch, recipe generation, response composition.
+Nodes are interaction surfaces, not separate personalities.
 
-New nodes are bootstrapped with:
+---
+
+## Node modules
+
+The `node/` runtime is modularized into reusable Python packages, any subset
+of which can run on a given node:
+
+| Module | Purpose |
+|---|---|
+| `camera_node` | Camera capture + Hailo inference + tracking memory |
+| `pantilt_node` | Pan-tilt servo control |
+| `rover_node` | Drive/steering/wheel control via serial |
+| `light_node` | Camera ring-light control |
+| `luhkas_node` | Presence-message proxy that forwards user input to vault |
+
+Each module ships its own systemd unit templates, command definitions, and
+self-test. The presence service collects per-module self-tests at startup and
+sends them to vault on `POST /node/register` + `POST /node/selftest`.
+
+---
+
+## Models (Ollama, vault-side)
+
+| Role | Default | Hot? |
+|---|---|---|
+| `router` | `qwen2.5:3b-instruct` | yes (keep-alive 24h) |
+| `chat` | `qwen3:8b` | yes (keep-alive 24h) |
+| `vision` | `qwen2.5vl:7b` | yes (keep-alive 24h) |
+| `coder` | `qwen3-coder:30b` | no (background) |
+| `fast_coder` | `qwen2.5-coder:14b` | no (background) |
+| `planner` / `reasoner` / `analyst` | `qwen3:30b` | no (background) |
+| `embed` | `bge-m3` | always-loaded |
+
+Configure via env vars (`VAULT_ROUTER_MODEL`, `VAULT_CHAT_MODEL`, etc.) or via
+the `MODEL_ROLES` map in `vault/models.py`. Runtime code requests by role
+(`get_model("chat")`) — never hardcoded model names.
+
+---
+
+## Deployment + sync
+
+Bootstrap a new node:
 
 ```bash
 NODE_ID=scout bash scripts/bootstrap_node.sh
 ```
 
-The bootstrap script clones this repo, writes `node/.env`, renders the systemd
+The script clones the repo on the node, writes `node/.env`, renders systemd
 unit templates, and enables user services.
 
-The vault can push node code through `vault/sync_manager.py`. It reads node
-profiles from `node/profiles/*.json`, rsyncs `node/` to the target host, and
-restarts configured services only when files changed. The Scout profile is:
+Vault pushes node code via `vault/sync_manager.py`:
 
-```text
-node/profiles/scout.json
+```bash
+python3 vault/sync_manager.py        # push to all profiles
+python3 vault/sync_manager.py scout  # push to one
 ```
 
-The node presence proxy registers itself with the vault at startup by calling
-`POST /node/register`. Registration records the node IP, service ports,
-capabilities, and module self-test data.
+It reads `node/profiles/<id>.json` (host, user, services to restart, rsync
+excludes), rsyncs `node/`, and restarts services on the node only when files
+changed. Vault has key-based SSH to nodes via `~/.ssh/id_ed25519_nodes`.
 
-## Legacy Stack
+`vault-autosync.timer` runs the push periodically; `vault-runtime.service`'s
+`ExecStartPost` also triggers a one-shot push so a vault restart propagates
+fresh code to nodes.
 
-The older runtime layout may still exist on mounted machines:
+---
+
+## Dependency install
+
+```bash
+python3 -m pip install -r vault/requirements.txt
+python3 -m pip install -r node/requirements.txt
+```
+
+Scout additionally needs the Hailo environment at `~/hailo-apps`; the node
+service units activate that environment before launching the vision service.
+
+---
+
+## Legacy stack
+
+The pre-repo runtime layout may still exist on mounted machines:
 
 ```text
 /Volumes/luhkas-vault/vault_v2
 /Volumes/luhkas-scout/scout_runtime
 ```
 
-Treat those as legacy/reference copies unless a service is explicitly still
-pointing at them. New development should land in this repo under `vault/` and
-`node/`.
-
-When moving behavior from the legacy stack, preserve the same service boundary:
-the vault owns reasoning and memory; nodes own real-time sensing and physical
-control.
-
-## Dependency Files
-
-Install vault dependencies with:
-
-```bash
-python3 -m pip install -r vault/requirements.txt
-```
-
-Install node dependencies with:
-
-```bash
-python3 -m pip install -r node/requirements.txt
-```
-
-Scout still requires the separate Hailo environment at `~/hailo-apps`; the node
-start scripts activate that environment before launching vision and robot API
-services.
+Treat as reference only. New development lands in this repo. The `vault_v2.db`
+SQLite file under `vault/` is current state (events, notifications, jobs) — the
+filename is legacy but the data is live.
