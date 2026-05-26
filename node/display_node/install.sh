@@ -112,22 +112,26 @@ if [ -n "$DISPLAY_ROTATION" ]; then
     printf '\n' >> "$CMDLINE"
     echo "[display_node/install] applied console rotation: ${DISPLAY_ROTATION} (${VIDEO_ARG})"
 
-    # Wayland-side rotation via labwc autostart. wlr-randr is what
-    # actually rotates the live desktop the user sees through HDMI on
-    # Pi OS Trixie. Without this the kernel rotate hint has no effect on
-    # the desktop session.
+    # Wayland-side rotation via kanshi. Kanshi is the Wayland output
+    # config daemon Pi OS Trixie's labwc-pi launches by default; it reads
+    # ~/.config/kanshi/config and applies output transforms on every
+    # session start AND on hotplug. This is the canonical persistent
+    # mechanism — using labwc autostart instead would race with kanshi.
     USER_HOME="$(getent passwd "$NODE_USER" | cut -d: -f6)"
-    LABWC_AUTOSTART="${USER_HOME}/.config/labwc/autostart"
-    install -d -m 0755 -o "$NODE_USER" -g "$NODE_USER" "${USER_HOME}/.config/labwc"
-    if [ ! -f "$LABWC_AUTOSTART" ] || ! grep -q "wlr-randr.*--transform ${ROTATE_DEG}\b" "$LABWC_AUTOSTART"; then
-      cat > "$LABWC_AUTOSTART" <<EOF
-# LUHKAS: rotate HDMI display at labwc session start
-wlr-randr --output ${HDMI_PORT} --transform ${ROTATE_DEG} &
+    KANSHI_DIR="${USER_HOME}/.config/kanshi"
+    KANSHI_CONF="${KANSHI_DIR}/config"
+    install -d -m 0755 -o "$NODE_USER" -g "$NODE_USER" "$KANSHI_DIR"
+    cat > "$KANSHI_CONF" <<EOF
+profile {
+    output ${HDMI_PORT} transform ${ROTATE_DEG} enable
+}
 EOF
-      chown "$NODE_USER:$NODE_USER" "$LABWC_AUTOSTART"
-      chmod 0755 "$LABWC_AUTOSTART"
-      echo "[display_node/install] wrote labwc autostart with rotation"
-    fi
+    chown "$NODE_USER:$NODE_USER" "$KANSHI_CONF"
+    chmod 0644 "$KANSHI_CONF"
+    # Remove any obsolete labwc autostart from earlier installs so it
+    # doesn't fight kanshi.
+    rm -f "${USER_HOME}/.config/labwc/autostart"
+    echo "[display_node/install] wrote kanshi rotation: ${HDMI_PORT} transform ${ROTATE_DEG}"
   fi
 fi
 
