@@ -60,3 +60,14 @@ node_modules/
 .env
 *.key
 *.pem
+vault/secrets/
+
+# Tests are dev-only, not shipped
+tests/
+
+# Runtime state
+vault/data/nodes_pending_alerts.json
+
+# Python bytecode
+__pycache__/
+*.pyc
