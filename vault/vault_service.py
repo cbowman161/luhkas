@@ -82,6 +82,34 @@ def _provision_tailscale_after_register(node_id: str, host: str, sync: dict) -> 
         print(f"[tailscale] provision {node_id}@{host}: failed: {exc}", flush=True)
 
 
+def _orchestrate_if_pre_install(payload: dict, sync: dict) -> None:
+    """If the node is registering in pre-install phase, kick the full
+    first-time orchestration on a background thread.
+
+    Pre-install registrations are sent by ``scripts/luhkas_firstboot.sh``
+    on the freshly-flashed SD card: the node only has cloud-init's user +
+    SSH + WiFi set up. The orchestrator takes it from there.
+    """
+    if str(payload.get("bootstrap_phase") or "") != "pre-install":
+        return
+    node_id = str(payload.get("node_id") or "").strip()
+    network = payload.get("network") if isinstance(payload.get("network"), dict) else {}
+    host = str(payload.get("ip") or network.get("lan_ip") or "").strip()
+    if not node_id or not host:
+        return
+    try:
+        from node_orchestrator import orchestrate_async
+        orchestrate_async(
+            node_id,
+            host,
+            user=str(sync.get("user") or "luhkas"),
+            node_dir=str(sync.get("node_dir") or "luhkas/node"),
+        )
+        print(f"[orchestrator] kicked off for {node_id}@{host}", flush=True)
+    except Exception as exc:
+        print(f"[orchestrator] kick-off failed for {node_id}@{host}: {exc}", flush=True)
+
+
 class VaultRequestHandler(BaseHTTPRequestHandler):
     server_version = "VaultRuntimeService/1.0"
 
@@ -315,7 +343,12 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 network = payload.get("network") if isinstance(payload.get("network"), dict) else {}
                 if not provision_host:
                     provision_host = str(network.get("lan_ip") or network.get("tailscale_ip") or "")
-                if provision_host:
+                # Pre-install registrations from a fresh SD card need full
+                # first-time orchestration. Existing nodes just need the
+                # Tailscale auth-key topped up.
+                if str(payload.get("bootstrap_phase") or "") == "pre-install":
+                    _orchestrate_if_pre_install(payload, sync)
+                elif provision_host:
                     _t.Thread(
                         target=_provision_tailscale_after_register,
                         args=(node_id, provision_host, sync),

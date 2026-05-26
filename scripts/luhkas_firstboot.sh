@@ -1,42 +1,27 @@
 #!/usr/bin/env bash
-# First-boot bootstrap for a LUHKAS edge node.
+# Minimal first-boot bootstrap for a LUHKAS edge node.
 #
 # Copied by ``prep_node_sd.sh`` onto the SD card's boot partition as
-# ``/boot/firmware/luhkas-firstboot.sh``. Pi Imager invokes it via either
-# its legacy firstrun.sh hook (patched) or cloud-init's runcmd. Runs as
-# root.
+# ``/boot/firmware/luhkas-firstboot.sh``. Invoked once by cloud-init's runcmd
+# after the user, SSH, hostname and WiFi have been configured.
 #
-# Flow:
-#   1. wait for network
-#   2. install baseline apt deps (git, python3-pip, etc.)
-#   3. clone repo as $NODE_USER
-#   4. for each module in node/profiles/${NODE_ID}.json's "modules" list,
-#      run ``node/<module>/install.sh`` if it exists (Hailo, audio HAT,
-#      chromium, etc. — entirely declarative on profile modules)
-#   5. run bootstrap_node.sh (renders systemd units from profile +
-#      templates, sets up Tailscale, enables user services)
-#   6. clean up SD-card files and reboot
+# This script does as little as possible:
+#   1. Wait for the network.
+#   2. POST /node/register to the vault with our LAN IP.
+#   3. Self-clean the SD-side files.
 #
-# Reads ``/boot/firmware/luhkas-bootstrap.env`` for NODE_ID, NODE_USER,
-# VAULT_URL, REPO_URL, TAILSCALE_AUTHKEY.
+# After that, vault's ``node_orchestrator`` takes over: it SSHes into the
+# Pi (using the public key Pi Imager seeded into authorized_keys via
+# user-data) and runs the actual installation. Anything that fails can be
+# retried by re-running the orchestrator on vault — no SD reflash needed.
+#
+# Reads ``/boot/firmware/luhkas-bootstrap.env`` for NODE_ID, VAULT_URL.
 
 set -euo pipefail
 
 LOG=/var/log/luhkas-firstboot.log
 exec >>"$LOG" 2>&1
-echo "[$(date -Is)] luhkas-firstboot starting"
-
-on_err() {
-  local rc=$?
-  echo "[$(date -Is)] luhkas-firstboot FAILED with exit code ${rc}"
-  echo "[firstboot] recovery:  ssh into the Pi and run:"
-  echo "             sudo /boot/firmware/luhkas-firstboot.sh   # if SD-side files still present"
-  echo "             OR (after first reboot):"
-  echo "             sudo -u luhkas bash ~/luhkas/scripts/bootstrap_node.sh"
-  echo "             sudo bash ~/luhkas/node/<module>/install.sh   # per failed module"
-  exit "$rc"
-}
-trap on_err ERR
+echo "[$(date -Is)] luhkas-firstboot starting (minimal mode)"
 
 BOOT_DIR="/boot/firmware"
 ENV_FILE="${BOOT_DIR}/luhkas-bootstrap.env"
@@ -51,9 +36,6 @@ fi
 NODE_ID="${NODE_ID:?NODE_ID required in bootstrap.env}"
 NODE_USER="${NODE_USER:-luhkas}"
 VAULT_URL="${VAULT_URL:-http://luhkas-vault:7000}"
-REPO_URL="${REPO_URL:-https://github.com/cbowman161/luhkas.git}"
-TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
-INSTALL_DIR="/home/${NODE_USER}/luhkas"
 
 echo "[firstboot] node_id=${NODE_ID} user=${NODE_USER} vault=${VAULT_URL}"
 
@@ -66,107 +48,44 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-# ── 2. baseline apt deps (everything else is per-module install.sh) ─────────
-# Wait for cloud-init / unattended-upgrades to release the dpkg lock before
-# we start. Also run ``apt-get update`` ONCE here and let each module's
-# install.sh skip its own update via the LUHKAS_APT_UPDATED flag.
-export DEBIAN_FRONTEND=noninteractive
+# ── 2. find our LAN IP and tell vault we exist ─────────────────────────────
+LAN_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+HOSTNAME=$(hostname)
 
-wait_for_apt_lock() {
-  for i in $(seq 1 100); do
-    if ! fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; then
-      return 0
-    fi
-    echo "[firstboot] dpkg locked; waiting (${i})..."
-    sleep 3
-  done
-  echo "[firstboot] WARN: dpkg lock still held after 5 min; proceeding anyway"
-}
-
-wait_for_apt_lock
-apt-get update -y
-export LUHKAS_APT_UPDATED=1
-
-wait_for_apt_lock
-apt-get install -y --no-install-recommends \
-  git curl ca-certificates \
-  python3 python3-pip python3-venv
-
-# ── 3. user + secrets ──────────────────────────────────────────────────────
-if ! id -u "$NODE_USER" >/dev/null 2>&1; then
-  echo "ERROR: user $NODE_USER not present"
-  exit 1
-fi
-USER_HOME=$(getent passwd "$NODE_USER" | cut -d: -f6)
-USER_CFG="${USER_HOME}/.config/luhkas"
-install -d -m 0755 -o "$NODE_USER" -g "$NODE_USER" "$USER_CFG"
-
-AUTHKEY_PATH=""
-if [ -n "${TAILSCALE_AUTHKEY}" ]; then
-  AUTHKEY_PATH="${USER_CFG}/tailscale.authkey"
-  printf '%s\n' "${TAILSCALE_AUTHKEY}" > "${AUTHKEY_PATH}"
-  chown "$NODE_USER:$NODE_USER" "${AUTHKEY_PATH}"
-  chmod 0600 "${AUTHKEY_PATH}"
-fi
-
-cat > "${USER_CFG}/bootstrap.env" <<EOF
-LUHKAS_NODE_ID=${NODE_ID}
-VAULT_CHAT_URL=${VAULT_URL}
-${AUTHKEY_PATH:+TAILSCALE_AUTHKEY_FILE=${AUTHKEY_PATH}}
-EOF
-chown "$NODE_USER:$NODE_USER" "${USER_CFG}/bootstrap.env"
-chmod 0600 "${USER_CFG}/bootstrap.env"
-
-# ── 4. clone repo ──────────────────────────────────────────────────────────
-sudo -u "$NODE_USER" -H bash -lc "
-  set -e
-  if [ -d '${INSTALL_DIR}/.git' ]; then
-    git -C '${INSTALL_DIR}' pull --ff-only || true
-  else
-    git clone '${REPO_URL}' '${INSTALL_DIR}'
-  fi
-"
-
-# ── 5. run each module's install.sh (modules drive everything) ─────────────
-PROFILE_PATH="${INSTALL_DIR}/node/profiles/${NODE_ID}.json"
-if [ ! -f "$PROFILE_PATH" ]; then
-  echo "ERROR: profile not found at ${PROFILE_PATH}"
+if [ -z "$LAN_IP" ]; then
+  echo "ERROR: could not determine LAN IP"
   exit 1
 fi
 
-MODULES=$(python3 -c "
-import json, pathlib
-p = pathlib.Path('${PROFILE_PATH}')
-data = json.loads(p.read_text())
-for m in data.get('modules', []):
-    print(m)
-")
+PAYLOAD=$(printf '{"node_id":"%s","node_name":"%s","ip":"%s","network":{"lan_ip":"%s","preferred":"lan"},"bootstrap_phase":"pre-install"}' \
+  "$NODE_ID" "$HOSTNAME" "$LAN_IP" "$LAN_IP")
 
-for mod in $MODULES; do
-  INSTALL="${INSTALL_DIR}/node/${mod}/install.sh"
-  if [ -x "$INSTALL" ]; then
-    echo "[firstboot] >> running ${mod}/install.sh"
-    NODE_USER="$NODE_USER" NODE_ID="$NODE_ID" \
-      LUHKAS_APT_UPDATED="${LUHKAS_APT_UPDATED:-0}" \
-      bash "$INSTALL" \
-      || echo "[firstboot] WARN: ${mod}/install.sh exited non-zero — see log; firstboot continues"
-  else
-    echo "[firstboot] (no install.sh for ${mod})"
+# Retry registration for ~5 minutes — vault may take a moment to be reachable
+# (e.g. WiFi DHCP still settling, mDNS not yet resolving the vault hostname).
+registered=0
+for i in $(seq 1 30); do
+  if curl -fsS --max-time 10 -X POST \
+       -H 'Content-Type: application/json' \
+       -d "$PAYLOAD" \
+       "${VAULT_URL}/node/register" >>"$LOG" 2>&1; then
+    echo "[firstboot] registered with vault on attempt ${i} (ip=${LAN_IP})"
+    registered=1
+    break
   fi
+  echo "[firstboot] registration attempt ${i} failed; retrying..."
+  sleep 10
 done
 
-# ── 6. bootstrap_node.sh: render systemd units + Tailscale + enable units ──
-sudo -u "$NODE_USER" -H bash -lc "
-  set -e
-  NODE_ID='${NODE_ID}' VAULT_URL='${VAULT_URL}' INSTALL_DIR='${INSTALL_DIR}' \
-    bash '${INSTALL_DIR}/scripts/bootstrap_node.sh'
-  bash '${INSTALL_DIR}/node/scripts/install_user_services.sh' || true
-"
+if [ "$registered" != "1" ]; then
+  echo "[firstboot] WARN: vault unreachable after retries — orchestrator can be invoked manually from vault:"
+  echo "             python3 -m vault.node_orchestrator ${NODE_ID} ${LAN_IP}"
+fi
 
-# ── 7. cleanup + reboot ────────────────────────────────────────────────────
-rm -f "${BOOT_DIR}/luhkas-bootstrap.env" "${BOOT_DIR}/luhkas-firstboot.sh"
+# ── 3. clean up SD-side files ──────────────────────────────────────────────
+# Leave the env file in place if registration failed so a manual rerun can
+# read it; otherwise clean up to keep the boot partition tidy.
+if [ "$registered" = "1" ]; then
+  rm -f "${BOOT_DIR}/luhkas-bootstrap.env" "${BOOT_DIR}/luhkas-firstboot.sh"
+fi
 
-echo "[$(date -Is)] luhkas-firstboot done — rebooting"
-sync
-sleep 2
-shutdown -r +1 "luhkas-firstboot complete" || reboot
+echo "[$(date -Is)] luhkas-firstboot done; awaiting orchestration from vault"

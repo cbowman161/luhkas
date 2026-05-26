@@ -201,20 +201,35 @@ else
 fi
 echo "[prep] provisioning mode: ${PROVISION_MODE}"
 
-# ── Tailscale auth key ─────────────────────────────────────────────────────
-TAILSCALE_AUTHKEY=""
+# ── Vault SSH pubkey (so the orchestrator can SSH into the node) ───────────
+# The Tailscale auth-key stays on vault — the orchestrator pushes it over
+# SSH after the node first registers. The SD card only needs to seed
+# vault's SSH pubkey into the node's authorized_keys so vault can SSH back.
+VAULT_PUBKEY_PATH="${INVOKING_HOME}/.ssh/id_ed25519_nodes.pub"
+VAULT_PUBKEY=""
+if [ -f "$VAULT_PUBKEY_PATH" ]; then
+  VAULT_PUBKEY=$(tr -d '\r\n' < "$VAULT_PUBKEY_PATH")
+fi
+if [ -z "$VAULT_PUBKEY" ]; then
+  echo "ERROR: ${VAULT_PUBKEY_PATH} missing or empty." >&2
+  echo "       Generate one with: ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_nodes -N ''" >&2
+  exit 2
+fi
+echo "[prep] vault SSH pubkey: ${VAULT_PUBKEY_PATH} (${#VAULT_PUBKEY} chars)"
+
+# Optional Tailscale rotation check (so vault has a fresh key ready when it
+# pushes it post-registration). The key itself does NOT land on the SD.
 if [ "$PROVISION_TAILSCALE" = "1" ]; then
-  AUTHKEY_FILE="${REPO_ROOT}/vault/secrets/tailscale.authkey"
   ROTATE_IF_NEEDED="${REPO_ROOT}/scripts/rotate_tailscale_authkey_if_needed.py"
+  AUTHKEY_FILE="${REPO_ROOT}/vault/secrets/tailscale.authkey"
   if [ -x "$ROTATE_IF_NEEDED" ]; then
     sudo -u "$INVOKING_USER" -H python3 "$ROTATE_IF_NEEDED" \
-      || echo "[prep] WARN: rotation check failed; using existing key" >&2
+      || echo "[prep] WARN: rotation check failed; vault will use existing key" >&2
   fi
   if [ ! -f "$AUTHKEY_FILE" ]; then
-    echo "ERROR: ${AUTHKEY_FILE} missing. Provision via scripts/rotate_tailscale_authkey.sh." >&2
-    exit 2
+    echo "[prep] WARN: ${AUTHKEY_FILE} missing — Tailscale provisioning will fail" >&2
+    echo "             until: scripts/rotate_tailscale_authkey.sh" >&2
   fi
-  TAILSCALE_AUTHKEY=$(tr -d '\r\n' < "$AUTHKEY_FILE")
 fi
 
 # ── write bootstrap env + firstboot script onto the SD card ────────────────
@@ -223,8 +238,7 @@ ENV_OUT="${BOOT_DIR}/luhkas-bootstrap.env"
   echo "NODE_ID=${NODE_ID}"
   echo "NODE_USER=${NODE_USER}"
   echo "VAULT_URL=${VAULT_URL}"
-  [ -n "$REPO_URL" ]          && echo "REPO_URL=${REPO_URL}"
-  [ -n "$TAILSCALE_AUTHKEY" ] && echo "TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY}"
+  [ -n "$REPO_URL" ] && echo "REPO_URL=${REPO_URL}"
 } > "${ENV_OUT}"
 chmod 0600 "${ENV_OUT}" || true
 
@@ -259,19 +273,20 @@ PY
     echo "[prep] firstrun.sh already patched (marker found)"
   fi
 else
-  # cloud-init: merge a runcmd entry into user-data via PyYAML.
+  # cloud-init: merge runcmd + ssh_authorized_keys into user-data via PyYAML.
   if grep -q "$PATCH_MARKER" "$CLOUD_USERDATA"; then
     echo "[prep] user-data already patched (marker found)"
   else
-    python3 - "$CLOUD_USERDATA" "$PATCH_MARKER" <<'PY'
+    python3 - "$CLOUD_USERDATA" "$PATCH_MARKER" "$NODE_USER" "$VAULT_PUBKEY" <<'PY'
 import sys, pathlib
 import yaml
 
 path = pathlib.Path(sys.argv[1])
 marker = sys.argv[2]
-text = path.read_text()
+node_user = sys.argv[3]
+vault_pubkey = sys.argv[4]
 
-# Cloud-init expects a "#cloud-config" header — preserve whatever's at the top.
+text = path.read_text()
 first_line = text.split("\n", 1)[0].strip()
 header = first_line if first_line.startswith("#") else "#cloud-config"
 
@@ -279,9 +294,34 @@ data = yaml.safe_load(text) or {}
 if not isinstance(data, dict):
     raise SystemExit(f"unexpected user-data root: {type(data).__name__}")
 
-# Drop a marker comment so prep is idempotent.
 data.setdefault("_luhkas_marker", marker)
 
+# Inject vault's SSH pubkey into the target user's authorized_keys so the
+# orchestrator can SSH back as soon as the node is reachable.
+users = data.get("users")
+if isinstance(users, list):
+    target = None
+    for entry in users:
+        if isinstance(entry, dict) and entry.get("name") == node_user:
+            target = entry
+            break
+    if target is None:
+        # No matching user entry — add one. Pi Imager normally creates the
+        # user, so this branch is just defensive.
+        target = {"name": node_user}
+        users.append(target)
+    keys = target.setdefault("ssh_authorized_keys", [])
+    if not isinstance(keys, list):
+        keys = [keys] if keys else []
+        target["ssh_authorized_keys"] = keys
+    if vault_pubkey not in keys:
+        keys.append(vault_pubkey)
+elif users is None:
+    data["users"] = [
+        {"name": node_user, "ssh_authorized_keys": [vault_pubkey]},
+    ]
+
+# Append our firstboot to runcmd (last step in cloud-final).
 runcmd = data.setdefault("runcmd", [])
 if not isinstance(runcmd, list):
     raise SystemExit("user-data runcmd is not a list")
@@ -292,7 +332,7 @@ runcmd.append(
 out = header + "\n" + yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
 path.write_text(out)
 PY
-    echo "[prep] merged runcmd into ${CLOUD_USERDATA}"
+    echo "[prep] merged runcmd + vault SSH pubkey into ${CLOUD_USERDATA}"
   fi
 fi
 
@@ -308,9 +348,18 @@ echo "[prep]   firstboot      : ${FIRSTBOOT_DST}"
 if [ "$PROVISION_MODE" = "firstrun" ]; then
   echo "[prep]   firstrun.sh    : ${PI_FIRSTRUN} (patched)"
 else
-  echo "[prep]   user-data      : ${CLOUD_USERDATA} (runcmd merged)"
+  echo "[prep]   user-data      : ${CLOUD_USERDATA} (runcmd + ssh key merged)"
 fi
-echo "[prep]   tailscale key  : $([ -n "$TAILSCALE_AUTHKEY" ] && echo provisioned || echo skipped)"
+echo "[prep]   vault pubkey   : seeded into authorized_keys for user '${NODE_USER}'"
 echo
-echo "Eject the SD, insert into the Pi, power on. First-boot log on the Pi:"
-echo "  /var/log/luhkas-firstboot.log"
+echo "Eject the SD, insert into the Pi, power on. Pi will:"
+echo "  1. cloud-init creates the user, joins WiFi, enables SSH (~30s)"
+echo "  2. firstboot waits for network and POSTs /node/register to vault"
+echo "  3. vault.node_orchestrator SSHes back and installs everything"
+echo
+echo "Watch progress:"
+echo "  Pi side  : tail -f /var/log/luhkas-firstboot.log"
+echo "  Vault    : journalctl --user -u vault-runtime.service -f | grep orchestrator"
+echo
+echo "If anything goes sideways, re-orchestrate by hand from vault:"
+echo "  python3 -m vault.node_orchestrator ${NODE_ID} <lan_ip>"
