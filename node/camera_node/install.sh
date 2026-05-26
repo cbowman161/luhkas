@@ -69,10 +69,15 @@ fi
 
 if [ -x "$HAILO_APPS_DIR/install.sh" ] && [ ! -d "$HAILO_APPS_DIR/venv_hailo_apps" ]; then
   echo "[camera_node/install] running hailo-apps/install.sh (creates venv_hailo_apps)"
-  # stdin from /dev/null in case the installer asks a confirmation question
-  # (firstboot is non-interactive — we want it to take the default).
-  sudo -u "$NODE_USER" -H bash -lc "cd '$HAILO_APPS_DIR' && ./install.sh </dev/null" \
-    || echo "[camera_node/install] WARN: hailo-apps/install.sh exited non-zero; check ${HAILO_APPS_DIR}/hailort.*.log"
+  # hailo-apps install.sh REQUIRES root (it apt-installs, drops files into
+  # /usr/local/hailo, etc.) and uses SUDO_USER to discover the target user.
+  # We're already running as root in this script (orchestrator invoked us
+  # with sudo), so set SUDO_USER explicitly and invoke directly. stdin from
+  # /dev/null prevents any unexpected prompt from hanging the install.
+  (
+    cd "$HAILO_APPS_DIR"
+    SUDO_USER="$NODE_USER" ./install.sh </dev/null
+  ) || echo "[camera_node/install] WARN: hailo-apps/install.sh exited non-zero; check ${HAILO_APPS_DIR}/logs/"
 fi
 
 echo "[camera_node/install] done"

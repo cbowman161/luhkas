@@ -22,8 +22,11 @@ DISPLAY_ROTATION="${DISPLAY_ROTATION:-}"
 
 echo "[display_node/install] starting (user=${NODE_USER})"
 
+# Pi OS Trixie packages chromium as ``chromium`` (no ``-browser`` suffix).
+# Older releases used chromium-browser. ``start_kiosk_browser.sh`` finds
+# whichever binary is installed.
 ensure_apt_updated
-apt_install chromium-browser unclutter
+apt_install chromium unclutter
 
 # ── Lite vs Desktop detection ────────────────────────────────────────────────
 # kiosk-browser.service requires graphical-session.target, which is only
