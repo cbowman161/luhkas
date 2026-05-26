@@ -66,6 +66,23 @@ if changed:
 PY
 fi
 
+# ── allow xrdp users to start X ─────────────────────────────────────────────
+# Debian/Pi OS's X wrapper script defaults to ``allowed_users=console``,
+# which blocks any non-console user (xrdp sessions count as non-console)
+# from opening /dev/tty0. Without this file Xorg fails with
+# ``parse_vt_settings: Cannot open /dev/tty0 (Permission denied)`` and the
+# RDP session dies at "creating session - X server could not be started".
+XWRAPPER=/etc/X11/Xwrapper.config
+if [ ! -f "$XWRAPPER" ] || ! grep -q '^allowed_users=anybody' "$XWRAPPER"; then
+  echo "[install_rdp] writing ${XWRAPPER} (allowed_users=anybody)"
+  install -d -m 0755 /etc/X11
+  cat > "$XWRAPPER" <<'EOF'
+allowed_users=anybody
+needs_root_rights=yes
+EOF
+  chmod 0644 "$XWRAPPER"
+fi
+
 # ── enable + start xrdp services ────────────────────────────────────────────
 systemctl enable --now xrdp.service
 systemctl enable --now xrdp-sesman.service
