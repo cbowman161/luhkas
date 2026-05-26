@@ -48,10 +48,19 @@ if [ -x /usr/bin/Xtigervnc ] && [ "$(readlink -f /usr/bin/Xvnc 2>/dev/null)" != 
 fi
 
 # ── ~/.xsession launches xfce4 when xrdp opens a session ─────────────────────
+# xfce4-session on Pi OS Trixie loads a Wayland-flavored default session
+# profile (FailsafeWayland) that OMITS xfwm4 — under real Wayland the
+# compositor is the WM. But our RDP session runs over Xvnc (X11), so no
+# xfwm4 means no window decorations / no wallpaper = black screen. Launch
+# xfwm4 explicitly before xfce4-session so an X11 WM is guaranteed.
 SESSION_FILE="${USER_HOME}/.xsession"
-if [ ! -f "$SESSION_FILE" ] || ! grep -qx "startxfce4" "$SESSION_FILE"; then
-  echo "[install_rdp] writing ${SESSION_FILE} -> startxfce4"
-  printf 'startxfce4\n' > "$SESSION_FILE"
+SESSION_CONTENT='#!/bin/sh
+xfwm4 &
+exec startxfce4
+'
+if [ ! -f "$SESSION_FILE" ] || [ "$(cat "$SESSION_FILE")" != "$SESSION_CONTENT" ]; then
+  echo "[install_rdp] writing ${SESSION_FILE} -> xfwm4 + startxfce4"
+  printf '%s' "$SESSION_CONTENT" > "$SESSION_FILE"
   chown "$NODE_USER:$NODE_USER" "$SESSION_FILE"
   chmod 0755 "$SESSION_FILE"
 fi
