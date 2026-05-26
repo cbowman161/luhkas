@@ -1,0 +1,12 @@
+# Allow the luhkas user to run scripts/prep_node_sd.sh without a password.
+# The script self-elevates internally; this entry removes the password
+# prompt so authoring a node profile + running one command is truly
+# one-step.
+#
+# Install (once, as root):
+#   sudo install -m 0440 -o root -g root \
+#     ~/luhkas/scripts/sudoers/vault-node-prep \
+#     /etc/sudoers.d/vault-node-prep
+#   sudo visudo -cf /etc/sudoers.d/vault-node-prep
+luhkas ALL=(root) NOPASSWD: /home/luhkas/luhkas/scripts/prep_node_sd.sh
+luhkas ALL=(root) NOPASSWD: /home/luhkas/luhkas/scripts/prep_node_sd.sh *

@@ -3,6 +3,12 @@ numpy>=1.24
 opencv-python<=4.10.0.84
 pyserial>=3.5
 inputs>=0.5
+# battery_node ina219 / max17040 backends (Pi UPS HATs). Harmless on hosts
+# without I2C — the backends fall back to None on missing smbus2 or device.
+smbus2>=0.4
+# audio_node Vosk STT (only loaded if AUDIO_STT_ENGINE=vosk and a model is
+# present; engine falls back to disabled if vosk or model is missing).
+vosk>=0.3.45 ; platform_machine != "x86_64" or sys_platform == "linux"
 
 # Hailo Apps is installed separately on Scout at ~/hailo-apps and activated by
 # scripts/start_vision.sh and scripts/start_robot_api.sh.

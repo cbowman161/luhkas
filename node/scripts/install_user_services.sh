@@ -4,41 +4,96 @@ set -euo pipefail
 UNIT_DIR="${HOME}/.config/systemd/user"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_DIR="$(dirname "$SCRIPT_DIR")"
+BOOTSTRAP_ENV="${LUHKAS_BOOTSTRAP_ENV:-$HOME/.config/luhkas/bootstrap.env}"
+if [ -f "${BOOTSTRAP_ENV}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${BOOTSTRAP_ENV}"
+  set +a
+fi
+
 NODE_ID="${LUHKAS_NODE_ID:-scout}"
 VAULT_URL="${VAULT_CHAT_URL:-http://luhkas-vault.local:7000}"
+LUHKAS_TAILSCALE="${LUHKAS_TAILSCALE:-1}"
 
 mkdir -p "${UNIT_DIR}"
 
-for svc in scout-robot-api.service scout-vision.service scout-presence.service scout-controller.service; do
-  sed \
-    -e "s|{NODE_DIR}|${NODE_DIR}|g" \
-    -e "s|{NODE_ID}|${NODE_ID}|g" \
-    -e "s|{VAULT_URL}|${VAULT_URL}|g" \
-    "${NODE_DIR}/systemd/${svc}" > "${UNIT_DIR}/${svc}"
-done
-
-systemctl --user daemon-reload
-systemctl --user enable --now scout-robot-api.service
-systemctl --user enable --now scout-vision.service
-systemctl --user enable --now scout-presence.service
-systemctl --user enable scout-controller.service >/dev/null 2>&1 || true
-
+# ── make user systemd usable ───────────────────────────────────────────────
+# When this script is invoked under ``sudo -u luhkas`` from firstboot, the
+# environment lacks the bits that ``systemctl --user`` needs (DBUS socket,
+# XDG_RUNTIME_DIR). Enable linger FIRST so the user manager starts now and
+# also at every boot, then make sure the right env vars are exported.
+USER_UID="$(id -u)"
 if command -v loginctl >/dev/null 2>&1; then
-  loginctl enable-linger "${USER}" || true
+  loginctl enable-linger "${USER}" 2>/dev/null || true
+  # Give the user manager a couple of seconds to come up.
+  for i in 1 2 3 4 5; do
+    if [ -S "/run/user/${USER_UID}/bus" ]; then break; fi
+    sleep 1
+  done
+fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${USER_UID}}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+if [ "${LUHKAS_TAILSCALE}" = "1" ]; then
+  LUHKAS_NODE_ID="${NODE_ID}" "${NODE_DIR}/scripts/setup_tailscale.sh" || {
+    echo "WARNING: Tailscale setup failed. Re-run:"
+    echo "  LUHKAS_NODE_ID=${NODE_ID} ${NODE_DIR}/scripts/setup_tailscale.sh"
+  }
 fi
 
-echo "Installed user services."
+# Render this node's systemd units from the shared templates + profile.
+# render_units.py is the single source of truth for what unit files exist.
+python3 "${NODE_DIR}/scripts/render_units.py" \
+  "${NODE_ID}" \
+  --dest "${UNIT_DIR}" \
+  --node-dir "${NODE_DIR}" \
+  --vault-url "${VAULT_URL}"
+
+PREFIX="${NODE_ID}-"
+shopt -s nullglob
+RENDERED=()
+for svc_path in "${UNIT_DIR}/${PREFIX}"*.service; do
+  RENDERED+=("$(basename "${svc_path}")")
+done
+shopt -u nullglob
+
+systemctl --user daemon-reload
+
+# Always-on services for every node (start with --now). Controller, if present,
+# is enabled but not auto-started (gamepad is optional).
+ALWAYS_ON_SUFFIXES=("robot-api" "vision" "presence" "battery" "audio" "display")
+for svc in "${RENDERED[@]}"; do
+  suffix="${svc#${PREFIX}}"
+  suffix="${suffix%.service}"
+  match=0
+  for on in "${ALWAYS_ON_SUFFIXES[@]}"; do
+    if [ "$suffix" = "$on" ]; then
+      match=1; break
+    fi
+  done
+  if [ "$match" = "1" ]; then
+    systemctl --user enable --now "${svc}"
+  else
+    systemctl --user enable "${svc}" >/dev/null 2>&1 || true
+  fi
+done
+
+echo "Installed user services for node '${NODE_ID}'."
 echo "Node directory: ${NODE_DIR}"
-echo "Node id: ${NODE_ID}"
 echo "Vault URL: ${VAULT_URL}"
 echo
-echo "Robot API, vision, and presence proxy are enabled and started."
+echo "Installed units:"
+for svc in "${RENDERED[@]}"; do
+  echo "  ${svc}"
+done
+echo
 echo "User lingering was requested so services can start at boot before login."
 echo
 echo "Useful commands:"
-echo "  systemctl --user status scout-robot-api.service"
-echo "  systemctl --user status scout-vision.service"
-echo "  systemctl --user status scout-presence.service"
-echo "  journalctl --user -u scout-robot-api.service -f"
-echo "  journalctl --user -u scout-vision.service -f"
-echo "  journalctl --user -u scout-presence.service -f"
+for svc in "${RENDERED[@]}"; do
+  echo "  systemctl --user status ${svc}"
+done
+for svc in "${RENDERED[@]}"; do
+  echo "  journalctl --user -u ${svc} -f"
+done

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import socket
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -79,12 +80,63 @@ def _http_post(url: str, payload: dict, timeout: float = 30.0) -> dict | None:
         raise RuntimeError(f"brain request failed: {exc}") from exc
 
 
+def _get_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return ""
+
+
+def _get_tailscale_ip() -> str:
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # TTS
 # ---------------------------------------------------------------------------
 
+def _speak_via_audio_node(text: str, url: str, timeout: float = 30.0) -> bool:
+    """POST text to audio_node's /tts endpoint. Returns True on success."""
+    try:
+        from urllib.request import Request, urlopen
+        req = Request(
+            url.rstrip("/") + "/tts",
+            data=json.dumps({"text": text}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        return bool(payload.get("ok"))
+    except Exception:
+        return False
+
+
 def _speak(text: str, engine: str = "auto") -> None:
     if not text:
+        return
+    # Prefer audio_node when available — keeps engine choice and ALSA device
+    # configuration in one place. Falls back to the original local path.
+    audio_url = os.environ.get("AUDIO_SERVICE_URL", "")
+    if audio_url and _speak_via_audio_node(text, audio_url):
         return
     if engine == "auto":
         engine = "say" if os.uname().sysname == "Darwin" else "espeak"
@@ -132,9 +184,19 @@ class NodeRuntime:
         url = self.brain_url + "/node/register"
         try:
             capabilities = self.local_capabilities()
+            lan_ip = _get_lan_ip()
+            tailscale_ip = _get_tailscale_ip()
+            prefer_tailscale = os.environ.get("LUHKAS_PREFER_TAILSCALE", "1") != "0"
+            ip = tailscale_ip if prefer_tailscale and tailscale_ip else lan_ip
             result = _http_post(url, {
                 "node_id": self.node_id,
                 "node_name": self.node_name,
+                "ip": ip,
+                "network": {
+                    "lan_ip": lan_ip,
+                    "tailscale_ip": tailscale_ip,
+                    "preferred": "tailscale" if ip == tailscale_ip and tailscale_ip else "lan",
+                },
                 "display": self.display,
                 "capabilities": capabilities,
                 "modules": capabilities.get("module_status") or {},

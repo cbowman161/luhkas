@@ -1,15 +1,17 @@
 [Unit]
-Description=Rover Robot API
+Description=LUHKAS Vision Service ({NODE_ID})
 After=network-online.target
 Wants=network-online.target
+{EXTRA_UNIT}
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory={NODE_DIR}
-Environment=SCOUT_TELEMETRY_LOG_ENABLED=1
-Environment=SCOUT_TELEMETRY_DB_PATH={NODE_DIR}/config/telemetry.db
-ExecStart={NODE_DIR}/scripts/start_robot_api.sh
+Environment=LUHKAS_NODE_ID={NODE_ID}
+Environment=VAULT_CHAT_URL={VAULT_URL}
+{EXTRA_ENV}
+ExecStart={NODE_DIR}/scripts/start_vision.sh
 Restart=always
 RestartSec=2
 

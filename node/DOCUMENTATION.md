@@ -49,6 +49,7 @@ behavior.
 | `scout-robot-api` | 5001 | `services/robot_api.py` | HTTP to serial bridge, telemetry, OLED, heartbeat watchdog |
 | `scout-vision` | 5000 | `services/vision_service.py` | Camera, inference, tracking, UI, behavior, manual controller |
 | `scout-presence` | 5002 | `services/presence_client_service.py` | Edge proxy to the vault brain |
+| `scout-battery` | 5003 | `battery_node/service.py` | Canonical battery state (UART proxy backend on scout; INA219 on UPS-HAT nodes) |
 | `scout-controller` | none | `tools/controller_drive.py` | Legacy/manual-start gamepad client; normal controller support now lives in `scout-vision` |
 
 All services run from `~/scout_runtime` through scripts in `scripts/`, which
@@ -94,9 +95,9 @@ Threads:
 
 | Thread | Role |
 |--------|------|
-| `serial_reader` | Reads UART, parses `T:1001`, updates battery/telemetry, logs telemetry |
+| `serial_reader` | Reads UART, parses `T:1001`, publishes battery voltage to `/run/luhkas/battery_raw.json` for `battery_node`, updates motor/IMU telemetry, logs telemetry |
 | `serial_worker` | Flushes pan-tilt, light, and move state every 30 ms |
-| `oled_updater` | Alternates IP/battery display and accepts `/oled` overrides |
+| `oled_updater` | Alternates IP / `battery_node` percentage and accepts `/oled` overrides |
 | `heartbeat_watchdog` | Polls brain `/health`; stops wheels after 5 seconds unreachable |
 | HTTP server | Serves port 5001 |
 
@@ -127,8 +128,7 @@ Robot API endpoints:
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health` | API/serial status and current battery |
-| `GET /battery` | Current battery voltage/percent |
+| `GET /health` | API/serial status |
 | `GET /telemetry` | Latest parsed `T:1001` telemetry |
 | `GET /telemetry/history?seconds=60` | Recent SQLite telemetry rows, max 3600 seconds |
 | `GET /heartbeat` | Last heartbeat timestamp and timeout |
@@ -628,6 +628,20 @@ Common environment variables:
 | `VAULT_CHAT_URL` | `http://luhkas-vault.local:7000` | Presence brain URL |
 | `VAULT_CHAT_SOURCE` | `scout_presence` | Presence source label |
 | `SCOUT_PRESENCE_PORT` | `5002` | Presence listen port |
+| `LUHKAS_TAILSCALE` | `1` | Install/start Tailscale during node bootstrap and service install |
+| `TAILSCALE_AUTHKEY` | empty | Optional Tailscale auth key for unattended node enrollment |
+| `TAILSCALE_HOSTNAME` | `luhkas-$LUHKAS_NODE_ID` | Tailnet hostname assigned during setup |
+| `LUHKAS_PREFER_TAILSCALE` | `1` | Register the Tailscale IP as the preferred node service address |
+
+Remote nodes are enrolled into the private tailnet by `scripts/bootstrap_node.sh`
+and `node/scripts/install_user_services.sh` through
+`node/scripts/setup_tailscale.sh`. For fully unattended provisioning, create a
+reusable or ephemeral Tailscale auth key and store it on the vault at
+`vault/secrets/tailscale.authkey` with mode `600`. Fresh nodes can start without
+the key locally: they register with the vault over LAN, the vault SSHes back to
+the node, writes `~/.config/luhkas/tailscale.authkey`, and reruns
+`setup_tailscale.sh`. Nodes still register both `lan_ip` and `tailscale_ip` with
+the vault; the vault prefers `tailscale_ip` when building service URLs.
 
 ## Local Data
 

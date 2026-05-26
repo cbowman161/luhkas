@@ -1,0 +1,20 @@
+[Unit]
+Description=LUHKAS Kiosk Browser ({NODE_ID})
+PartOf=graphical-session.target
+After=graphical-session.target {NODE_ID}-display.service
+Wants={NODE_ID}-display.service
+{EXTRA_UNIT}
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory={NODE_DIR}
+Environment=LUHKAS_NODE_ID={NODE_ID}
+Environment=KIOSK_URL=http://127.0.0.1:5005/ui
+{EXTRA_ENV}
+ExecStart={NODE_DIR}/scripts/start_kiosk_browser.sh
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=graphical-session.target

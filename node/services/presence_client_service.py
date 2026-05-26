@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import threading
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from luhkas_node.wakeword import is_wakeword_only as _is_wakeword_only
 from luhkas_node.wakeword import response as _wakeword_response
+from profile_loader import load_profile as _load_profile_resolved
 try:
     from luhkas_node.local_commands import capabilities as _local_capabilities
     from luhkas_node.local_commands import selftest as _local_selftest
@@ -26,10 +28,35 @@ except Exception:
     _local_selftest = None
 
 _SELFTEST_INTERVAL = float(os.environ.get("SCOUT_SELFTEST_INTERVAL", "60"))
-_LOCAL_SERVICES = {
-    "vision": "http://127.0.0.1:5000/health",
-    "robot_api": "http://127.0.0.1:5001/health",
-}
+
+
+def _default_local_services(node_id: str) -> dict[str, str]:
+    """Local services to poll in selftest, derived from the node profile.
+
+    Accepts both shorthand (``"name": port``) and verbose
+    (``"name": {"port": ...}``) service entries.
+    """
+    try:
+        profile = _load_profile_resolved(node_id)
+    except Exception:
+        profile = {}
+    services = profile.get("services") or {}
+    urls: dict[str, str] = {}
+    for name, value in services.items():
+        if name == "presence":
+            continue
+        port = value.get("port") if isinstance(value, dict) else value
+        if isinstance(port, int):
+            urls[name] = f"http://127.0.0.1:{port}/health"
+    if urls:
+        return urls
+    return {
+        "vision": "http://127.0.0.1:5000/health",
+        "robot_api": "http://127.0.0.1:5001/health",
+    }
+
+
+_LOCAL_SERVICES = _default_local_services(os.environ.get("LUHKAS_NODE_ID", "scout"))
 
 _latest_selftest: dict = {}
 _selftest_lock = threading.Lock()
@@ -49,6 +76,24 @@ def _get_lan_ip() -> str:
             return sock.getsockname()[0]
     except Exception:
         return socket.gethostbyname(socket.gethostname())
+
+
+def _get_tailscale_ip() -> str:
+    """Return this node's Tailscale IPv4 address when the tunnel is active."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _ensure_vault_pubkey(brain_url: str) -> None:
@@ -72,9 +117,8 @@ def _ensure_vault_pubkey(brain_url: str) -> None:
 
 
 def _load_profile(node_id: str) -> dict:
-    profile_path = Path(__file__).resolve().parents[1] / "profiles" / f"{node_id}.json"
     try:
-        return json.loads(profile_path.read_text()) if profile_path.exists() else {}
+        return _load_profile_resolved(node_id)
     except Exception:
         return {}
 
@@ -84,13 +128,21 @@ def _register_with_brain(config: dict, retries: int = 6) -> None:
     brain_url = config["brain_url"]
     node_id = config.get("node_id", "scout")
     _ensure_vault_pubkey(brain_url)
-    ip = _get_lan_ip()
+    lan_ip = _get_lan_ip()
+    tailscale_ip = _get_tailscale_ip()
+    prefer_tailscale = os.environ.get("LUHKAS_PREFER_TAILSCALE", "1") != "0"
+    ip = tailscale_ip if prefer_tailscale and tailscale_ip else lan_ip
     profile = _load_profile(node_id)
     capabilities = _node_capabilities()
     payload = {
         "node_id": node_id,
         "node_name": f"{node_id} ({ip})",
         "ip": ip,
+        "network": {
+            "lan_ip": lan_ip,
+            "tailscale_ip": tailscale_ip,
+            "preferred": "tailscale" if ip == tailscale_ip and tailscale_ip else "lan",
+        },
         "display": profile.get("display") or {"has_display": False},
         "services": profile.get("services") or {"presence": 5002},
         "capabilities": capabilities,
@@ -318,7 +370,7 @@ class PresenceProxyServer(ThreadingHTTPServer):
 
 def main():
     parser = argparse.ArgumentParser(description="Always-on scout edge proxy for the unified vault presence endpoint.")
-    parser.add_argument("--host", default=os.environ.get("SCOUT_PRESENCE_HOST", "127.0.0.1"))
+    parser.add_argument("--host", default=os.environ.get("SCOUT_PRESENCE_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("SCOUT_PRESENCE_PORT", "5002")))
     parser.add_argument("--brain-url", default=DEFAULT_BRAIN_URL)
     parser.add_argument("--source", default=DEFAULT_SOURCE)

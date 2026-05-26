@@ -1,0 +1,20 @@
+[Unit]
+Description=LUHKAS Robot API ({NODE_ID})
+After=network-online.target
+Wants=network-online.target
+{EXTRA_UNIT}
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory={NODE_DIR}
+Environment=LUHKAS_NODE_ID={NODE_ID}
+Environment=SCOUT_TELEMETRY_LOG_ENABLED=1
+Environment=SCOUT_TELEMETRY_DB_PATH={NODE_DIR}/config/telemetry.db
+{EXTRA_ENV}
+ExecStart={NODE_DIR}/scripts/start_robot_api.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

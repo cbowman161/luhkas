@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0c10">
+  <title>LUHKAS</title>
+  <link rel="stylesheet" href="/ui/assets/app.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="node-id" id="nodeId">…</div>
+    <div class="badges">
+      <span class="badge" id="batteryBadge" title="battery">— %</span>
+      <span class="badge" id="audioBadge" title="audio">audio</span>
+      <span class="badge" id="cameraBadge" title="camera">camera</span>
+      <span class="badge clock" id="clock"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="exchange">
+      <div class="bubble user" id="userBubble">
+        <div class="label">You</div>
+        <div class="text" id="userText">Say something…</div>
+        <div class="meta" id="userMeta"></div>
+      </div>
+      <div class="bubble assistant" id="assistantBubble">
+        <div class="label">LUHKAS</div>
+        <div class="text" id="assistantText">Listening.</div>
+        <div class="meta" id="assistantMeta"></div>
+      </div>
+    </section>
+
+    <section class="history" id="history" aria-label="History"></section>
+  </main>
+
+  <footer>
+    <button class="control" id="muteBtn" type="button">Mute mic</button>
+  </footer>
+
+  <script src="/ui/assets/app.js"></script>
+</body>
+</html>

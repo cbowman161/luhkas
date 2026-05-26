@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import socket
 import sys
@@ -10,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -31,13 +33,47 @@ state_lock = threading.Lock()
 serial_lock = threading.Lock()
 ser = None
 serial_buffer = ""
-latest_battery = {"voltage": 0.0, "percent": 0}
+# Battery state is owned by battery_node. We publish each T:1001 reading to
+# BATTERY_RAW_PATH for the uart_proxy backend to consume, and pull the
+# canonical reading from battery_node's HTTP service when we need it
+# locally (e.g. for the OLED display).
+_BATTERY_RAW_DEFAULT_BASE = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+BATTERY_RAW_PATH = Path(
+    os.environ.get("BATTERY_UART_PROXY_PATH")
+    or f"{_BATTERY_RAW_DEFAULT_BASE}/luhkas-battery.json"
+)
+BATTERY_SERVICE_URL = os.environ.get("BATTERY_SERVICE_URL", "http://127.0.0.1:5003").rstrip("/")
 latest_telemetry: dict = {}
 last_heartbeat: float = 0.0
 HEARTBEAT_TIMEOUT = 5.0  # seconds before wheels are stopped
 pt_seq = 0
 mv_seq = 0
 oled_queue: queue.Queue = queue.Queue(maxsize=1)
+
+
+def _publish_battery_reading(voltage: float, percent: int) -> None:
+    """Write the latest UART battery sample for battery_node to read."""
+    try:
+        BATTERY_RAW_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BATTERY_RAW_PATH.with_suffix(BATTERY_RAW_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps({
+            "voltage": voltage,
+            "percent": percent,
+            "timestamp": time.time(),
+            "source": "robot_api_uart",
+        }))
+        tmp.replace(BATTERY_RAW_PATH)
+    except Exception as exc:
+        log.debug("battery publish failed: %s", exc)
+
+
+def _fetch_battery_for_display() -> dict:
+    """Best-effort fetch of canonical battery reading from battery_node."""
+    try:
+        with urlopen(f"{BATTERY_SERVICE_URL}/battery", timeout=1.0) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {}
 
 pt_cmd = {
     "mode": "stop",
@@ -119,7 +155,7 @@ def heartbeat_watchdog() -> None:
 
 
 def serial_reader() -> None:
-    global serial_buffer, latest_battery
+    global serial_buffer
     while True:
         try:
             if not ser or not ser.is_open:
@@ -148,7 +184,7 @@ def serial_reader() -> None:
                     raw_voltage = float(data.get("v", 0))
                     voltage = raw_voltage / 100.0
                     percent = max(0, min(100, int((voltage - 9.9) / (12.6 - 9.9) * 100)))
-                    latest_battery = {"voltage": voltage, "percent": percent}
+                    _publish_battery_reading(voltage, percent)
                     latest_telemetry.update({
                         "timestamp": time.time(),
                         "motors": {"L": data.get("L", 0), "R": data.get("R", 0)},
@@ -156,7 +192,6 @@ def serial_reader() -> None:
                         "gyro": {"x": data.get("gx", 0), "y": data.get("gy", 0), "z": data.get("gz", 0)},
                         "mag": {"x": data.get("mx", 0), "y": data.get("my", 0), "z": data.get("mz", 0)},
                         "encoders": {"left": data.get("odl", 0), "right": data.get("odr", 0)},
-                        "battery": latest_battery,
                     })
                     if telemetry_logger is not None:
                         telemetry_logger.log(data)
@@ -186,7 +221,12 @@ def oled_updater() -> None:
                 write_serial({"T": 3, "lineNum": 1, "Text": str(lines[1])})
             except queue.Empty:
                 line1 = "   L  U  H  K  A  S   "
-                line2 = f"IP: {ip_addr}" if show_ip else f"BATTERY ::: {latest_battery['percent']} %"
+                if show_ip:
+                    line2 = f"IP: {ip_addr}"
+                else:
+                    reading = _fetch_battery_for_display()
+                    percent = reading.get("percent") if reading.get("ok") else None
+                    line2 = f"BATTERY ::: {percent} %" if percent is not None else "BATTERY ::: ?? %"
                 write_serial({"T": 3, "lineNum": 0, "Text": line1})
                 time.sleep(0.05)
                 write_serial({"T": 3, "lineNum": 1, "Text": line2})
@@ -274,10 +314,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "ok": True,
                 "serial": bool(ser and ser.is_open),
-                "battery": latest_battery,
             })
-        elif self.path == "/battery":
-            self._json(latest_battery)
         elif self.path == "/telemetry":
             self._json(latest_telemetry)
         elif self.path.startswith("/telemetry/history"):

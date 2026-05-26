@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 import requests
 
-from config import DATA_DIR, FACE_REFERENCES_DIR, OLLAMA_VISION_MODEL, PEOPLE_DIR, ROOT_DIR, SCOUT_ROBOT_URL, SCOUT_URL
+from config import DATA_DIR, FACE_REFERENCES_DIR, OLLAMA_VISION_MODEL, PEOPLE_DIR, ROOT_DIR, SCOUT_BATTERY_URL, SCOUT_ROBOT_URL, SCOUT_URL
 from models import get_model, model_manifest
 from mood_engine import MoodEngine
 from response_composer import ResponseComposer
@@ -417,6 +417,7 @@ class ScoutVaultBridge:
     def __init__(self, scout_url: str = SCOUT_URL):
         self.scout_url = scout_url.rstrip("/")
         self.scout_robot_url = SCOUT_ROBOT_URL.rstrip("/")
+        self.scout_battery_url = SCOUT_BATTERY_URL.rstrip("/")
         self.people_dir = Path(PEOPLE_DIR)
         self.face_dir = Path(FACE_REFERENCES_DIR)
         self.unknown_face_dir = Path(DATA_DIR) / "unknown_face_groups"
@@ -452,6 +453,12 @@ class ScoutVaultBridge:
             print(f"[memory_store] disabled: {exc}")
             self.embed_model = None
             self.memory_store = None
+        try:
+            from world import WorldKnowledgeStore
+            self.world_store = WorldKnowledgeStore(text_embedder=self.embed_model)
+        except Exception as exc:
+            print(f"[world_store] disabled: {exc}")
+            self.world_store = None
         # Seed the "assistant" identity bucket from identity_profile +
         # self/identity.json so recall about Luhkas itself goes through the
         # same vector path as recall about users. Duplicate guard prevents
@@ -687,9 +694,12 @@ class ScoutVaultBridge:
         ]
         if route_name == "general_question":
             mem_src = getattr(self, "_current_memory_sources", None) or {}
+            world_src = getattr(self, "_current_world_sources", None) or {}
             recalled = mem_src.get("recalled_facts") or []
             chat_turn_count = mem_src.get("recent_chat_turns") or 0
             identity_scope = mem_src.get("identity_scope") or "unknown"
+            wiki_hits = world_src.get("wiki_hits") or []
+            media_hits = world_src.get("media_hits") or []
             if recalled:
                 sources.append({
                     "name": "memory_store",
@@ -705,7 +715,29 @@ class ScoutVaultBridge:
                     "ok": True,
                     "turns_consulted": chat_turn_count,
                 })
-            if not recalled and not chat_turn_count:
+            if wiki_hits:
+                sources.append({
+                    "name": "wikipedia",
+                    "role": "offline Wikipedia corpus (WorldKnowledgeStore)",
+                    "ok": True,
+                    "articles_consulted": [
+                        {"title": h.get("title"), "section": h.get("section"),
+                         "distance": h.get("distance")}
+                        for h in wiki_hits
+                    ],
+                })
+            if media_hits:
+                sources.append({
+                    "name": "media_vault",
+                    "role": "offline media transcripts/captions (WorldKnowledgeStore)",
+                    "ok": True,
+                    "assets_consulted": [
+                        {"asset_id": h.get("asset_id"), "modality": h.get("modality"),
+                         "distance": h.get("distance")}
+                        for h in media_hits
+                    ],
+                })
+            if not recalled and not chat_turn_count and not wiki_hits and not media_hits:
                 sources.append({
                     "name": "model_prior_knowledge",
                     "role": "model prior knowledge",
@@ -1230,6 +1262,7 @@ class ScoutVaultBridge:
                         message,
                         source=source,
                         presence_context=presence_context,
+                        node_id=session_key,
                     )
                     self._ensure_result_provenance(result, message)
                     identity_context = self.response_identity_context({"ok": True})
@@ -1247,7 +1280,7 @@ class ScoutVaultBridge:
                 self._migrate_identity(new_identity, session_key)
             return result
 
-    def _handle_message_impl(self, message: str, source=None, presence_context: dict | None = None):
+    def _handle_message_impl(self, message: str, source=None, presence_context: dict | None = None, node_id: str = ""):
         actions = []
         source = _normalize_source(source)
         if _is_wakeword_only(message):
@@ -1335,7 +1368,7 @@ class ScoutVaultBridge:
             return {"ok": True, **turn}
 
         state = self.scout_state()
-        self._adopt_identity_from_state(state)
+        self._adopt_identity_from_state(state, node_id=node_id)
 
         if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
             if _source_is_scout(source):
@@ -3179,6 +3212,21 @@ STRICT WORD RULES:
             options={"num_predict": max_tokens, "temperature": temperature},
         )
 
+    def _scrub_primary_user(self, text: str | None, primary_user: str | None = None) -> str:
+        """Replace the primary_user's proper name with a generic stand-in
+        ("the user") in a single string. Used to keep the chat model
+        from parroting the name when the current speaker hasn't been
+        face-verified — without this, *any* prompt field that references
+        the primary user (identity_role, recent_chat, etc.) can leak the
+        name back to the model, which then volunteers it as the
+        speaker's name even when the speaker is unknown."""
+        if not text:
+            return text or ""
+        name = primary_user or self.identity_profile.get("primary_user")
+        if not name:
+            return text
+        return re.sub(r"\b" + re.escape(name) + r"\b", "the user", text)
+
     def response_identity_context(self, state: dict):
         active_identity = self.active_identity if state.get("ok") else None
         primary_user = self.identity_profile.get("primary_user")
@@ -3188,17 +3236,28 @@ STRICT WORD RULES:
             and primary_user
             and _safe_identity(active_identity) == _safe_identity(primary_user)
         )
+        # Hard scrub: when we are NOT allowed to address the current
+        # user by name, do not surface primary_user in the dict at all.
+        # The chat model has demonstrated a tendency to parrot any name
+        # it sees in the prompt regardless of accompanying "do not
+        # address" rules ("tell me how you feel" -> "Your name is
+        # Chris."). Removing the field is the only reliable guard.
+        if active_matches_primary:
+            return {
+                "active_identity": active_identity,
+                "primary_user": primary_user,
+                "primary_user_title": primary_user_title,
+                "active_matches_primary_user": True,
+                "may_address_primary_user": True,
+                "addressing_rule": "You may address the current user with primary_user or primary_user_title.",
+            }
         return {
             "active_identity": active_identity,
-            "primary_user": primary_user,
-            "primary_user_title": primary_user_title,
-            "active_matches_primary_user": active_matches_primary,
-            "may_address_primary_user": active_matches_primary,
-            "addressing_rule": (
-                "You may address the current user with primary_user or primary_user_title."
-                if active_matches_primary
-                else "Do not address the current user by primary_user, primary_user_title, or a known person name."
-            ),
+            "primary_user": None,
+            "primary_user_title": None,
+            "active_matches_primary_user": False,
+            "may_address_primary_user": False,
+            "addressing_rule": "You do not know the current user's name. Do not address them by any name.",
         }
 
     def generate_guarded_response(
@@ -3456,15 +3515,36 @@ User message:
                 best_name = str(identity).strip()
         return best_name
 
-    def _adopt_identity_from_state(self, state: dict | None) -> None:
+    def _adopt_identity_from_state(self, state: dict | None, node_id: str | None = None) -> None:
         """If the camera currently sees a recognized person, adopt that as the
         active identity for this turn. Sticky: we do NOT clear active_identity
         when nobody is visible — that lets the user step out briefly without
         the session losing context. Voice recognition will arbitrate conflicts
-        once it lands."""
+        once it lands.
+
+        When the adoption transitions from "nobody" → "known person", that's
+        a user-present signal: bump node activity AND flush any deferred
+        alerts onto this node's queue so the user immediately sees what
+        accumulated while they were away."""
         picked = self._pick_identity_from_state(state)
-        if picked and (not self.active_identity or self.active_identity.lower() != picked.lower()):
+        prev = self.active_identity
+        transitioned = bool(picked) and (
+            not prev or prev.lower() != picked.lower()
+        )
+        if picked and transitioned:
             self.active_identity = picked
+        if transitioned and node_id and getattr(self, "node_registry", None):
+            try:
+                self.node_registry.update_activity(node_id, identity=picked)
+                drained = self.node_registry.flush_pending_to(node_id)
+                if drained:
+                    print(
+                        f"[bridge] identity-adoption flushed {drained} "
+                        f"deferred alert(s) to {node_id}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[bridge] identity-adoption flush failed: {exc}", flush=True)
 
     def _unidentified_face_ref(self, state: dict | None) -> str | None:
         """Best-effort handle for the unknown-bucket: most-confident visible
@@ -3679,6 +3759,43 @@ Output JSON only:
             return self.memory_store.search(query, identity=identity, top_k=top_k)
         except Exception as exc:
             print(f"[memory_store] search failed: {exc}")
+            return []
+
+    def recall_world_knowledge(self, query: str, top_k: int = 3) -> list[dict]:
+        """Look up reference corpus (offline Wikipedia + media transcripts)
+        for world-fact context. Identity-free; safe to call on every general
+        question. Returns [] when the store is unavailable."""
+        if not self.world_store:
+            return []
+        try:
+            from world.config import (
+                WORLD_MEDIA_TEXT_DISTANCE_MAX, WORLD_WIKI_DISTANCE_MAX,
+            )
+            hits: list[dict] = []
+            for h in self.world_store.search_wiki(
+                query, top_k=top_k, distance_max=WORLD_WIKI_DISTANCE_MAX,
+            ):
+                hits.append({
+                    "source": "wikipedia",
+                    "title": h.get("title") or "",
+                    "section": h.get("section_path") or "",
+                    "snippet": (h.get("content") or "")[:600],
+                    "distance": h.get("distance"),
+                    "article_id": h.get("article_id"),
+                })
+            for h in self.world_store.search_media_text(
+                query, top_k=2, distance_max=WORLD_MEDIA_TEXT_DISTANCE_MAX,
+            ):
+                hits.append({
+                    "source": "media_vault",
+                    "asset_id": h.get("asset_id"),
+                    "modality": h.get("modality"),
+                    "snippet": (h.get("content") or "")[:600],
+                    "distance": h.get("distance"),
+                })
+            return hits
+        except Exception as exc:
+            print(f"[world_store] search failed: {exc}")
             return []
 
     ASSISTANT_MEMORY_IDENTITY = "assistant"
@@ -4000,9 +4117,20 @@ English:
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
-        self_description = _identity_sentence(identity_name, identity_role)
         active_identity_context = self.active_identity if state.get("ok") else "unverified_scout_tracking_unavailable"
         identity_context = self.response_identity_context(state)
+        # When we can't address the current user by name, strip the
+        # primary_user's name out of EVERY string we put in the prompt
+        # — `identity_role` is often "the AI companion and assistant
+        # Chris created" and the chat model has been parroting "Chris"
+        # as the user's name when the prompt mentions it ("tell me how
+        # you feel" -> "Your name is Chris."). The legitimate self
+        # description still tells the model who it is; it just loses
+        # the proper-name reference until we've face-verified the user.
+        primary_user = self.identity_profile.get("primary_user")
+        if primary_user and not identity_context.get("may_address_primary_user"):
+            identity_role = self._scrub_primary_user(identity_role, primary_user)
+        self_description = _identity_sentence(identity_name, identity_role)
         response_context = self.response_context(state)
         conversation_context = _presence_conversation_context(presence_context)
         # Convert stored 3rd-person facts to 2nd person before injecting so
@@ -4013,6 +4141,10 @@ English:
             self._third_to_second_person(r["content"])
             for r in self.recall_user_facts(message, top_k=5)
         ]
+        # World-knowledge lookup runs in parallel with user-fact recall and
+        # is identity-free. Composer prompt instructs the model to use these
+        # only for world facts (not speaker questions) and to cite by title.
+        world_hits = self.recall_world_knowledge(message, top_k=3)
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
         # Only inject recent_chat as a fallback when memory has nothing for
@@ -4020,6 +4152,17 @@ English:
         # ("I work as an architect" then "no, keep teacher" -> LLM still
         # sees the architect statement and tends to use it).
         recent_chat = self._recent_chat_for_recall(limit=6) if not recalled_facts else []
+        # If we can't address by name, scrub primary_user out of
+        # recent_chat too — once the model emits a bad "Your name is X"
+        # reply, that text sits in recent_chat and reinforces itself on
+        # every subsequent turn until the session resets.
+        if primary_user and not identity_context.get("may_address_primary_user") and recent_chat:
+            recent_chat = [
+                {**t, "user": self._scrub_primary_user(t.get("user"), primary_user),
+                      "assistant": self._scrub_primary_user(t.get("assistant"), primary_user)}
+                if isinstance(t, dict) else t
+                for t in recent_chat
+            ]
         # Annotate the running answer with the sources we consulted so the
         # outer provenance builder can surface them deterministically.
         self._current_memory_sources = {
@@ -4027,6 +4170,19 @@ English:
             "recent_chat_turns": len(recent_chat),
             "identity_scope": (self.active_identity or "unknown"),
         }
+        self._current_world_sources = {
+            "wiki_hits": [h for h in world_hits if h["source"] == "wikipedia"],
+            "media_hits": [h for h in world_hits if h["source"] == "media_vault"],
+        }
+        world_knowledge_prompt = [
+            {
+                "source": h["source"],
+                "title": h.get("title") or h.get("asset_id"),
+                "section": h.get("section") or h.get("modality"),
+                "snippet": h["snippet"],
+            }
+            for h in world_hits
+        ]
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -4043,30 +4199,88 @@ Context:
     "tracking_memory": state.get("object_memory", [])[:4],
     "remembered_user_facts": recalled_facts,
     "facts_just_stored": facts_just_stored,
+    "world_knowledge": world_knowledge_prompt,
 }, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
 Answer ONLY the specific thing the user asked. Do NOT volunteer unrelated stored facts. If they asked "what's my name", answer with the name and nothing else — do not append their location or snack preference.
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
-For recall about the SPEAKER (their name, possessions, preferences, plans):
+If the user is asking about YOURSELF (your mood, feelings, opinions, personality, name, role — anything starting with "you" / "your"), answer from your self_description and identity above. Do NOT use the "I don't have that stored" fallback — that template is for the SPEAKER's stored facts, never for your own inner state.
+For recall about the SPEAKER (their name, possessions, preferences, plans — anything starting with "my" / "I"):
   1. remembered_user_facts is the AUTHORITATIVE source. Pick the SINGLE fact from that list that matches what was asked and use its value verbatim. Ignore the others.
-  2. Questions phrased as "do you know my X", "do you remember my X", "do I have an X", "what's my X" all ask for the VALUE of X. If a fact about X exists in remembered_user_facts, answer with the value (e.g. "Your name is Chris."), not a yes/no.
+  2. Questions phrased as "do you know my X", "do you remember my X", "do I have an X", "what's my X" all ask for the VALUE of X. If a fact about X exists in remembered_user_facts, answer with the value verbatim from the matching fact (e.g. if a fact reads "the user's favorite drink is coffee", answer "Your favorite drink is coffee."), not a yes/no.
   3. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
   4. If none of remembered_user_facts actually matches what was asked (e.g. user asked for their name but only location/snack are stored), say plainly "I don't have that stored." Do NOT substitute an unrelated fact.
+For world-fact questions (NOT about the speaker — e.g. capitals, history, science, definitions, public people/places):
+  - world_knowledge is your offline reference corpus (Wikipedia + ingested media transcripts).
+  - If world_knowledge has a snippet that directly answers the question: USE IT and cite the source title verbatim (e.g. "According to Wikipedia's 'Mongolia' article, ..."). The cited title MUST appear verbatim in world_knowledge[*].title.
+  - If world_knowledge is empty OR no snippet directly answers the question: you MAY answer from your own knowledge, but you MUST NOT fabricate a citation. Do NOT write "According to Wikipedia" or "per the Mongolia article" or any reference attribution when world_knowledge is empty. Just answer plainly without citation.
+  - Never blend world_knowledge with remembered_user_facts. Speaker questions use facts; world questions use world_knowledge.
 Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
 """
         try:
-            return self.generate_guarded_response(
-                "general_question",
+            # Bypass response_composer: its outer "Write the final user-facing
+            # answer..." scaffold treats this prompt as data ("Facts:
+            # {legacy_prompt: ...}") instead of instructions, which drowned
+            # out the world_knowledge / remembered_user_facts rules. Same
+            # reason _assistant_identity_answer goes direct.
+            text = (self.chat_model.generate(
                 prompt,
-                state,
-                options={"num_predict": 90, "temperature": 0.45, "top_p": 0.9},
-            )
+                options={"num_predict": 140, "temperature": 0.45, "top_p": 0.9},
+                think=False,
+                allow_empty=True,
+            ) or "").strip()
+            text = _sanitize_generated_response(text) if text else ""
+            if not text:
+                return "I could not generate that cleanly."
+            violation = self.response_policy_violation(text, state, "general_question")
+            if violation:
+                fallback = self.cleanup_policy_failed_response(
+                    "general_question", state, "policy violation"
+                )
+                return fallback or "I could not generate that cleanly."
+            # Strip fabricated Wikipedia citations. The chat model
+            # sometimes adds "According to Wikipedia's X article" even
+            # when world_knowledge was empty or the cited title isn't
+            # among the offered hits. The prompt forbids this but the
+            # model ignores the rule for high-confidence pretraining
+            # facts. Better to scrub the cite than mislead the user.
+            text = self._strip_unverified_wiki_citations(text)
+            return text
         except Exception as exc:
             return f"I can hear you, but my local chat model is unavailable: {exc}"
+
+    _UNVERIFIED_CITATION_PATTERNS = (
+        re.compile(r"\s*[,(.]?\s*according to wikipedia[^.,;]*[.,;]?", re.IGNORECASE),
+        re.compile(r"\s*[,(.]?\s*per (the|wikipedia['’]s)[^.,;]*article[.,;]?", re.IGNORECASE),
+        re.compile(r"\s*[,(.]?\s*from wikipedia['’]s[^.,;]*article[.,;]?", re.IGNORECASE),
+        re.compile(r"\s*[,(.]?\s*wikipedia['’]s [\"'].+?[\"'] article (says|states|notes)[^.,;]*[.,;]?", re.IGNORECASE),
+    )
+
+    def _strip_unverified_wiki_citations(self, text: str) -> str:
+        """Remove "According to Wikipedia's X article" phrasings unless an
+        offered wiki hit's title actually appears in the citation. The
+        chat model fabricates these for facts it knows from pretraining
+        — sourcing them to Wikipedia is misleading."""
+        if not text:
+            return text
+        wiki_hits = (getattr(self, "_current_world_sources", None) or {}).get("wiki_hits") or []
+        titles_lower = {(h.get("title") or "").lower() for h in wiki_hits if h.get("title")}
+        cleaned = text
+        for pat in self._UNVERIFIED_CITATION_PATTERNS:
+            for m in list(pat.finditer(cleaned)):
+                snippet = m.group(0).lower()
+                if titles_lower and any(t and t in snippet for t in titles_lower):
+                    continue  # cited title is among offered hits — keep it
+                cleaned = cleaned.replace(m.group(0), "")
+        # Tidy up whitespace and stray double-punctuation left by removal.
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"([.,;:!?])\1+", r"\1", cleaned)
+        return cleaned
 
     def identity_status(self, state: dict):
         return self.generate_response(
@@ -4330,15 +4544,19 @@ Do not address the user by name/title unless identity_context permits it.
     def scout_tool_status(self):
         state = self.scout_state()
         robot_health = self._get_json(f"{self.scout_robot_url}/health") or {"ok": False, "error": "robot_api_unavailable"}
+        battery_health = self._get_json(f"{self.scout_battery_url}/health") or {"ok": False, "error": "battery_service_unavailable"}
         scout_capabilities = self.scout_node_capabilities()
         return {
             "ok": True,
             "scout_url": self.scout_url,
             "scout_robot_url": self.scout_robot_url,
+            "scout_battery_url": self.scout_battery_url,
             "vision_reachable": bool(state.get("ok")),
             "robot_api_reachable": bool(robot_health.get("ok")),
+            "battery_reachable": bool(battery_health.get("ok")),
             "state": _compact_scout_state(state),
             "robot_health": robot_health,
+            "battery_health": battery_health,
             "node_capabilities": scout_capabilities,
             "actions": [
                 "inspect_scout_state",
@@ -4372,11 +4590,14 @@ Do not address the user by name/title unless identity_context permits it.
                 ],
                 "robot_api": [
                     "GET /health",
-                    "GET /battery",
                     "GET /telemetry",
                     "POST /pantilt",
                     "POST /move",
                     "POST /oled",
+                ],
+                "battery": [
+                    "GET /health",
+                    "GET /battery",
                 ],
             },
         }

@@ -19,8 +19,9 @@ SKILLS_REGISTRY_PATH = str(SKILLS_DIR / "skills.json")
 TASK_LOG_DIR = str(LOGS_DIR / "tasks")
 
 CODE_MONKEY_URL = "http://127.0.0.1:8765"
-SCOUT_URL = os.environ.get("VAULT_SCOUT_URL", "http://192.168.4.32:5000")
-SCOUT_ROBOT_URL = os.environ.get("VAULT_SCOUT_ROBOT_URL", "http://192.168.4.32:5001")
+SCOUT_URL = os.environ.get("VAULT_SCOUT_URL", "http://luhkas-scout:5000")
+SCOUT_ROBOT_URL = os.environ.get("VAULT_SCOUT_ROBOT_URL", "http://luhkas-scout:5001")
+SCOUT_BATTERY_URL = os.environ.get("VAULT_SCOUT_BATTERY_URL", "http://luhkas-scout:5003")
 OLLAMA_URL = os.environ.get("VAULT_OLLAMA_URL", "http://localhost:11434")
 
 VAULT_ROUTER_MODEL = os.environ.get("VAULT_ROUTER_MODEL", "qwen2.5:3b-instruct")

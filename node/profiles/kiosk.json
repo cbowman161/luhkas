@@ -1,0 +1,9 @@
+{
+  "node_id": "kiosk",
+  "modules": [
+    "camera_node",
+    "battery_node",
+    "audio_node",
+    "display_node"
+  ]
+}

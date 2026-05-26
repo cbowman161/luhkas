@@ -54,6 +54,8 @@ def _all_known_modules() -> list[str]:
     modules: set[str] = set()
     if _PROFILES_DIR.exists():
         for path in _PROFILES_DIR.glob("*.json"):
+            if path.name.startswith("."):  # skip ._* macOS resource forks
+                continue
             try:
                 data = json.loads(path.read_text())
                 modules.update(m.strip() for m in data.get("modules", []) if m.strip())

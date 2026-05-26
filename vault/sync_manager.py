@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROFILES_DIR = _REPO_ROOT / "node" / "profiles"
 _NODE_DIR = _REPO_ROOT / "node"
+
+# Use the canonical profile loader so sync.host / user / node_dir / services
+# are filled in from node_id + modules when the profile doesn't spell them out.
+if str(_NODE_DIR) not in sys.path:
+    sys.path.insert(0, str(_NODE_DIR))
+from profile_loader import load_profile as _load_profile  # noqa: E402
+_SECRETS_DIR = _REPO_ROOT / "vault" / "secrets"
+_TAILSCALE_AUTHKEY_FILE = _SECRETS_DIR / "tailscale.authkey"
 _SSH_KEY = Path.home() / ".ssh" / "id_ed25519_nodes"
 
 _SSH_OPTS = [
@@ -124,6 +133,148 @@ def push_node(profile: dict) -> dict:
     }
 
 
+def push_tailscale_authkey(profile: dict) -> dict:
+    """Copy the vault's current Tailscale auth key to one node."""
+    sync = profile.get("sync") or {}
+    host = sync.get("host", "")
+    user = sync.get("user", "luhkas")
+    node_id = profile.get("node_id", "?")
+
+    if not host:
+        return {"ok": False, "node_id": node_id, "error": "no sync.host configured in profile"}
+    if not _TAILSCALE_AUTHKEY_FILE.exists():
+        return {
+            "ok": False,
+            "node_id": node_id,
+            "error": f"missing auth key file: {_TAILSCALE_AUTHKEY_FILE}",
+        }
+
+    key = _TAILSCALE_AUTHKEY_FILE.read_text(encoding="utf-8").strip()
+    if not key:
+        return {"ok": False, "node_id": node_id, "error": "auth key file is empty"}
+
+    remote = (
+        "set -euo pipefail; "
+        "install -m 700 -d ~/.config/luhkas; "
+        "tmp=$(mktemp); "
+        "cat > \"$tmp\"; "
+        "install -m 600 \"$tmp\" ~/.config/luhkas/tailscale.authkey; "
+        "rm -f \"$tmp\"; "
+        "cat > ~/.config/luhkas/bootstrap.env <<'EOF'\n"
+        "export TAILSCALE_AUTHKEY_FILE=\"$HOME/.config/luhkas/tailscale.authkey\"\n"
+        "export LUHKAS_TAILSCALE=1\n"
+        "export LUHKAS_PREFER_TAILSCALE=1\n"
+        "EOF\n"
+        "chmod 600 ~/.config/luhkas/bootstrap.env"
+    )
+    result = subprocess.run(
+        ["ssh"] + _SSH_OPTS + [f"{user}@{host}", remote],
+        input=key + "\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return {"ok": False, "node_id": node_id, "host": host, "error": result.stderr.strip()}
+    return {"ok": True, "node_id": node_id, "host": host, "installed": True}
+
+
+def push_tailscale_authkeys(node_id: str | None = None) -> dict:
+    """Push the current Tailscale auth key secret to all configured nodes."""
+    nodes: dict[str, dict] = {}
+    for profile_path in sorted(p for p in _PROFILES_DIR.glob("*.json") if not p.name.startswith(".")):
+        try:
+            profile = _load_profile(profile_path)
+        except Exception as exc:
+            nodes[profile_path.stem] = {"ok": False, "error": f"bad profile: {exc}"}
+            continue
+        nid = profile.get("node_id", profile_path.stem)
+        if node_id and nid != node_id:
+            continue
+        if not profile.get("sync"):
+            continue
+        nodes[nid] = push_tailscale_authkey(profile)
+    return {
+        "ok": all(v.get("ok") for v in nodes.values()) if nodes else True,
+        "nodes": nodes,
+        "synced_at": time.time(),
+    }
+
+
+def provision_tailscale_for_node(
+    *,
+    node_id: str,
+    host: str,
+    user: str = "luhkas",
+    node_dir: str = "luhkas/node",
+) -> dict:
+    """Install the current Tailscale auth key on a registered node and run setup.
+
+    This is called after /node/register. The node already fetched the vault's
+    SSH public key during registration, so the vault can push the secret over
+    SSH without exposing the auth key through the HTTP API.
+    """
+    node_id = str(node_id or "").strip()
+    host = str(host or "").strip()
+    user = str(user or "luhkas").strip()
+    node_dir = str(node_dir or "luhkas/node").strip().strip("/")
+    if not node_id:
+        return {"ok": False, "error": "missing node_id"}
+    if not host:
+        return {"ok": False, "node_id": node_id, "error": "missing host"}
+    if not _TAILSCALE_AUTHKEY_FILE.exists():
+        return {
+            "ok": False,
+            "node_id": node_id,
+            "host": host,
+            "error": f"missing auth key file: {_TAILSCALE_AUTHKEY_FILE}",
+        }
+    key = _TAILSCALE_AUTHKEY_FILE.read_text(encoding="utf-8").strip()
+    if not key:
+        return {"ok": False, "node_id": node_id, "host": host, "error": "auth key file is empty"}
+
+    hostname = f"luhkas-{node_id}"
+    remote = (
+        "set -euo pipefail; "
+        "install -m 700 -d ~/.config/luhkas; "
+        "tmp=$(mktemp); "
+        "cat > \"$tmp\"; "
+        "install -m 600 \"$tmp\" ~/.config/luhkas/tailscale.authkey; "
+        "rm -f \"$tmp\"; "
+        "cat > ~/.config/luhkas/bootstrap.env <<'EOF'\n"
+        "export TAILSCALE_AUTHKEY_FILE=\"$HOME/.config/luhkas/tailscale.authkey\"\n"
+        "export LUHKAS_TAILSCALE=1\n"
+        "export LUHKAS_PREFER_TAILSCALE=1\n"
+        "EOF\n"
+        "chmod 600 ~/.config/luhkas/bootstrap.env; "
+        f"if [ -x ~/{node_dir}/scripts/setup_tailscale.sh ]; then "
+        f"LUHKAS_NODE_ID={node_id!r} TAILSCALE_HOSTNAME={hostname!r} "
+        f"~/{node_dir}/scripts/setup_tailscale.sh; "
+        "else echo 'setup_tailscale.sh not found' >&2; exit 2; fi"
+    )
+    result = subprocess.run(
+        ["ssh"] + _SSH_OPTS + [f"{user}@{host}", remote],
+        input=key + "\n",
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "node_id": node_id,
+            "host": host,
+            "error": (result.stderr or result.stdout).strip(),
+        }
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "host": host,
+        "hostname": hostname,
+        "output": result.stdout.strip(),
+    }
+
+
 def push_all(node_id: str | None = None) -> dict:
     """Rsync node/ to every node with a sync profile, without pulling from git.
 
@@ -137,7 +288,7 @@ def push_all(node_id: str | None = None) -> dict:
 
     for profile_path in sorted(p for p in _PROFILES_DIR.glob("*.json") if not p.name.startswith(".")):
         try:
-            profile = json.loads(profile_path.read_text())
+            profile = _load_profile(profile_path)
         except Exception as exc:
             nodes[profile_path.stem] = {"ok": False, "error": f"bad profile: {exc}"}
             continue
@@ -171,7 +322,7 @@ def sync_all(node_id: str | None = None) -> dict:
 
     for profile_path in sorted(p for p in _PROFILES_DIR.glob("*.json") if not p.name.startswith(".")):
         try:
-            profile = json.loads(profile_path.read_text())
+            profile = _load_profile(profile_path)
         except Exception as exc:
             nodes[profile_path.stem] = {"ok": False, "error": f"bad profile: {exc}"}
             continue
@@ -208,7 +359,7 @@ def auto_push_if_new(node_id: str) -> None:
     if not profile_path.exists():
         return
     try:
-        profile = json.loads(profile_path.read_text())
+        profile = _load_profile(profile_path)
     except Exception:
         return
     if not profile.get("sync"):
