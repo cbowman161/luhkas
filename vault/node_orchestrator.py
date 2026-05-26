@@ -192,6 +192,19 @@ def orchestrate(
         if not result.get("ok"):
             record.append(f"  WARN: {mod}/install.sh exited non-zero: {result.get('error', '')[:200]}")
 
+    # ── 4b. optional system-level installs from profile flags ────────────
+    rdp_cfg = profile.get("rdp") if isinstance(profile.get("rdp"), dict) else {}
+    if rdp_cfg.get("enabled"):
+        step("running install_rdp.sh (profile.rdp.enabled)")
+        rdp_cmd = (
+            "set -euo pipefail; "
+            f"sudo NODE_USER={user!r} NODE_ID={node_id!r} "
+            f"bash ~/{node_dir}/scripts/install_rdp.sh"
+        )
+        result = _ssh_run(host, user, rdp_cmd, record, timeout=900)
+        if not result.get("ok"):
+            record.append(f"  WARN: install_rdp.sh exited non-zero: {result.get('error', '')[:200]}")
+
     # ── 5. Tailscale join (push key + run setup_tailscale.sh) ─────────────
     step("provisioning Tailscale (push key + setup_tailscale.sh)")
     try:

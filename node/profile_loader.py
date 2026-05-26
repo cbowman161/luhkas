@@ -216,6 +216,15 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
     if display.get("has_display") and "kind" not in display:
         display["kind"] = "hdmi_touch"
 
+    # ── rdp ────────────────────────────────────────────────────────────────
+    # Any node that has a display attached (display_node) or a camera
+    # (camera_node) is one we plausibly want to remote-desktop into for
+    # debugging. Headless nodes without either don't need an X stack. The
+    # profile may override (e.g. rdp.enabled=false to opt out).
+    rdp_inferred_enabled = ("display_node" in modules) or ("camera_node" in modules)
+    rdp = dict(raw.get("rdp") or {})
+    rdp.setdefault("enabled", rdp_inferred_enabled)
+
     # ── sync ───────────────────────────────────────────────────────────────
     sync_raw = dict(raw.get("sync") or {})
     sync = {
@@ -248,6 +257,7 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
         "modules": modules,
         "services": services,
         "display": display,
+        "rdp": rdp,
         "sync": sync,
         "extra_units": extras,
     })
