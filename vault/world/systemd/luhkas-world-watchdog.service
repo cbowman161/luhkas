@@ -1,0 +1,12 @@
+[Unit]
+Description=LUHKAS world-vault Wikipedia ingest watchdog
+# We want this even if vault-runtime is down (one of the failure modes
+# we want to alert on is the runtime crashing).
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/luhkas/vault
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m world.ingest_watchdog
+StandardOutput=journal
+StandardError=journal

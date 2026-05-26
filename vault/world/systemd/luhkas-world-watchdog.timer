@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic Wikipedia ingest health check
+Requires=luhkas-world-watchdog.service
+
+[Timer]
+# Run 30s after boot, then every 2 minutes.
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=luhkas-world-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

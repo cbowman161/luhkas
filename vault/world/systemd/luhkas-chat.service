@@ -1,0 +1,24 @@
+[Unit]
+Description=LUHKAS persistent chat session (tmux + ui_client.py registered as node_id=vault)
+After=vault-runtime.service
+Wants=vault-runtime.service
+
+[Service]
+# tmux forks into the background; systemd treats that as a normal
+# launch. The tmux server holds the session across detach/reattach.
+Type=forking
+WorkingDirectory=%h/luhkas/vault
+Environment=PYTHONUNBUFFERED=1
+# Kill any prior session of the same name so a restart starts clean.
+ExecStartPre=-/usr/bin/tmux kill-session -t luhkas-chat
+# The vault PC's own chat is just another node in node_registry.
+# Polls /alerts/pending?node_id=vault for proactive pushes from
+# vault-runtime (background events, presence-triggered greetings).
+ExecStart=/usr/bin/tmux new-session -d -s luhkas-chat -c %h/luhkas/vault /usr/bin/python3 ui_client.py --node-id vault --poll-interval 3
+ExecStop=-/usr/bin/tmux kill-session -t luhkas-chat
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
