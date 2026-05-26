@@ -1,0 +1,7 @@
+[Unit]
+Description=Rotate LUHKAS Tailscale node auth key if needed
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vault/luhkas
+ExecStart=/usr/bin/python3 /home/vault/luhkas/scripts/rotate_tailscale_authkey_if_needed.py

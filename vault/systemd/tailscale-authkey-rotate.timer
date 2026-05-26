@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily LUHKAS Tailscale node auth key rotation check
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+Unit=tailscale-authkey-rotate.service
+
+[Install]
+WantedBy=timers.target
