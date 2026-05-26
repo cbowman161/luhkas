@@ -16,6 +16,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${NODE_USER:?NODE_USER is required}"
 BOOT_CONFIG="/boot/firmware/config.txt"
+CMDLINE="/boot/firmware/cmdline.txt"
+# Optional: one of normal | right | inverted | left. Unset => no rotation.
+DISPLAY_ROTATION="${DISPLAY_ROTATION:-}"
 
 echo "[display_node/install] starting (user=${NODE_USER})"
 
@@ -67,6 +70,44 @@ autologin-session=openbox
 user-session=openbox
 EOF
   systemctl enable lightdm.service 2>/dev/null || true
+fi
+
+# ── optional: rotate the active HDMI output ──────────────────────────────────
+# KMS-level rotation via the kernel command line so it applies to the
+# console AND the X/Wayland desktop, and survives every boot.
+if [ -n "$DISPLAY_ROTATION" ]; then
+  case "$DISPLAY_ROTATION" in
+    normal)   ROTATE_DEG=0  ;;
+    right)    ROTATE_DEG=90 ;;
+    inverted) ROTATE_DEG=180 ;;
+    left)     ROTATE_DEG=270 ;;
+    *)
+      echo "[display_node/install] WARN: ignoring unknown DISPLAY_ROTATION='${DISPLAY_ROTATION}'"
+      ROTATE_DEG=""
+      ;;
+  esac
+
+  if [ -n "$ROTATE_DEG" ] && [ -f "$CMDLINE" ]; then
+    # Pick the first connected HDMI port reported by DRM (HDMI-A-1, HDMI-A-2).
+    HDMI_PORT=""
+    for s in /sys/class/drm/card*-HDMI*/status; do
+      if [ -f "$s" ] && [ "$(cat "$s")" = "connected" ]; then
+        HDMI_PORT="$(basename "$(dirname "$s")" | sed 's/^card[0-9]*-//')"
+        break
+      fi
+    done
+    HDMI_PORT="${HDMI_PORT:-HDMI-A-1}"
+
+    VIDEO_ARG="video=${HDMI_PORT}:rotate=${ROTATE_DEG}"
+    # Strip any prior video=<HDMI-A-*>:... arg before appending, so re-runs
+    # update the value instead of accumulating duplicates.
+    sed -i -E "s| ?video=HDMI-A-[0-9]+:[^ ]*||g" "$CMDLINE"
+    sed -i -E "s|$| ${VIDEO_ARG}|" "$CMDLINE"
+    # cmdline.txt must be a single line; collapse if sed left any newlines.
+    tr -d '\n' < "$CMDLINE" > "${CMDLINE}.tmp" && mv "${CMDLINE}.tmp" "$CMDLINE"
+    printf '\n' >> "$CMDLINE"
+    echo "[display_node/install] applied rotation: ${DISPLAY_ROTATION} (${VIDEO_ARG})"
+  fi
 fi
 
 echo "[display_node/install] done"

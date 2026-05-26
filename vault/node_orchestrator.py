@@ -163,6 +163,17 @@ def orchestrate(
         return report(False, f"rsync failed: {rsync_result.get('error')}")
 
     # ── 4. per-module install.sh scripts (NODE_USER=user, NODE_ID=node_id) ─
+    # Per-module env overrides from the profile (e.g. profile.display.rotation
+    # -> DISPLAY_ROTATION for the display_node install). Keep this small: the
+    # profile stays minimal; only fields actually used by a module install
+    # need to be wired here.
+    display_cfg = profile.get("display") if isinstance(profile.get("display"), dict) else {}
+    module_extra_env: dict[str, dict[str, str]] = {
+        "display_node": {
+            "DISPLAY_ROTATION": str(display_cfg.get("rotation") or ""),
+        },
+    }
+
     for mod in modules:
         install_path_remote = f"~/{node_dir}/{mod}/install.sh"
         check = _ssh_run(host, user, f"test -x {install_path_remote}", record, timeout=10)
@@ -170,9 +181,12 @@ def orchestrate(
             step(f"(no install.sh for {mod})")
             continue
         step(f"running {mod}/install.sh on {host}")
+        extras = " ".join(
+            f"{k}={v!r}" for k, v in (module_extra_env.get(mod) or {}).items() if v
+        )
         install_cmd = (
             "set -euo pipefail; "
-            f"sudo NODE_USER={user!r} NODE_ID={node_id!r} bash {install_path_remote}"
+            f"sudo NODE_USER={user!r} NODE_ID={node_id!r} {extras} bash {install_path_remote}"
         )
         result = _ssh_run(host, user, install_cmd, record, timeout=1800)
         if not result.get("ok"):

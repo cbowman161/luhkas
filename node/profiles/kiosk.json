@@ -5,5 +5,8 @@
     "battery_node",
     "audio_node",
     "display_node"
-  ]
+  ],
+  "display": {
+    "rotation": "right"
+  }
 }
