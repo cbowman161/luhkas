@@ -217,13 +217,12 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
         display["kind"] = "hdmi_touch"
 
     # ── rdp ────────────────────────────────────────────────────────────────
-    # Any node that has a display attached (display_node) or a camera
-    # (camera_node) is one we plausibly want to remote-desktop into for
-    # debugging. Headless nodes without either don't need an X stack. The
-    # profile may override (e.g. rdp.enabled=false to opt out).
-    rdp_inferred_enabled = ("display_node" in modules) or ("camera_node" in modules)
+    # Opt-in only. RDP isn't installed unless a profile explicitly sets
+    # ``rdp.enabled: true``. (Earlier this auto-inferred from camera_node
+    # / display_node, but the only host we actually RDP into is the vault,
+    # which manages its own xrdp stack — nodes don't need it.)
     rdp = dict(raw.get("rdp") or {})
-    rdp.setdefault("enabled", rdp_inferred_enabled)
+    rdp.setdefault("enabled", False)
 
     # ── sync ───────────────────────────────────────────────────────────────
     sync_raw = dict(raw.get("sync") or {})
