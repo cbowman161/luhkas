@@ -688,7 +688,10 @@ class Handler(BaseHTTPRequestHandler):
         log.debug(fmt, *args)
 
     def _serve_ui(self) -> None:
-        data = _ui_html().encode("utf-8")
+        # This is Scout's vision service, so the label is "scout" unless
+        # overridden via LUHKAS_NODE_ID (which ui_html honors as the
+        # env-level fallback). Other node services pass their own.
+        data = _ui_html(node_label="scout").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))

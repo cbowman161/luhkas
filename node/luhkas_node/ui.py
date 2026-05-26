@@ -1,13 +1,24 @@
 """LUHKAS node UI composition shell."""
 from __future__ import annotations
 
+import os
+
 from camera_node.ui import ui_sections as camera_ui_sections
 from light_node.ui import ui_sections as light_ui_sections
 from pantilt_node.ui import ui_sections as pantilt_ui_sections
 from rover_node.ui import ui_sections as rover_ui_sections
 
 
-def ui_html() -> str:
+def ui_html(node_label: str | None = None) -> str:
+    """Render the per-node web UI.
+
+    ``node_label`` identifies which node is serving the page; appears in
+    the browser tab title and the header. Falls back to the
+    ``LUHKAS_NODE_ID`` env var, then to ``"NODE"``. Each node service
+    (Scout's vision_service, future wall-node services, etc.) passes
+    its own label so the header reads e.g. ``LUHKAS - {label}`` /
+    ``LUHKAS - KITCHEN`` based on which device the browser is hitting."""
+    label = (node_label or os.environ.get("LUHKAS_NODE_ID") or "node").upper()
     sections = "\n\n".join(
         [
             *camera_ui_sections(),
@@ -21,7 +32,7 @@ def ui_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Luhkas Vision</title>
+<title>LUHKAS - {label}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#111;color:#eee;font-family:system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}}
@@ -75,6 +86,7 @@ input[type=text]:focus{{outline:none;border-color:#3a7}}
 .chat-msg.user{{background:#1a2a1a;border:1px solid #2a4a2a;color:#8e8;align-self:flex-end}}
 .chat-msg.bot{{background:#1c1c2a;border:1px solid #2a2a4a;color:#bbd;align-self:flex-start}}
 .chat-msg.err{{background:#2a1a1a;border:1px solid #4a2a2a;color:#d88;align-self:flex-start}}
+.chat-msg.alert{{background:#2a200e;border:1px solid #4a3a1e;color:#cb6;align-self:flex-start;font-size:.7rem;font-style:italic}}
 .chat-row{{display:flex;gap:4px;flex-shrink:0}}
 .chat-row input[type=text]{{flex:1}}
 .chat-row button{{padding:4px 10px;border-color:#2e6a2e;background:#163016;color:#6c6}}
@@ -85,7 +97,7 @@ input[type=text]:focus{{outline:none;border-color:#3a7}}
 <body>
 <header>
   <span id="dot">●</span>
-  <h1>LUHKAS VISION</h1>
+  <h1>LUHKAS - {label}</h1>
   <span id="hdr-right">fr -</span>
 </header>
 <main>
@@ -385,6 +397,15 @@ function sendChat(){{
       if(d.ok){{
         var r = d.response || {{}};
         appendMsg('bot', r.tts || r.message || '(no response)', elapsed);
+        // Pending push alerts that vault attached to this response
+        // (background-job results, ingest stalls, presence-triggered
+        // pushes). Vault drains its per-node queue when the user types
+        // here, so each alert appears exactly once.
+        (r.pending_alerts || []).forEach(function(a){{
+          var label = a.event_type || a.type || 'alert';
+          var text = (a.message || '').toString();
+          appendMsg('alert', '[' + label + '] ' + text);
+        }});
       }} else {{
         var er = d.response || {{}};
         appendMsg('err', er.message || d.error || 'error');
