@@ -14,8 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/../scripts/lib_install.sh"
 
-NODE_USER="${NODE_USER:-luhkas}"
+: "${NODE_USER:?NODE_USER is required}"
 USER_HOME="$(getent passwd "$NODE_USER" | cut -d: -f6)"
+[ -n "$USER_HOME" ] || { echo "ERROR: user $NODE_USER not found"; exit 2; }
 BOOT_CONFIG="/boot/firmware/config.txt"
 HAILO_APPS_REPO="${HAILO_APPS_REPO:-https://github.com/hailo-ai/hailo-apps.git}"
 HAILO_APPS_DIR="${USER_HOME}/hailo-apps"

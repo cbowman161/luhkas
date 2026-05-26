@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/../scripts/lib_install.sh"
 
-NODE_USER="${NODE_USER:-luhkas}"
+: "${NODE_USER:?NODE_USER is required}"
 BOOT_CONFIG="/boot/firmware/config.txt"
 
 echo "[display_node/install] starting (user=${NODE_USER})"

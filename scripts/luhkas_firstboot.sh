@@ -33,9 +33,9 @@ fi
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 
-NODE_ID="${NODE_ID:?NODE_ID required in bootstrap.env}"
-NODE_USER="${NODE_USER:-luhkas}"
-VAULT_URL="${VAULT_URL:-http://luhkas-vault:7000}"
+: "${NODE_ID:?NODE_ID required in bootstrap.env}"
+: "${NODE_USER:?NODE_USER required in bootstrap.env}"
+: "${VAULT_URL:?VAULT_URL required in bootstrap.env}"
 
 echo "[firstboot] node_id=${NODE_ID} user=${NODE_USER} vault=${VAULT_URL}"
 

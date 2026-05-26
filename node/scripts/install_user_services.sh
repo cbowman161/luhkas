@@ -12,8 +12,10 @@ if [ -f "${BOOTSTRAP_ENV}" ]; then
   set +a
 fi
 
-NODE_ID="${LUHKAS_NODE_ID:-scout}"
-VAULT_URL="${VAULT_CHAT_URL:-http://luhkas-vault.local:7000}"
+: "${LUHKAS_NODE_ID:?LUHKAS_NODE_ID is required (set it in ~/.config/luhkas/bootstrap.env or via env)}"
+: "${VAULT_CHAT_URL:?VAULT_CHAT_URL is required}"
+NODE_ID="${LUHKAS_NODE_ID}"
+VAULT_URL="${VAULT_CHAT_URL}"
 LUHKAS_TAILSCALE="${LUHKAS_TAILSCALE:-1}"
 
 mkdir -p "${UNIT_DIR}"
@@ -41,6 +43,26 @@ if [ "${LUHKAS_TAILSCALE}" = "1" ]; then
     echo "  LUHKAS_NODE_ID=${NODE_ID} ${NODE_DIR}/scripts/setup_tailscale.sh"
   }
 fi
+
+# Remove any LUHKAS-rendered unit files that DON'T belong to this node.
+# A unit is recognizable as LUHKAS-rendered by its ExecStart path pointing
+# at a script in ${NODE_DIR}/scripts/start_*.sh. Anything matching that but
+# not prefixed with "${NODE_ID}-" is a stale rendering from a previous run
+# with a different NODE_ID; disable and remove it so the cleanup is
+# idempotent across reconfigurations.
+PREFIX="${NODE_ID}-"
+shopt -s nullglob
+for unit in "${UNIT_DIR}"/*.service; do
+  name="$(basename "${unit}")"
+  if grep -qE "^ExecStart=${NODE_DIR}/scripts/start_" "${unit}" 2>/dev/null; then
+    if [[ "${name}" != ${PREFIX}* ]]; then
+      echo "Removing stale unit (different NODE_ID): ${name}"
+      systemctl --user disable --now "${name}" 2>/dev/null || true
+      rm -f "${unit}"
+    fi
+  fi
+done
+shopt -u nullglob
 
 # Render this node's systemd units from the shared templates + profile.
 # render_units.py is the single source of truth for what unit files exist.

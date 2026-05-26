@@ -12,8 +12,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/../scripts/lib_install.sh"
 
-NODE_USER="${NODE_USER:-luhkas}"
+: "${NODE_USER:?NODE_USER is required}"
 USER_HOME="$(getent passwd "$NODE_USER" | cut -d: -f6)"
+[ -n "$USER_HOME" ] || { echo "ERROR: user $NODE_USER not found"; exit 2; }
 BOOT_CONFIG="/boot/firmware/config.txt"
 AUDIO_OVERLAY="${AUDIO_OVERLAY:-wm8960-soundcard}"
 VOSK_MODEL_URL="${VOSK_MODEL_URL:-https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip}"

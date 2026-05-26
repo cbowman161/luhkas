@@ -27,10 +27,10 @@ if [ -f "$BOOTSTRAP_ENV" ]; then
     set +a
 fi
 
-NODE_ID="${NODE_ID:?NODE_ID is required}"
-REPO_URL="${REPO_URL:-https://github.com/cbowman161/luhkas.git}"
-INSTALL_DIR="${INSTALL_DIR:-$HOME/luhkas}"
-VAULT_URL="${VAULT_URL:-http://luhkas-vault.local:7000}"
+: "${NODE_ID:?NODE_ID is required}"
+: "${VAULT_URL:?VAULT_URL is required}"
+: "${REPO_URL:?REPO_URL is required}"
+: "${INSTALL_DIR:?INSTALL_DIR is required}"
 LUHKAS_TAILSCALE="${LUHKAS_TAILSCALE:-1}"
 NODE_DIR="$INSTALL_DIR/node"
 

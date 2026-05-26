@@ -153,6 +153,7 @@ def push_tailscale_authkey(profile: dict) -> dict:
     if not key:
         return {"ok": False, "node_id": node_id, "error": "auth key file is empty"}
 
+    node_id_q = node_id.replace("'", "'\\''")
     remote = (
         "set -euo pipefail; "
         "install -m 700 -d ~/.config/luhkas; "
@@ -160,7 +161,8 @@ def push_tailscale_authkey(profile: dict) -> dict:
         "cat > \"$tmp\"; "
         "install -m 600 \"$tmp\" ~/.config/luhkas/tailscale.authkey; "
         "rm -f \"$tmp\"; "
-        "cat > ~/.config/luhkas/bootstrap.env <<'EOF'\n"
+        f"cat > ~/.config/luhkas/bootstrap.env <<EOF\n"
+        f"export LUHKAS_NODE_ID='{node_id_q}'\n"
         "export TAILSCALE_AUTHKEY_FILE=\"$HOME/.config/luhkas/tailscale.authkey\"\n"
         "export LUHKAS_TAILSCALE=1\n"
         "export LUHKAS_PREFER_TAILSCALE=1\n"
@@ -241,7 +243,8 @@ def provision_tailscale_for_node(
         "cat > \"$tmp\"; "
         "install -m 600 \"$tmp\" ~/.config/luhkas/tailscale.authkey; "
         "rm -f \"$tmp\"; "
-        "cat > ~/.config/luhkas/bootstrap.env <<'EOF'\n"
+        f"cat > ~/.config/luhkas/bootstrap.env <<EOF\n"
+        f"export LUHKAS_NODE_ID='{node_id}'\n"
         "export TAILSCALE_AUTHKEY_FILE=\"$HOME/.config/luhkas/tailscale.authkey\"\n"
         "export LUHKAS_TAILSCALE=1\n"
         "export LUHKAS_PREFER_TAILSCALE=1\n"

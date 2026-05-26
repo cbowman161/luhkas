@@ -192,9 +192,13 @@ def orchestrate(
         record.append(f"  WARN: tailscale provisioning errored: {exc}")
 
     # ── 6. install + start user systemd services ──────────────────────────
+    # Pass LUHKAS_NODE_ID explicitly so install_user_services.sh doesn't fall
+    # back to its hardcoded ``scout`` default if bootstrap.env is missing it.
+    # VAULT_CHAT_URL is exported so render_units uses our resolvable URL.
     step("install_user_services.sh (render units + enable + start)")
     svc_cmd = (
         "set -euo pipefail; "
+        f"LUHKAS_NODE_ID={node_id!r} VAULT_CHAT_URL='http://luhkas-vault.local:7000' "
         f"bash ~/{node_dir}/scripts/install_user_services.sh"
     )
     result = _ssh_run(host, user, svc_cmd, record, timeout=600)
