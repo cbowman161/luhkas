@@ -273,11 +273,11 @@ PY
     echo "[prep] firstrun.sh already patched (marker found)"
   fi
 else
-  # cloud-init: merge runcmd + ssh_authorized_keys into user-data via PyYAML.
-  if grep -q "$PATCH_MARKER" "$CLOUD_USERDATA"; then
-    echo "[prep] user-data already patched (marker found)"
-  else
-    python3 - "$CLOUD_USERDATA" "$PATCH_MARKER" "$NODE_USER" "$VAULT_PUBKEY" <<'PY'
+  # cloud-init: ensure runcmd + ssh_authorized_keys are in user-data.
+  # Idempotent at the field level — re-running prep with new requirements
+  # (e.g. additional pubkeys) updates them in place instead of skipping.
+  RUNCMD_LINE='/boot/firmware/luhkas-firstboot.sh >>/var/log/luhkas-firstboot.log 2>&1 &'
+  python3 - "$CLOUD_USERDATA" "$PATCH_MARKER" "$NODE_USER" "$VAULT_PUBKEY" "$RUNCMD_LINE" <<'PY'
 import sys, pathlib
 import yaml
 
@@ -285,6 +285,7 @@ path = pathlib.Path(sys.argv[1])
 marker = sys.argv[2]
 node_user = sys.argv[3]
 vault_pubkey = sys.argv[4]
+runcmd_line = sys.argv[5]
 
 text = path.read_text()
 first_line = text.split("\n", 1)[0].strip()
@@ -294,46 +295,51 @@ data = yaml.safe_load(text) or {}
 if not isinstance(data, dict):
     raise SystemExit(f"unexpected user-data root: {type(data).__name__}")
 
-data.setdefault("_luhkas_marker", marker)
+# Marker is informational only; do not gate other operations on it.
+data["_luhkas_marker"] = marker
+
+changes = []
 
 # Inject vault's SSH pubkey into the target user's authorized_keys so the
 # orchestrator can SSH back as soon as the node is reachable.
 users = data.get("users")
-if isinstance(users, list):
-    target = None
-    for entry in users:
-        if isinstance(entry, dict) and entry.get("name") == node_user:
-            target = entry
-            break
-    if target is None:
-        # No matching user entry — add one. Pi Imager normally creates the
-        # user, so this branch is just defensive.
-        target = {"name": node_user}
-        users.append(target)
-    keys = target.setdefault("ssh_authorized_keys", [])
-    if not isinstance(keys, list):
-        keys = [keys] if keys else []
-        target["ssh_authorized_keys"] = keys
-    if vault_pubkey not in keys:
-        keys.append(vault_pubkey)
-elif users is None:
-    data["users"] = [
-        {"name": node_user, "ssh_authorized_keys": [vault_pubkey]},
-    ]
+if not isinstance(users, list):
+    users = []
+    data["users"] = users
 
-# Append our firstboot to runcmd (last step in cloud-final).
-runcmd = data.setdefault("runcmd", [])
+target = None
+for entry in users:
+    if isinstance(entry, dict) and entry.get("name") == node_user:
+        target = entry
+        break
+if target is None:
+    target = {"name": node_user}
+    users.append(target)
+    changes.append(f"added user '{node_user}'")
+
+keys = target.get("ssh_authorized_keys")
+if not isinstance(keys, list):
+    keys = [keys] if isinstance(keys, str) and keys else []
+    target["ssh_authorized_keys"] = keys
+if vault_pubkey not in keys:
+    keys.append(vault_pubkey)
+    changes.append("added vault SSH pubkey")
+
+# Append our firstboot to runcmd (last step in cloud-final). De-dup so
+# re-runs don't add the same line N times.
+runcmd = data.get("runcmd")
 if not isinstance(runcmd, list):
-    raise SystemExit("user-data runcmd is not a list")
-runcmd.append(
-    "/boot/firmware/luhkas-firstboot.sh >>/var/log/luhkas-firstboot.log 2>&1 &"
-)
+    runcmd = []
+    data["runcmd"] = runcmd
+if runcmd_line not in runcmd:
+    runcmd.append(runcmd_line)
+    changes.append("added runcmd hook")
 
 out = header + "\n" + yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
 path.write_text(out)
+print("MERGE_CHANGES=" + ("; ".join(changes) if changes else "none (already up to date)"))
 PY
-    echo "[prep] merged runcmd + vault SSH pubkey into ${CLOUD_USERDATA}"
-  fi
+  echo "[prep] user-data patched"
 fi
 
 sync
