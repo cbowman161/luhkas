@@ -76,17 +76,24 @@ EOF
 fi
 
 # ── optional: rotate the active HDMI output ──────────────────────────────────
-# KMS-level rotation via the kernel command line so it applies to the
-# console AND the X/Wayland desktop, and survives every boot.
+# Two backends with OPPOSITE conventions:
+#   * Linux DRM ``video=...,rotate=N`` (cmdline.txt, X11 fallback):
+#     N=90  -> 90 deg CLOCKWISE
+#     N=270 -> 90 deg COUNTER-clockwise
+#   * Wayland ``wl_output_transform`` (wlr-randr / kanshi):
+#     90    -> 90 deg COUNTER-clockwise
+#     270   -> 90 deg CLOCKWISE
+# "right" in casual usage = clockwise, matching xrandr's --rotate right.
 if [ -n "$DISPLAY_ROTATION" ]; then
   case "$DISPLAY_ROTATION" in
-    normal)   ROTATE_DEG=0  ;;
-    right)    ROTATE_DEG=90 ;;
-    inverted) ROTATE_DEG=180 ;;
-    left)     ROTATE_DEG=270 ;;
+    normal)   ROTATE_DEG=0;   WAYLAND_TRANSFORM=normal ;;
+    right)    ROTATE_DEG=90;  WAYLAND_TRANSFORM=270 ;;
+    inverted) ROTATE_DEG=180; WAYLAND_TRANSFORM=180 ;;
+    left)     ROTATE_DEG=270; WAYLAND_TRANSFORM=90 ;;
     *)
       echo "[display_node/install] WARN: ignoring unknown DISPLAY_ROTATION='${DISPLAY_ROTATION}'"
       ROTATE_DEG=""
+      WAYLAND_TRANSFORM=""
       ;;
   esac
 
@@ -123,7 +130,7 @@ if [ -n "$DISPLAY_ROTATION" ]; then
     install -d -m 0755 -o "$NODE_USER" -g "$NODE_USER" "$KANSHI_DIR"
     cat > "$KANSHI_CONF" <<EOF
 profile {
-    output ${HDMI_PORT} transform ${ROTATE_DEG} enable
+    output ${HDMI_PORT} transform ${WAYLAND_TRANSFORM} enable
 }
 EOF
     chown "$NODE_USER:$NODE_USER" "$KANSHI_CONF"
@@ -131,7 +138,7 @@ EOF
     # Remove any obsolete labwc autostart from earlier installs so it
     # doesn't fight kanshi.
     rm -f "${USER_HOME}/.config/labwc/autostart"
-    echo "[display_node/install] wrote kanshi rotation: ${HDMI_PORT} transform ${ROTATE_DEG}"
+    echo "[display_node/install] wrote kanshi rotation: ${HDMI_PORT} transform ${WAYLAND_TRANSFORM} (DISPLAY_ROTATION=${DISPLAY_ROTATION})"
   fi
 fi
 
