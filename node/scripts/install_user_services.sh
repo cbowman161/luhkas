@@ -16,7 +16,6 @@ fi
 : "${VAULT_CHAT_URL:?VAULT_CHAT_URL is required}"
 NODE_ID="${LUHKAS_NODE_ID}"
 VAULT_URL="${VAULT_CHAT_URL}"
-LUHKAS_TAILSCALE="${LUHKAS_TAILSCALE:-1}"
 
 mkdir -p "${UNIT_DIR}"
 
@@ -37,12 +36,12 @@ fi
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${USER_UID}}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
-if [ "${LUHKAS_TAILSCALE}" = "1" ]; then
-  LUHKAS_NODE_ID="${NODE_ID}" "${NODE_DIR}/scripts/setup_tailscale.sh" || {
-    echo "WARNING: Tailscale setup failed. Re-run:"
-    echo "  LUHKAS_NODE_ID=${NODE_ID} ${NODE_DIR}/scripts/setup_tailscale.sh"
-  }
-fi
+# NOTE: Tailscale provisioning lives in the orchestrator
+# (vault/node_orchestrator.py -> sync_manager.provision_tailscale_for_node).
+# install_user_services.sh used to re-invoke setup_tailscale.sh here, but
+# that second invocation could race with the orchestrator's first one and
+# re-auth the node under a stale hostname. Single source of truth is the
+# orchestrator; this script just renders + enables units.
 
 # Remove any LUHKAS-rendered unit files that DON'T belong to this node.
 # A unit is recognizable as LUHKAS-rendered by its ExecStart path pointing
