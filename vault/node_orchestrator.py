@@ -104,7 +104,15 @@ def orchestrate(
         return report(False, "profile has no modules")
     step(f"profile loaded: modules={modules}")
 
-    # ── 1. SSH reachability (retry — sshd may have just come up) ──────────
+    # ── 1. clear any stale known_hosts entries for this node ─────────────
+    # On a re-flash the node generates fresh SSH host keys. If vault still
+    # has a cached fingerprint for this IP / hostname, SSH refuses to
+    # connect ("Host key for X has changed") and ``accept-new`` doesn't
+    # help. Wipe entries proactively so every orchestration starts clean.
+    step("clearing stale known_hosts entries")
+    _clear_known_hosts(host, node_id, record)
+
+    # ── 2. SSH reachability (retry — sshd may have just come up) ─────────
     step("ssh reachability check (with retry)")
     ssh_ok = False
     for attempt in range(1, 11):
@@ -203,6 +211,39 @@ def orchestrate(
 
 # ──────────────────────────────────────────────────────────────────────────
 # helpers
+
+
+def _clear_known_hosts(host: str, node_id: str, record: list[str]) -> None:
+    """Remove cached SSH host keys for this node from vault's known_hosts.
+
+    Run before connecting so re-flashed nodes (new host keys) don't trip on
+    a stale fingerprint match. Wipes by IP and by the MagicDNS / mDNS names
+    we'd plausibly use later.
+    """
+    known_hosts = Path.home() / ".ssh" / "known_hosts"
+    if not known_hosts.exists():
+        return
+    targets = {host}
+    if node_id:
+        targets.add(f"luhkas-{node_id}")
+        targets.add(f"luhkas-{node_id}.local")
+    removed: list[str] = []
+    for target in sorted(t for t in targets if t):
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-f", str(known_hosts), "-R", target],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            continue
+        # ssh-keygen prints "Host X found:" when it removes something.
+        out = (result.stdout or "") + (result.stderr or "")
+        if "found:" in out or "updated" in out:
+            removed.append(target)
+    if removed:
+        record.append(f"  cleared known_hosts entries: {', '.join(removed)}")
+    else:
+        record.append("  no stale known_hosts entries to clear")
 
 
 def _ssh_run(host: str, user: str, command: str, record: list[str], *, timeout: int = 60) -> dict:
