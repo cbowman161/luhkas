@@ -343,7 +343,9 @@ if runcmd_line not in runcmd:
     runcmd.append(runcmd_line)
     changes.append("added runcmd hook")
 
-out = header + "\n" + yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+out = header + "\n" + yaml.safe_dump(
+    data, default_flow_style=False, sort_keys=False, width=10000,
+)
 path.write_text(out)
 print("MERGE_CHANGES=" + ("; ".join(changes) if changes else "none (already up to date)"))
 PY
