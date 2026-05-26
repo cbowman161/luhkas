@@ -252,6 +252,7 @@ def provision_tailscale_for_node(
         "chmod 600 ~/.config/luhkas/bootstrap.env; "
         f"if [ -x ~/{node_dir}/scripts/setup_tailscale.sh ]; then "
         f"LUHKAS_NODE_ID={node_id!r} TAILSCALE_HOSTNAME={hostname!r} "
+        f"TAILSCALE_AUTHKEY_FILE=\"$HOME/.config/luhkas/tailscale.authkey\" "
         f"~/{node_dir}/scripts/setup_tailscale.sh; "
         "else echo 'setup_tailscale.sh not found' >&2; exit 2; fi"
     )
