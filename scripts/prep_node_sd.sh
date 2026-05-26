@@ -325,6 +325,14 @@ if vault_pubkey not in keys:
     keys.append(vault_pubkey)
     changes.append("added vault SSH pubkey")
 
+# Passwordless sudo for the node user. Without this, the orchestrator
+# can't run apt-get / write to /boot/firmware/config.txt etc. without an
+# interactive password prompt, which it can't satisfy over SSH.
+nopasswd_rule = "ALL=(ALL) NOPASSWD:ALL"
+if target.get("sudo") != nopasswd_rule:
+    target["sudo"] = nopasswd_rule
+    changes.append("set NOPASSWD sudo")
+
 # Append our firstboot to runcmd (last step in cloud-final). De-dup so
 # re-runs don't add the same line N times.
 runcmd = data.get("runcmd")
