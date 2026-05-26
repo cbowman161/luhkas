@@ -22,12 +22,30 @@ echo "[install_rdp] starting (user=${NODE_USER})"
 # ── packages ─────────────────────────────────────────────────────────────────
 # xfce4 keeps the RDP session lightweight. dbus-x11 lets xfce4 talk to its
 # session bus. xfce4-terminal so the desktop has a usable terminal app.
+# tigervnc-standalone-server because Pi OS ships RealVNC's /usr/bin/Xvnc,
+# which doesn't accept the same command-line args xrdp emits — TigerVNC's
+# Xvnc is the one xrdp expects. We divert RealVNC's binary below so
+# /usr/bin/Xvnc resolves to TigerVNC.
 ensure_apt_updated
 apt_install \
   xrdp \
   xfce4 \
   xfce4-terminal \
-  dbus-x11
+  dbus-x11 \
+  tigervnc-standalone-server
+
+# Make /usr/bin/Xvnc point at TigerVNC. RealVNC installs its own Xvnc as a
+# regular file (not a symlink), which blocks update-alternatives from
+# pointing it at TigerVNC. Use dpkg-divert to move the RealVNC binary
+# aside, then symlink Xvnc -> Xtigervnc. Idempotent.
+if [ -e /usr/bin/Xvnc ] && [ ! -L /usr/bin/Xvnc ]; then
+  echo "[install_rdp] diverting RealVNC /usr/bin/Xvnc -> Xvnc.distrib"
+  dpkg-divert --rename --add /usr/bin/Xvnc
+fi
+if [ -x /usr/bin/Xtigervnc ] && [ "$(readlink -f /usr/bin/Xvnc 2>/dev/null)" != "/usr/bin/Xtigervnc" ]; then
+  echo "[install_rdp] symlinking /usr/bin/Xvnc -> /usr/bin/Xtigervnc"
+  ln -sf /usr/bin/Xtigervnc /usr/bin/Xvnc
+fi
 
 # ── ~/.xsession launches xfce4 when xrdp opens a session ─────────────────────
 SESSION_FILE="${USER_HOME}/.xsession"
