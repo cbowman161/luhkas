@@ -486,8 +486,8 @@ ExecStartPost=/usr/bin/systemctl --user start --no-block vault-autosync.service
 Environment=VAULT_WARM_MODEL_ROLES=router,chat,vision
 Environment=VAULT_IMMEDIATE_KEEP_ALIVE=24h
 Environment=VAULT_BACKGROUND_KEEP_ALIVE=5m
-Environment=VAULT_SCOUT_URL=http://luhkas-scout.local:5000
-Environment=VAULT_SCOUT_ROBOT_URL=http://luhkas-scout.local:5001
+Environment=VAULT_SCOUT_URL=http://luhkas-scout:5000
+Environment=VAULT_SCOUT_ROBOT_URL=http://luhkas-scout:5001
 ```
 
 ---

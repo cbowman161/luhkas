@@ -243,6 +243,122 @@
       "target": "vault",
       "updated_at": 1779393880.6928976
     },
+    "list active bluetooth devices": {
+      "code_monkey_task": {
+        "generator": "code_monkey_single_recipe",
+        "ok": true,
+        "single_recipe": true
+      },
+      "confidence": 0.86,
+      "confirmed": true,
+      "confirmed_by": "yes",
+      "created_at": 1779662309.7382317,
+      "description": "Vault bluetooth list",
+      "examples": [
+        {
+          "confidence": 0.86,
+          "confirmed_at": 1779662309.73823,
+          "input": "list active bluetooth devices",
+          "intent": "vault_learned_command",
+          "normalized_input": "list active bluetooth devices",
+          "route": "learned_capability"
+        }
+      ],
+      "execution": {
+        "command": "hciconfig -a",
+        "required_facts": [
+          "bluetooth_devices"
+        ],
+        "safety": {
+          "allowed": true,
+          "reason": "Command passed basic safety validation."
+        },
+        "timeout_seconds": 10,
+        "type": "bash"
+      },
+      "hits": 0,
+      "inferred": {
+        "aspect": "list",
+        "topic": "bluetooth"
+      },
+      "input": "list active bluetooth devices",
+      "intent": "vault_learned_command",
+      "last_result": {
+        "error": null,
+        "ok": true,
+        "ran_at": 1779662309.736866,
+        "returncode": 0
+      },
+      "name": "vault_learned_command",
+      "normalized_input": "list active bluetooth devices",
+      "reason": "Code Monkey will generate and validate a safe single-command learned recipe.",
+      "response": {
+        "required_facts": [
+          "bluetooth_devices"
+        ],
+        "type": "compose_from_output"
+      },
+      "route": "learned_capability",
+      "target": "vault",
+      "updated_at": 1779662309.7382317
+    },
+    "list active network interfaces": {
+      "code_monkey_task": {
+        "generator": "code_monkey_single_recipe",
+        "ok": true,
+        "single_recipe": true
+      },
+      "confidence": 0.86,
+      "confirmed": true,
+      "confirmed_by": "yes",
+      "created_at": 1779504496.4718122,
+      "description": "Vault network list",
+      "examples": [
+        {
+          "confidence": 0.86,
+          "confirmed_at": 1779504496.4718103,
+          "input": "list active network interfaces",
+          "intent": "vault_learned_command",
+          "normalized_input": "list active network interfaces",
+          "route": "learned_capability"
+        }
+      ],
+      "execution": {
+        "path": "/home/vault/luhkas/vault/data/learned_capabilities/scripts/learned_command.py",
+        "required_facts": [
+          "network_interfaces"
+        ],
+        "source": "import os\nfor interface in os.listdir('/sys/class/net'):\n    with open(os.path.join('/sys/class/net', interface, 'address')) as f:\n        print(f'{interface}: {f.read().strip()}')",
+        "timeout_seconds": 10,
+        "type": "python_script"
+      },
+      "hits": 2,
+      "inferred": {
+        "aspect": "list",
+        "topic": "network"
+      },
+      "input": "list active network interfaces",
+      "intent": "vault_learned_command",
+      "last_hit_at": 1779506326.1139364,
+      "last_result": {
+        "error": null,
+        "ok": true,
+        "ran_at": 1779504496.4702652,
+        "returncode": 0
+      },
+      "name": "vault_learned_command",
+      "normalized_input": "list active network interfaces",
+      "reason": "Code Monkey will generate and validate a safe single-command learned recipe.",
+      "response": {
+        "required_facts": [
+          "network_interfaces"
+        ],
+        "type": "compose_from_output"
+      },
+      "route": "learned_capability",
+      "target": "vault",
+      "updated_at": 1779504496.4718122
+    },
     "list network interfaces": {
       "code_monkey_task": {
         "generator": "code_monkey_single_recipe",
@@ -861,6 +977,66 @@
       "route": "learned_capability",
       "target": "vault",
       "updated_at": 1779393880.1165187
+    },
+    "what time is it": {
+      "code_monkey_task": {
+        "generator": "code_monkey_single_recipe",
+        "ok": true,
+        "single_recipe": true
+      },
+      "confidence": 0.86,
+      "confirmed": true,
+      "confirmed_by": "yes",
+      "created_at": 1779545579.3441708,
+      "description": "Vault time status",
+      "examples": [
+        {
+          "confidence": 0.86,
+          "confirmed_at": 1779545579.3441687,
+          "input": "what time is it",
+          "intent": "vault_learned_command",
+          "normalized_input": "what time is it",
+          "route": "learned_capability"
+        }
+      ],
+      "execution": {
+        "command": "date '+%Y-%m-%d %H:%M:%S'",
+        "required_facts": [
+          "current_time"
+        ],
+        "safety": {
+          "allowed": true,
+          "reason": "Command passed basic safety validation."
+        },
+        "timeout_seconds": 10,
+        "type": "bash"
+      },
+      "hits": 3,
+      "inferred": {
+        "aspect": "status",
+        "topic": "time"
+      },
+      "input": "what time is it",
+      "intent": "vault_learned_command",
+      "last_hit_at": 1779729480.120094,
+      "last_result": {
+        "error": null,
+        "ok": true,
+        "ran_at": 1779545579.3429916,
+        "returncode": 0
+      },
+      "name": "vault_learned_command",
+      "normalized_input": "what time is it",
+      "reason": "Code Monkey will generate and validate a safe single-command learned recipe.",
+      "response": {
+        "required_facts": [
+          "current_time"
+        ],
+        "type": "compose_from_output"
+      },
+      "route": "learned_capability",
+      "target": "vault",
+      "updated_at": 1779545579.3441708
     }
   },
   "pending_code_monkey": {

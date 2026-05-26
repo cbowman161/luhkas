@@ -199,6 +199,11 @@ class VaultRuntime:
         self._active_learn_jobs: dict = {}
         self._active_install_jobs: dict = {}
         self._async_job_lock = threading.Lock()
+        # Per-request stash for alerts to inline into the /ui or
+        # /presence/message response. Thread-local so concurrent
+        # requests (ThreadingHTTPServer spawns one thread per call)
+        # don't bleed alerts across each other.
+        self._inline_alerts_tls = threading.local()
 
     def handle(self, user_input, node_id: str = "cli"):
         user_input = (user_input or "").strip()
@@ -410,6 +415,30 @@ class VaultRuntime:
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
+        # User-is-here signal: bump activity FIRST so the registry's
+        # currently_active_node_ids() check sees this node as active,
+        # then drain any deferred alerts onto this node's queue, then
+        # IMMEDIATELY pop them onto a thread-local so they ride back
+        # out attached to THIS response. Without the immediate pop,
+        # Scout's background `/alerts/pending` poller (in
+        # presence_client_service.py, every 3s) frequently wins the
+        # race during the LLM processing that follows, draining the
+        # queue before `_enrich` can read it — alerts then sit in
+        # Scout's local cache (which the web UI doesn't poll) and
+        # never reach the user.
+        self.node_registry.update_activity(node_id, identity=None)
+        try:
+            drained = self.node_registry.flush_pending_to(node_id)
+            if drained:
+                print(
+                    f"[runtime] flushed {drained} deferred alert(s) to {node_id}",
+                    flush=True,
+                )
+            inline = self.node_registry.pop_alerts(node_id)
+        except Exception as exc:
+            print(f"[runtime] flush_pending_to({node_id}) failed: {exc}", flush=True)
+            inline = []
+        self._inline_alerts_tls.alerts = list(inline or [])
         if isinstance(presence_context, dict):
             self.node_registry.update_capabilities(
                 node_id,
@@ -570,6 +599,10 @@ class VaultRuntime:
         if install_response is not None:
             return install_response
 
+        world_ingest_response = self._maybe_handle_world_ingest_command(message)
+        if world_ingest_response is not None:
+            return world_ingest_response
+
         command_response = self.command_agent.handle(message)
         if command_response is not None:
             command_response["active_task_id"] = self.active_task_id
@@ -705,6 +738,21 @@ class VaultRuntime:
             "response_composed": True,
         })
 
+    def _maybe_handle_world_ingest_command(self, user_input: str) -> dict | None:
+        """Recognize chat commands controlling the Wikipedia ingest:
+        'start the wikipedia ingest', 'wikipedia progress', 'stop the wiki
+        ingest', etc. Falls through to normal routing for anything else."""
+        try:
+            from world.ingest_admin import handle as world_ingest_handle
+        except Exception:
+            return None
+        response = world_ingest_handle(user_input)
+        if response is None:
+            return None
+        return self._remember_active(self._runtime_command_response(
+            response, "world_ingest_admin",
+        ))
+
     def _maybe_handle_install_command(self, user_input: str, node_id: str) -> dict | None:
         """Recognize `install <pkg>` admin commands. Returns a response when
         the input matches the strict pattern, None otherwise so normal routing
@@ -833,6 +881,9 @@ class VaultRuntime:
         background_types = {
             "learn_succeeded", "learn_failed", "learn_needs_install",
             "install_succeeded", "install_failed",
+            # World vault ingest health (written by the
+            # luhkas-world-watchdog systemd timer).
+            "world_ingest_stalled", "world_ingest_completed",
         }
         relevant = [e for e in unread if e.get("event_type") in background_types]
         count = len(relevant)
@@ -1837,7 +1888,27 @@ class VaultRuntime:
         return self.node_registry.pop_alerts(node_id)
 
     def _enrich(self, response: dict, node_id: str) -> dict:
-        """Add tts, display, and has_display fields to every response."""
+        """Populate channel-independent rendering fields on every response.
+
+        `message` is the rich text (markdown, citations); `tts` is the
+        speech-clean version. Both are always emitted so multi-channel
+        surfaces (e.g. a node with both a screen and a speaker) can
+        render both. The node-side renderer is responsible for picking
+        which channel(s) to use based on its own `has_display` /
+        `has_audio` capabilities — vault does NOT clobber `message`
+        with `tts` for audio-only nodes anymore. A node that genuinely
+        cannot render text reads `tts` instead; one that has neither
+        ignores both.
+
+        Any alerts queued for this node (background-job results, ingest
+        stalls, presence-triggered pushes) are drained and attached as
+        `response['pending_alerts']` so request-response clients (web
+        UIs, curl) get them on the same HTTP round-trip instead of
+        having to separately poll /alerts/pending. The /alerts/pending
+        endpoint remains for poll-only surfaces (presence proxies, the
+        persistent chat daemon's between-input window); both code paths
+        share the same per-node queue under a lock, so each alert is
+        delivered exactly once."""
         message = response.get("message") or ""
         if message and response.get("compose", True) and not response.get("response_composed"):
             response["raw_message"] = message
@@ -1846,11 +1917,21 @@ class VaultRuntime:
             message = response["message"]
         if response.get("response_composed") or "tts" not in response:
             response["tts"] = format_for_tts(message)
-        has_display = self.node_registry.has_display(node_id)
-        response["has_display"] = has_display
+        response["has_display"] = self.node_registry.has_display(node_id)
+        response["has_audio"] = self.node_registry.has_audio(node_id)
         response["node_id"] = node_id
-        if not has_display:
-            response["message"] = response["tts"]
+        # Inline alerts captured at the top of handle_presence (see the
+        # race-fix comment there). Consume once per request so deterministic
+        # short-circuits don't show the same alerts twice if they happen
+        # to traverse _enrich more than once.
+        try:
+            inline = getattr(self._inline_alerts_tls, "alerts", None) or []
+            if inline:
+                existing = response.get("pending_alerts") or []
+                response["pending_alerts"] = list(existing) + list(inline)
+                self._inline_alerts_tls.alerts = []
+        except Exception:
+            pass
         return response
 
     def _compose_runtime_message(self, response: dict, node_id: str) -> str:

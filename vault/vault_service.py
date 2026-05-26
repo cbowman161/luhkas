@@ -6,6 +6,82 @@ from urllib.parse import unquote, urlparse
 from vault_runtime import VaultRuntime
 
 
+_PUSHABLE_EVENT_TYPES = {
+    "learn_succeeded", "learn_failed", "learn_needs_install",
+    "install_succeeded", "install_failed",
+    "world_ingest_stalled", "world_ingest_completed",
+}
+
+
+def _events_feed(runtime, since_id: int) -> dict:
+    """Read-only poll for UI clients. Returns the unread events with
+    id > since_id, filtered to types meant for user attention. Clients
+    track their own last_seen_id locally so each event is shown once
+    per client, without marking anything read globally (so the chat
+    path's notification_alert auto-attach still fires until the user
+    explicitly reads with `any updates`)."""
+    try:
+        unread = runtime.event_log.unread() or []
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "events": []}
+    events = [
+        {
+            "id": e.get("id"),
+            "event_type": e.get("event_type"),
+            "message": e.get("message"),
+            "data": e.get("data"),
+            "created_at": e.get("created_at"),
+        }
+        for e in unread
+        if isinstance(e.get("id"), int)
+        and e["id"] > since_id
+        and e.get("event_type") in _PUSHABLE_EVENT_TYPES
+    ]
+    return {"ok": True, "events": events}
+
+
+def _world_status(runtime) -> dict:
+    """Fresh-instantiate the world store per call so counts reflect writes
+    made by background ingest jobs (cached table snapshots can lag)."""
+    try:
+        from models import get_model
+        from world import WorldKnowledgeStore
+        try:
+            embedder = get_model("embed")
+        except Exception:
+            embedder = None
+        store = WorldKnowledgeStore(text_embedder=embedder)
+        return {"ok": True, **store.stats()}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _node_sync_profile(node_id: str) -> dict:
+    try:
+        path = __import__("pathlib").Path(__file__).resolve().parents[1] / "node" / "profiles" / f"{node_id}.json"
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data.get("sync") if isinstance(data, dict) and isinstance(data.get("sync"), dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _provision_tailscale_after_register(node_id: str, host: str, sync: dict) -> None:
+    try:
+        from sync_manager import provision_tailscale_for_node
+        result = provision_tailscale_for_node(
+            node_id=node_id,
+            host=host,
+            user=str(sync.get("user") or "luhkas"),
+            node_dir=str(sync.get("node_dir") or "luhkas/node"),
+        )
+        status = "ok" if result.get("ok") else f"failed: {result.get('error')}"
+        print(f"[tailscale] provision {node_id}@{host}: {status}", flush=True)
+    except Exception as exc:
+        print(f"[tailscale] provision {node_id}@{host}: failed: {exc}", flush=True)
+
+
 class VaultRequestHandler(BaseHTTPRequestHandler):
     server_version = "VaultRuntimeService/1.0"
 
@@ -80,6 +156,20 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
             if path == "/admin/sync":
                 from sync_manager import last_result
                 self._send(200, last_result())
+                return
+
+            if path == "/world/status":
+                self._send(200, _world_status(self.runtime))
+                return
+
+            if path == "/events/feed":
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    since_id = int((qs.get("since_id") or ["0"])[0])
+                except ValueError:
+                    since_id = 0
+                self._send(200, _events_feed(self.runtime, since_id))
                 return
 
             if path == "/admin/pubkey":
@@ -209,6 +299,7 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                     display=payload.get("display") or {},
                     node_name=str(payload.get("node_name") or node_id),
                     ip=str(payload.get("ip") or ""),
+                    network=payload.get("network") or {},
                     services=payload.get("services") or {},
                     capabilities=payload.get("capabilities") or {},
                     modules=payload.get("modules") or {},
@@ -219,6 +310,17 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                     args=(node_id,),
                     daemon=True,
                 ).start()
+                sync = _node_sync_profile(node_id)
+                provision_host = str(payload.get("ip") or "")
+                network = payload.get("network") if isinstance(payload.get("network"), dict) else {}
+                if not provision_host:
+                    provision_host = str(network.get("lan_ip") or network.get("tailscale_ip") or "")
+                if provision_host:
+                    _t.Thread(
+                        target=_provision_tailscale_after_register,
+                        args=(node_id, provision_host, sync),
+                        daemon=True,
+                    ).start()
                 self._send(200, {"ok": True, "node_id": node_id})
                 return
 
@@ -228,6 +330,20 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 if node_id:
                     self.runtime.node_registry.record_selftest(node_id, payload)
                 self._send(200, {"ok": True, "node_id": node_id})
+                return
+
+            if path == "/alerts/enqueue":
+                # Cross-process alert injection. The ingest watchdog (and
+                # future out-of-band sources) POSTs an alert here after
+                # writing the event_log row. The registry decides whether
+                # to deliver immediately (a node currently has a user) or
+                # defer to the pending queue until presence is detected.
+                payload = self._read_json()
+                alert = payload.get("alert") if isinstance(payload, dict) else None
+                if not isinstance(alert, dict):
+                    alert = payload if isinstance(payload, dict) else {}
+                result = self.runtime.node_registry.enqueue_for_active_user(alert)
+                self._send(200, result)
                 return
 
             if path == "/admin/sync":

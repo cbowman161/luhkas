@@ -1,0 +1,33 @@
+{
+  "no the configuration": {
+    "confidence": 0.8,
+    "confirmed_at": 1779484512.2467272,
+    "confirmed_by": "user_confirmation",
+    "decided_route": "general_question",
+    "examples": [
+      {
+        "confidence": 0.8,
+        "confirmed_at": 1779484512.2467272,
+        "confirmed_by": "user_confirmation",
+        "decided_route": "general_question",
+        "input": "no, the configuration",
+        "normalized_input": "no the configuration",
+        "reason": "asks about system configuration",
+        "self_route": null
+      }
+    ],
+    "hits": 0,
+    "input": "no, the configuration",
+    "normalized_input": "no the configuration",
+    "reason": "asks about system configuration",
+    "route": {
+      "attempts": 1,
+      "confidence": 0.8,
+      "keywords": {},
+      "ok": true,
+      "reason": "asks about system configuration",
+      "route": "general_question"
+    },
+    "self_route": null
+  }
+}
