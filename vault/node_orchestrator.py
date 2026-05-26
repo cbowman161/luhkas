@@ -201,12 +201,28 @@ def orchestrate(
     if not result.get("ok"):
         return report(False, f"install_user_services.sh failed: {result.get('error')}")
 
-    # ── 7. (best-effort) wait for re-registration over tailnet ────────────
-    # The presence_service should come up and re-register with its tailnet
-    # IP within ~30s. We don't block on this — the orchestrator returns OK
-    # once installation is complete; tailnet visibility is a follow-up.
+    # ── 7. schedule a final reboot ────────────────────────────────────────
+    # dtoverlays added by install.sh (PCIe gen3 for Hailo, wm8960 for the
+    # audio HAT, i2c_arm for UPS HAT, vc4-kms-v3d for HDMI) only take
+    # effect after a reboot. Schedule it 15s out via systemd-run so this
+    # SSH command returns successfully before the box goes down. Linger is
+    # already enabled by install_user_services.sh, so services auto-start
+    # on the next boot. Presence will re-register via Tailscale on its own.
+    step("scheduling final reboot to apply dtoverlays")
+    _ssh_run(
+        host, user,
+        "sudo systemd-run --on-active=15s --unit=luhkas-orchestrator-reboot "
+        "/sbin/shutdown -r now 'luhkas-orchestrator: applying dtoverlays'",
+        record, timeout=10,
+    )
 
-    return report(True, extra={"modules": modules})
+    # ── 8. (best-effort) wait for re-registration over tailnet ────────────
+    # The presence_service should come up and re-register with its tailnet
+    # IP within ~30s of the reboot. We don't block on it here — the
+    # orchestrator returns OK once installation is complete; tailnet
+    # visibility is a follow-up that vault's node_registry tracks.
+
+    return report(True, extra={"modules": modules, "reboot_scheduled": True})
 
 
 # ──────────────────────────────────────────────────────────────────────────
