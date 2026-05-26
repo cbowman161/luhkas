@@ -104,10 +104,35 @@ def orchestrate(
         return report(False, "profile has no modules")
     step(f"profile loaded: modules={modules}")
 
-    # ── 1. SSH reachability ───────────────────────────────────────────────
-    step("ssh reachability check")
-    if not _ssh_run(host, user, "echo ok", record, timeout=15).get("ok"):
-        return report(False, f"ssh to {user}@{host} failed (is vault's pubkey in authorized_keys?)")
+    # ── 1. SSH reachability (retry — sshd may have just come up) ──────────
+    step("ssh reachability check (with retry)")
+    ssh_ok = False
+    for attempt in range(1, 11):
+        result = _ssh_run(host, user, "echo ok", record, timeout=10)
+        if result.get("ok"):
+            ssh_ok = True
+            record.append(f"  ssh reachable on attempt {attempt}")
+            break
+        time.sleep(6)
+    if not ssh_ok:
+        return report(False, f"ssh to {user}@{host} failed after retries (is vault's pubkey in authorized_keys?)")
+
+    # ── 1b. wait for NTP to fix the clock ─────────────────────────────────
+    # Pi 5 has no RTC battery by default; it boots with the kernel build
+    # date. apt rejects GPG signatures and HTTPS rejects certs until the
+    # clock catches up to "now". systemd-timesyncd syncs within seconds of
+    # network availability — usually well under a minute.
+    step("wait for NTP sync (kiosk clock catches up to real time)")
+    ntp_cmd = (
+        "for i in $(seq 1 30); do "
+        "  if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q '^yes$'; then "
+        "    echo synced; exit 0; "
+        "  fi; "
+        "  sleep 3; "
+        "done; "
+        "echo 'WARN: NTP did not converge in 90s, proceeding anyway' >&2"
+    )
+    _ssh_run(host, user, ntp_cmd, record, timeout=120)
 
     # ── 2. baseline apt deps ──────────────────────────────────────────────
     step("apt baseline (git, python3-pip, ...)")
