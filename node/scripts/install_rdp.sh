@@ -38,31 +38,31 @@ if [ ! -f "$SESSION_FILE" ] || ! grep -qx "startxfce4" "$SESSION_FILE"; then
   chmod 0755 "$SESSION_FILE"
 fi
 
-# ── xrdp.ini sanity (regression in HANDOFF doc) ──────────────────────────────
-# A previous edit on vault accidentally set every ``port=`` line to 3389,
-# which made xrdp connect to itself and produce a black RDP session. Be
-# defensive: keep [Globals] at 3389; force [Xorg]/[Xvnc] to -1.
+# ── xrdp.ini: prefer Xvnc backend over Xorg ─────────────────────────────────
+# Pi OS Trixie's Xorg can't open /dev/tty0 from an xrdp-launched session
+# (the Debian X wrapper restricts non-console users; xrdp invokes
+# /usr/lib/xorg/Xorg directly, bypassing the wrapper). Xvnc is a virtual
+# X server that needs no TTY/DRM and works out of the box. Putting [Xvnc]
+# before [Xorg] makes it the default session, so new RDP connections
+# avoid the Xorg trap.
 XRDP_INI=/etc/xrdp/xrdp.ini
 if [ -f "$XRDP_INI" ]; then
   python3 - "$XRDP_INI" <<'PY'
 import re, sys, pathlib
 path = pathlib.Path(sys.argv[1])
-lines = path.read_text().splitlines()
-section = None
-changed = False
-for i, line in enumerate(lines):
-    m = re.match(r"^\[([^\]]+)\]\s*$", line)
-    if m:
-        section = m.group(1)
-        continue
-    if line.strip().startswith("port="):
-        want = "3389" if section == "Globals" else ("-1" if section in {"Xorg", "Xvnc"} else None)
-        if want is not None and line.strip() != f"port={want}":
-            lines[i] = f"port={want}"
-            changed = True
-if changed:
-    path.write_text("\n".join(lines) + "\n")
-    print("[install_rdp] normalized port= entries in xrdp.ini")
+text = path.read_text()
+
+def section_re(name):
+    return re.compile(r"(^\[" + re.escape(name) + r"\]\n.*?)(?=^\[|\Z)", re.S | re.M)
+
+xorg_m = section_re("Xorg").search(text)
+xvnc_m = section_re("Xvnc").search(text)
+if xorg_m and xvnc_m and xvnc_m.start() > xorg_m.start():
+    # Swap the two sections so Xvnc is first.
+    xorg, xvnc = xorg_m.group(0), xvnc_m.group(0)
+    text = text.replace(xorg, "\0XORG\0").replace(xvnc, xorg).replace("\0XORG\0", xvnc)
+    path.write_text(text)
+    print("[install_rdp] reordered xrdp.ini: [Xvnc] now before [Xorg]")
 PY
 fi
 

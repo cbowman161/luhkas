@@ -101,15 +101,33 @@ if [ -n "$DISPLAY_ROTATION" ]; then
     done
     HDMI_PORT="${HDMI_PORT:-HDMI-A-1}"
 
+    # Kernel-level rotation hint for the console + X11 fallback. Wayland
+    # compositors (labwc on Pi OS Trixie Desktop, wayfire on Bookworm)
+    # ignore this and manage their own transforms — see labwc autostart
+    # below for the Wayland-side rotation.
     VIDEO_ARG="video=${HDMI_PORT}:rotate=${ROTATE_DEG}"
-    # Strip any prior video=<HDMI-A-*>:... arg before appending, so re-runs
-    # update the value instead of accumulating duplicates.
     sed -i -E "s| ?video=HDMI-A-[0-9]+:[^ ]*||g" "$CMDLINE"
     sed -i -E "s|$| ${VIDEO_ARG}|" "$CMDLINE"
-    # cmdline.txt must be a single line; collapse if sed left any newlines.
     tr -d '\n' < "$CMDLINE" > "${CMDLINE}.tmp" && mv "${CMDLINE}.tmp" "$CMDLINE"
     printf '\n' >> "$CMDLINE"
-    echo "[display_node/install] applied rotation: ${DISPLAY_ROTATION} (${VIDEO_ARG})"
+    echo "[display_node/install] applied console rotation: ${DISPLAY_ROTATION} (${VIDEO_ARG})"
+
+    # Wayland-side rotation via labwc autostart. wlr-randr is what
+    # actually rotates the live desktop the user sees through HDMI on
+    # Pi OS Trixie. Without this the kernel rotate hint has no effect on
+    # the desktop session.
+    USER_HOME="$(getent passwd "$NODE_USER" | cut -d: -f6)"
+    LABWC_AUTOSTART="${USER_HOME}/.config/labwc/autostart"
+    install -d -m 0755 -o "$NODE_USER" -g "$NODE_USER" "${USER_HOME}/.config/labwc"
+    if [ ! -f "$LABWC_AUTOSTART" ] || ! grep -q "wlr-randr.*--transform ${ROTATE_DEG}\b" "$LABWC_AUTOSTART"; then
+      cat > "$LABWC_AUTOSTART" <<EOF
+# LUHKAS: rotate HDMI display at labwc session start
+wlr-randr --output ${HDMI_PORT} --transform ${ROTATE_DEG} &
+EOF
+      chown "$NODE_USER:$NODE_USER" "$LABWC_AUTOSTART"
+      chmod 0755 "$LABWC_AUTOSTART"
+      echo "[display_node/install] wrote labwc autostart with rotation"
+    fi
   fi
 fi
 
