@@ -663,6 +663,9 @@ def _vault_runtime_state() -> dict:
     }
 
 
+_EYE_TRACKING_INVERT_180 = os.environ.get("CAMERA_TRANSFORM_180", "").lower() in ("1", "true", "yes")
+
+
 def _eye_target_from_vision_meta(vision_meta: dict | None) -> dict | None:
     if not isinstance(vision_meta, dict):
         return None
@@ -672,9 +675,13 @@ def _eye_target_from_vision_meta(vision_meta: dict | None) -> dict | None:
     track_shape = tracking.get("frame_shape")
     if center and len(center) >= 2 and track_shape:
         try:
+            xn = float(center[0]) / float(track_shape[1]) - 0.5
+            yn = float(center[1]) / float(track_shape[0]) - 0.5
+            if _EYE_TRACKING_INVERT_180:
+                xn, yn = -xn, -yn
             return {
-                "x_norm": float(center[0]) / float(track_shape[1]) - 0.5,
-                "y_norm": float(center[1]) / float(track_shape[0]) - 0.5,
+                "x_norm": xn,
+                "y_norm": yn,
                 "label": str(tracked.get("label") or "tracked"),
                 "confidence": tracked.get("confidence"),
                 "priority": 1,

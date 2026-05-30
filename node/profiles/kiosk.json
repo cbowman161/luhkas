@@ -19,7 +19,8 @@
         "SCOUT_SEARCH_ENABLED": "0",
         "SCOUT_WHEEL_ENABLED": "0",
         "SCOUT_VAULT_MEMORY_ENABLED": "1",
-        "SCOUT_VAULT_MEMORY_URL": "http://luhkas-vault.local:7000"
+        "SCOUT_VAULT_MEMORY_URL": "http://luhkas-vault.local:7000",
+        "CAMERA_TRANSFORM_180": "1"
       }
     },
     "display": {

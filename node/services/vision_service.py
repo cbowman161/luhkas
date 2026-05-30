@@ -222,10 +222,18 @@ def _open_camera(camera_index, width, height):
                 # Currently no rotation is applied (intentional — see
                 # CLAUDE.md / luhkas_gotchas memory for context).
                 # ---------------------------------------------------------
-                cfg = picam.create_video_configuration(
-                    main={"size": (width, height), "format": "BGR888"},
-                    buffer_count=2,
-                )
+                _cam_transform = None
+                if os.environ.get("CAMERA_TRANSFORM_180", "").lower() in ("1", "true", "yes"):
+                    try:
+                        from libcamera import Transform as _LCTransform
+                        _cam_transform = _LCTransform(vflip=1, hflip=1)
+                        log.info("CAMERA_TRANSFORM_180=1 -> libcamera Transform(vflip=1, hflip=1)")
+                    except Exception as exc:
+                        log.warning("CAMERA_TRANSFORM_180 requested but libcamera.Transform unavailable: %s", exc)
+                _cfg_kwargs = dict(main={"size": (width, height), "format": "BGR888"}, buffer_count=2)
+                if _cam_transform is not None:
+                    _cfg_kwargs["transform"] = _cam_transform
+                cfg = picam.create_video_configuration(**_cfg_kwargs)
                 picam.configure(cfg)
                 picam.start()
                 return _Picamera2Capture(picam)
