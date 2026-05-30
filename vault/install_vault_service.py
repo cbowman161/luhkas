@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -48,6 +49,20 @@ WantedBy=default.target
 
     unit_path.write_text(unit)
     print(f"wrote {unit_path}")
+
+    # Install drop-ins from repo (e.g. wait-for-ollama). The repo dir mirrors
+    # ~/.config/systemd/user/vault-runtime.service.d/. We sync rather than
+    # symlink so the user's systemd doesn't need read access to the repo path.
+    repo_dropin_src = Path(args.working_directory) / "systemd" / f"{UNIT_NAME}.d"
+    dropin_dst = user_dir / f"{UNIT_NAME}.d"
+    if repo_dropin_src.is_dir():
+        dropin_dst.mkdir(parents=True, exist_ok=True)
+        # Wipe any stale files we may have written previously, then copy fresh.
+        for stale in dropin_dst.glob("*.conf"):
+            stale.unlink()
+        for src in sorted(repo_dropin_src.glob("*.conf")):
+            shutil.copy(src, dropin_dst / src.name)
+            print(f"wrote {dropin_dst / src.name}")
 
     if args.no_enable:
         return 0
