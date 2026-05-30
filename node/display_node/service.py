@@ -353,27 +353,6 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
   });
 
   const clock = new THREE.Clock();
-  let nextCoreGlitchAt = 0.4 + Math.random() * 0.9;
-  let coreGlitchStart = 0;
-  let coreGlitchUntil = 0;
-  let coreGlitchFrom = new THREE.Euler();
-  let coreGlitchTo = new THREE.Euler();
-
-  function scheduleCoreGlitch(t) {
-    coreGlitchStart = t;
-    coreGlitchUntil = t + 0.16 + Math.random() * 0.12;
-    coreGlitchFrom.copy(core.rotation);
-    coreGlitchTo.set(
-      core.rotation.x + (Math.random() - 0.5) * 0.9,
-      core.rotation.y + (Math.random() - 0.5) * 0.9,
-      core.rotation.z + (Math.random() < 0.5 ? -1 : 1) * (0.35 + Math.random() * 0.55),
-    );
-    nextCoreGlitchAt = t + 0.75 + Math.random() * 1.65;
-  }
-
-  function easeOutCubic(x) {
-    return 1 - Math.pow(1 - x, 3);
-  }
 
   function animate() {
     requestAnimationFrame(animate);
@@ -397,29 +376,15 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
       ).normalize();
       const coreAimQuat = new THREE.Quaternion().setFromUnitVectors(coreEyeForward, desiredForward);
       core.quaternion.slerp(coreAimQuat, 0.14);
-      coreGlitchUntil = 0;
-      nextCoreGlitchAt = t + 0.6;
       core.scale.lerp(new THREE.Vector3(1, 1, 1), 0.18);
       coreMat.opacity += (1 - coreMat.opacity) * 0.22;
     } else {
       core.rotation.x += 0.0140 * arousal;
       core.rotation.y += 0.0110 * arousal;
       core.rotation.z += 0.0190 * arousal;
-      if (t >= nextCoreGlitchAt) scheduleCoreGlitch(t);
     }
-    if (!coreAimActive && t < coreGlitchUntil) {
-      const progress = Math.max(0, Math.min(1, (t - coreGlitchStart) / (coreGlitchUntil - coreGlitchStart)));
-      const eased = easeOutCubic(progress);
-      const tremor = Math.sin(progress * Math.PI * 4) * 0.015 * (1 - progress);
-      core.rotation.x = coreGlitchFrom.x + (coreGlitchTo.x - coreGlitchFrom.x) * eased + tremor;
-      core.rotation.y = coreGlitchFrom.y + (coreGlitchTo.y - coreGlitchFrom.y) * eased - tremor;
-      core.rotation.z = coreGlitchFrom.z + (coreGlitchTo.z - coreGlitchFrom.z) * eased;
-      core.scale.setScalar(1 + Math.sin(progress * Math.PI) * 0.04);
-      coreMat.opacity = 0.9;
-    } else {
-      core.scale.lerp(new THREE.Vector3(1, 1, 1), 0.18);
-      coreMat.opacity += (1 - coreMat.opacity) * 0.22;
-    }
+    core.scale.lerp(new THREE.Vector3(1, 1, 1), 0.18);
+    coreMat.opacity += (1 - coreMat.opacity) * 0.22;
     if (eyeTarget) {
       const eyeYaw = coreAimActive ? 0 : -eyeTarget.x_norm * 0.72;
       const eyePitch = coreAimActive ? 0 : eyeTarget.y_norm * 0.48;
