@@ -1,0 +1,20 @@
+[Unit]
+Description=LUHKAS Node Web and Chat ({NODE_ID})
+After=network-online.target {NODE_ID}-presence.service
+Wants=network-online.target {NODE_ID}-presence.service
+{EXTRA_UNIT}
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory={NODE_DIR}
+Environment=LUHKAS_NODE_ID={NODE_ID}
+Environment=LUHKAS_WEB_PORT=5005
+Environment=AUDIO_SERVICE_URL=http://127.0.0.1:5004
+{EXTRA_ENV}
+ExecStart={NODE_DIR}/scripts/start_luhkas_web.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
