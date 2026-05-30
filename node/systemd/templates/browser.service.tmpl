@@ -10,11 +10,14 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory={NODE_DIR}
 Environment=LUHKAS_NODE_ID={NODE_ID}
-Environment=KIOSK_URL=http://127.0.0.1:5005/ui
+Environment=KIOSK_URL=http://127.0.0.1:5006/presence/face
 {EXTRA_ENV}
 ExecStart={NODE_DIR}/scripts/start_kiosk_browser.sh
 Restart=always
 RestartSec=4
+TimeoutStopSec=3
+KillMode=mixed
+SendSIGKILL=yes
 
 [Install]
 WantedBy=graphical-session.target

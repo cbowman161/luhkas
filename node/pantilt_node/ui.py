@@ -34,28 +34,8 @@ def ui_sections() -> list[str]:
       </div>
     </div>""",
         """    <div class="card">
-      <div class="card-title">Tracking</div>
-      <div class="row"><span class="lbl">Enabled</span><button id="btn-tracking_enabled" onclick="tog('tracking_enabled','/tracking','enabled')">-</button></div>
-      <div class="row"><span class="lbl">Search camera</span><button id="btn-search_movement_enabled" onclick="setting('search_movement_enabled')">-</button></div>
-      <hr class="divider">
-      <div class="srow">
-        <div class="slbls"><span>Target identity</span></div>
-        <input type="text" id="inp-identity" placeholder="name or blank for any"
-          onchange="post('/tracking',{target_identity:this.value||null})">
-      </div>
-      <div class="srow">
-        <div class="slbls"><span>Score threshold</span><span id="val-score_threshold">-</span></div>
-        <input type="range" id="sld-score_threshold" min="0.10" max="0.90" step="0.05"
-          oninput="sld(this,'score_threshold',2,'/settings')">
-      </div>
-      <div class="srow">
-        <div class="slbls"><span>Person score threshold</span><span id="val-person_score_threshold">-</span></div>
-        <input type="range" id="sld-person_score_threshold" min="0.10" max="0.90" step="0.05"
-          oninput="sld(this,'person_score_threshold',2,'/settings')">
-      </div>
-    </div>""",
-        """    <div class="card">
       <div class="card-title">Pan-Tilt</div>
+      <div class="row"><span class="lbl">Search camera</span><button id="btn-search_movement_enabled" onclick="setting('search_movement_enabled')">-</button></div>
       <div class="row"><span class="lbl">Edge reacquire</span><button id="btn-edge_reacquire_enabled" onclick="setting('edge_reacquire_enabled')">-</button></div>
       <div class="srow">
         <div class="slbls"><span>Max command</span><span id="val-max_command">-</span></div>

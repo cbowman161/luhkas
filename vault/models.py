@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import requests
 
 from config import (
@@ -34,8 +36,12 @@ MODEL_ROLES = {
     "embed": VAULT_EMBED_MODEL,
 }
 
-IMMEDIATE_ROLES = {"router", "chat", "embed"}
-BACKGROUND_ROLES = {"reasoner", "planner", "analyst", "coder", "fast_coder", "vision"}
+# Vision lives here (not in BACKGROUND_ROLES) because it's in the default
+# VAULT_WARM_MODEL_ROLES list. Keeping it on the short BACKGROUND keep-alive
+# meant it was warmed once at boot and then evicted after 5 min idle, so the
+# next vision question paid a 5-7s cold load — defeating the warm config.
+IMMEDIATE_ROLES = {"router", "chat", "embed", "vision"}
+BACKGROUND_ROLES = {"reasoner", "planner", "analyst", "coder", "fast_coder"}
 
 ROLE_OPTIONS = {
     "router": {
@@ -49,7 +55,10 @@ ROLE_OPTIONS = {
         "temperature": 0.35,
         "top_p": 0.9,
         "repeat_penalty": 1.12,
-        "num_ctx": 4096,
+        # 8192 fits comfortably in VRAM once Ollama is running with
+        # OLLAMA_KV_CACHE_TYPE=q8_0 (halved KV memory) and FA2 enabled.
+        # Larger window = better multi-turn recall and richer fact context.
+        "num_ctx": 8192,
         "num_predict": 240,
     },
     "reasoner": {
@@ -99,7 +108,14 @@ class BaseModel:
         timeout=120,
         allow_empty=False,
         think: bool | None = None,
+        images: list[str] | None = None,
     ):
+        """Single-shot generate.
+
+        ``images`` accepts a list of base64-encoded image strings for
+        multimodal models (e.g. qwen2.5vl). Pass-through to Ollama's
+        ``images`` field. Text-only models will ignore or error on this.
+        """
         model_options = dict(ROLE_OPTIONS.get(self.role, ROLE_OPTIONS["chat"]))
         if options:
             model_options.update(options)
@@ -114,6 +130,8 @@ class BaseModel:
             payload["think"] = think
         if response_format is not None:
             payload["format"] = response_format
+        if images:
+            payload["images"] = images
         response = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=timeout)
 
         if response.status_code != 200:
@@ -133,6 +151,49 @@ class BaseModel:
             )
         return text
 
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        options: dict | None = None,
+        timeout=120,
+        think: bool | None = None,
+    ):
+        """Yield text deltas as Ollama produces them.
+
+        Uses Ollama's streaming API (``stream: True``). Each yielded value is
+        the latest ``response`` token chunk. Iteration ends on ``done: True``
+        or a closed connection. Raises on non-200; otherwise empty deltas are
+        skipped silently.
+        """
+        model_options = dict(ROLE_OPTIONS.get(self.role, ROLE_OPTIONS["chat"]))
+        if options:
+            model_options.update(options)
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": True,
+            "options": model_options,
+            "keep_alive": self.keep_alive,
+        }
+        if think is not None:
+            payload["think"] = think
+        with requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=timeout, stream=True) as response:
+            if response.status_code != 200:
+                raise RuntimeError(f"Ollama error: {response.text}")
+            for line in response.iter_lines(decode_unicode=False):
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                chunk = data.get("response") or ""
+                if chunk:
+                    yield chunk
+                if data.get("done"):
+                    break
+
     @property
     def keep_alive(self):
         if self.role in IMMEDIATE_ROLES:
@@ -143,13 +204,27 @@ class BaseModel:
 
 
 class EmbeddingModel:
+    # The "embed" role is in IMMEDIATE_ROLES (warm), but without sending
+    # keep_alive in each request Ollama falls back to its 5-minute default
+    # and evicts bge-m3 between memory queries — slow cold-load on every
+    # gap. Pin it to the immediate keep-alive value just like BaseModel.
+    role = "embed"
+
     def __init__(self, model_name: str):
         self.model_name = model_name
+
+    @property
+    def keep_alive(self):
+        return VAULT_IMMEDIATE_KEEP_ALIVE
 
     def embed(self, text: str | list[str], timeout=120):
         response = requests.post(
             OLLAMA_EMBED_URL,
-            json={"model": self.model_name, "input": text},
+            json={
+                "model": self.model_name,
+                "input": text,
+                "keep_alive": self.keep_alive,
+            },
             timeout=timeout,
         )
         if response.status_code != 200:

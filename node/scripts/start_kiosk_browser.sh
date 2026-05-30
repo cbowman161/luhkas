@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch chromium in kiosk mode pointing at the local display_node /ui.
-# Runs under the user's X session — make sure the kiosk Pi is set to
+# Launch chromium in kiosk mode pointing at the configured kiosk URL.
+# Runs under the user's X session - make sure the kiosk Pi is set to
 # autologin into a desktop session before enabling the systemd unit.
 set -euo pipefail
 
@@ -24,17 +24,18 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-# Pick whichever chromium binary the OS image provides.
+# Pick a browser. Firefox is more reliable on this kiosk image; Chromium is
+# retained as a fallback for images that do not ship Firefox.
 BROWSER=""
-for candidate in chromium-browser chromium google-chrome-stable; do
-  if command -v "${candidate}" >/dev/null 2>&1; then
+for candidate in firefox firefox-esr chromium-browser chromium google-chrome-stable /usr/lib/chromium/chromium; do
+  if [ -x "${candidate}" ] || command -v "${candidate}" >/dev/null 2>&1; then
     BROWSER="${candidate}"
     break
   fi
 done
 
 if [ -z "${BROWSER}" ]; then
-  echo "[kiosk-browser] no chromium binary found; install chromium-browser" >&2
+  echo "[kiosk-browser] no kiosk browser found; install firefox or chromium-browser" >&2
   exit 1
 fi
 
@@ -46,13 +47,32 @@ if command -v unclutter >/dev/null 2>&1; then
   unclutter -idle 1 -root &
 fi
 
+case "$(basename "${BROWSER}")" in
+  firefox|firefox-esr)
+    export MOZ_ENABLE_WAYLAND=0
+    exec "${BROWSER}" \
+      --no-remote \
+      --profile "${KIOSK_FIREFOX_PROFILE:-${HOME}/.cache/luhkas-kiosk-firefox}" \
+      --kiosk \
+      "${DISPLAY_URL}"
+    ;;
+esac
+
 exec "${BROWSER}" \
   --kiosk \
   --noerrdialogs \
   --disable-infobars \
+  --disable-extensions \
+  --disable-component-extensions-with-background-pages \
+  --disable-background-networking \
+  --disable-gpu \
+  --disable-software-rasterizer=false \
+  --ozone-platform=x11 \
   --disable-features=TranslateUI \
   --check-for-update-interval=31536000 \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port="${KIOSK_DEBUG_PORT:-9222}" \
   --user-data-dir="${USER_DATA_DIR}" \
   --no-first-run \
   --start-fullscreen \
-  --app="${DISPLAY_URL}"
+  "${DISPLAY_URL}"

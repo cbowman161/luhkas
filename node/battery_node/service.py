@@ -39,6 +39,72 @@ _state_lock = threading.Lock()
 _latest: Optional[BatteryReading] = None
 _last_error: Optional[str] = None
 
+# ---- Low-battery shutdown trigger -------------------------------------------
+# When percent or voltage drops below threshold for N consecutive polls,
+# issue a clean shutdown -h +1 so journals flush and Hailo cleanup runs
+# instead of the X120x cutting hardware power abruptly at ~0% / ~3.0V
+# (which leaves /dev/hailo0 wedged on next boot).
+#
+# Configuration env (all optional):
+#   BATTERY_SHUTDOWN_ENABLED      "1"/"0" kill switch  (default: 1)
+#   BATTERY_SHUTDOWN_PERCENT      percent threshold     (default: 15)
+#   BATTERY_SHUTDOWN_VOLTAGE      voltage threshold (V) (default: 3.5)
+#   BATTERY_SHUTDOWN_GRACE_POLLS  consec lows required  (default: 5)
+#   BATTERY_SHUTDOWN_COMMAND      override shutdown cmd (default: sudo -n /sbin/shutdown -h +1)
+# Requires /etc/sudoers.d/luhkas-battery-shutdown granting NOPASSWD shutdown.
+_SHUTDOWN_ENABLED = os.environ.get("BATTERY_SHUTDOWN_ENABLED", "0").lower() not in ("0", "false", "no", "")  # safer default: opt-in
+_SHUTDOWN_PERCENT = float(os.environ.get("BATTERY_SHUTDOWN_PERCENT", "15"))
+_SHUTDOWN_VOLTAGE = float(os.environ.get("BATTERY_SHUTDOWN_VOLTAGE", "3.5"))
+_SHUTDOWN_GRACE_POLLS = int(os.environ.get("BATTERY_SHUTDOWN_GRACE_POLLS", "5"))
+
+_low_battery_count = 0
+_shutdown_triggered = False
+
+
+def _trigger_shutdown(voltage, percent) -> None:
+    global _shutdown_triggered
+    if _shutdown_triggered:
+        return
+    _shutdown_triggered = True
+    msg = f"LUHKAS battery critical (voltage={voltage}V, percent={percent}%) - shutting down in 60s"
+    log.error("TRIGGERING SHUTDOWN: %s", msg)
+    import shlex, subprocess
+    default_cmd = "sudo -n /sbin/shutdown -h +1"
+    cmd_str = os.environ.get("BATTERY_SHUTDOWN_COMMAND", default_cmd)
+    cmd = shlex.split(cmd_str) + [msg]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        log.error("shutdown command (%s) failed: %s", cmd_str, exc)
+        _shutdown_triggered = False  # let next poll retry
+
+
+def _check_low_battery(reading) -> None:
+    """Increment the consecutive-low counter and trigger shutdown if exceeded."""
+    global _low_battery_count
+    if not _SHUTDOWN_ENABLED or _shutdown_triggered or reading is None:
+        return
+    voltage = getattr(reading, "voltage", None)
+    percent = getattr(reading, "percent", None)
+    low_pct = (percent is not None) and (percent < _SHUTDOWN_PERCENT)
+    low_volt = (voltage is not None) and (voltage < _SHUTDOWN_VOLTAGE)
+    if low_pct or low_volt:
+        _low_battery_count += 1
+        log.warning(
+            "low battery (%d/%d): voltage=%s percent=%s (thresholds v<%.2f or p<%.1f)",
+            _low_battery_count, _SHUTDOWN_GRACE_POLLS, voltage, percent,
+            _SHUTDOWN_VOLTAGE, _SHUTDOWN_PERCENT,
+        )
+        if _low_battery_count >= _SHUTDOWN_GRACE_POLLS:
+            _trigger_shutdown(voltage, percent)
+    else:
+        if _low_battery_count > 0:
+            log.info(
+                "battery recovered (voltage=%s percent=%s) - clearing low-battery counter",
+                voltage, percent,
+            )
+        _low_battery_count = 0
+
 
 def _poller(backend, interval: float) -> None:
     global _latest, _last_error
@@ -55,6 +121,7 @@ def _poller(backend, interval: float) -> None:
             with _state_lock:
                 _latest = reading
                 _last_error = None
+            _check_low_battery(reading)
         time.sleep(interval)
 
 
@@ -70,6 +137,14 @@ def _snapshot(stale_s: float) -> dict:
     payload["stale"] = not fresh
     if last_error:
         payload["last_error"] = last_error
+    payload["shutdown_trigger"] = {
+        "enabled": _SHUTDOWN_ENABLED,
+        "percent_threshold": _SHUTDOWN_PERCENT,
+        "voltage_threshold": _SHUTDOWN_VOLTAGE,
+        "grace_polls": _SHUTDOWN_GRACE_POLLS,
+        "low_battery_count": _low_battery_count,
+        "triggered": _shutdown_triggered,
+    }
     return payload
 
 

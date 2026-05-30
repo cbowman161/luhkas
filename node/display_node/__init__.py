@@ -1,4 +1,4 @@
-"""Display node module: serves /ui and accepts events from other node services."""
+"""Display node module: renders the physical presence face and accepts events."""
 
 from .commands import capabilities, handle, health, DisplayCommandConfig
 

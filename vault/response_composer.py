@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from streaming import get_stream_sink
+
 
 FALLBACK_PREFIX = "Fallback response:"
 
@@ -36,12 +38,29 @@ class ResponseComposer:
         if contract:
             prompt = f"{prompt}\n\nNon-negotiable response contract:\n{contract}\n"
         try:
-            text = self.model.generate(
-                prompt,
-                options=self._options(options),
-                timeout=timeout,
-                think=False,
-            ).strip()
+            sink = get_stream_sink()
+            stream_fn = getattr(self.model, "generate_stream", None) if sink is not None else None
+            if stream_fn is not None:
+                parts: list[str] = []
+                for chunk in stream_fn(
+                    prompt,
+                    options=self._options(options),
+                    timeout=timeout,
+                    think=False,
+                ):
+                    parts.append(chunk)
+                    try:
+                        sink("delta", chunk)
+                    except Exception:
+                        pass
+                text = "".join(parts).strip()
+            else:
+                text = self.model.generate(
+                    prompt,
+                    options=self._options(options),
+                    timeout=timeout,
+                    think=False,
+                ).strip()
             text = sanitizer(text) if sanitizer is not None else text
             if not text:
                 return self.fallback(fallback, "empty model response")

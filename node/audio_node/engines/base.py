@@ -48,6 +48,9 @@ class TTSEngine:
     def speak(self, text: str) -> None:
         raise NotImplementedError
 
+    def interrupt(self) -> None:
+        pass
+
     def close(self) -> None:
         pass
 

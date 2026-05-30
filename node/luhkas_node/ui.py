@@ -1,32 +1,60 @@
 """LUHKAS node UI composition shell."""
 from __future__ import annotations
 
+import logging
 import os
-
-from camera_node.ui import ui_sections as camera_ui_sections
-from light_node.ui import ui_sections as light_ui_sections
-from pantilt_node.ui import ui_sections as pantilt_ui_sections
-from rover_node.ui import ui_sections as rover_ui_sections
+from typing import Iterable
 
 
-def ui_html(node_label: str | None = None) -> str:
+log = logging.getLogger("luhkas_node.ui")
+
+
+# Declarative registry: which *_node packages contribute UI sidebar sections,
+# and in what order they appear. Add a row here when a new *_node ships a
+# `ui_sections()` callable in its `ui` submodule. Modules not listed here
+# are silently skipped even if present in the node profile. Modules listed
+# here but absent from the node profile are skipped at render time.
+_MODULE_UI_REGISTRY: list[tuple[str, str]] = [
+    ("camera_node", "camera_node.ui"),
+    ("pantilt_node", "pantilt_node.ui"),
+    ("rover_node", "rover_node.ui"),
+    ("light_node", "light_node.ui"),
+]
+
+
+def _collect_sections(modules: set[str]) -> list[str]:
+    sections: list[str] = []
+    for module_name, import_path in _MODULE_UI_REGISTRY:
+        if module_name not in modules:
+            continue
+        try:
+            mod = __import__(import_path, fromlist=["ui_sections"])
+        except ImportError as exc:
+            log.warning("Skipping ui_sections for %s: import failed (%s)", module_name, exc)
+            continue
+        try:
+            sections.extend(mod.ui_sections())
+        except Exception as exc:
+            log.warning("Skipping ui_sections for %s: ui_sections() raised (%s)", module_name, exc)
+    return sections
+
+
+def ui_html(node_label: str | None = None, modules: Iterable[str] | None = None) -> str:
     """Render the per-node web UI.
 
     ``node_label`` identifies which node is serving the page; appears in
-    the browser tab title and the header. Falls back to the
-    ``LUHKAS_NODE_ID`` env var, then to ``"NODE"``. Each node service
-    (Scout's vision_service, future wall-node services, etc.) passes
-    its own label so the header reads e.g. ``LUHKAS - {label}`` /
-    ``LUHKAS - KITCHEN`` based on which device the browser is hitting."""
+    the browser tab title and the header. Falls back to ``LUHKAS_NODE_ID``
+    env var, then to ``'NODE'``.
+
+    ``modules`` is the iterable of ``*_node`` packages installed on this
+    node (typically from ``node/profiles/<id>.json``'s ``modules`` list).
+    Only modules in this collection AND registered in
+    ``_MODULE_UI_REGISTRY`` contribute sidebar cards. Pass an empty list /
+    ``None`` to render no sidebar cards.
+    """
     label = (node_label or os.environ.get("LUHKAS_NODE_ID") or "node").upper()
-    sections = "\n\n".join(
-        [
-            *camera_ui_sections(),
-            *pantilt_ui_sections(),
-            *rover_ui_sections(),
-            *light_ui_sections(),
-        ]
-    )
+    modules_set = set(modules or [])
+    sections = "\n\n".join(_collect_sections(modules_set))
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>

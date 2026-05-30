@@ -126,7 +126,12 @@ def generate_learned_command_recipe(payload: Dict[str, Any]) -> Dict[str, Any]:
             num_predict=1024,
         )
         try:
-            raw = model.generate(prompt, response_format="json")
+            try:
+                raw = model.generate(prompt, response_format="json")
+            except TypeError as exc:
+                if "response_format" not in str(exc):
+                    raise
+                raw = model.generate(prompt)
         except Exception as exc:
             last_error = f"planner call failed: {exc}"
             last_raw = ""

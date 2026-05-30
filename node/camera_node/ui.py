@@ -72,4 +72,24 @@ def ui_sections() -> list[str]:
       <div class="card-title">Detections <span id="det-count" style="color:#555;font-weight:400"></span></div>
       <div id="det-list"><span class="none">waiting...</span></div>
     </div>""",
+        """    <div class="card">
+      <div class="card-title">Tracking</div>
+      <div class="row"><span class="lbl">Enabled</span><button id="btn-tracking_enabled" onclick="tog('tracking_enabled','/tracking','enabled')">-</button></div>
+      <hr class="divider">
+      <div class="srow">
+        <div class="slbls"><span>Target identity</span></div>
+        <input type="text" id="inp-identity" placeholder="name or blank for any"
+          onchange="post('/tracking',{target_identity:this.value||null})">
+      </div>
+      <div class="srow">
+        <div class="slbls"><span>Score threshold</span><span id="val-score_threshold">-</span></div>
+        <input type="range" id="sld-score_threshold" min="0.10" max="0.90" step="0.05"
+          oninput="sld(this,'score_threshold',2,'/settings')">
+      </div>
+      <div class="srow">
+        <div class="slbls"><span>Person score threshold</span><span id="val-person_score_threshold">-</span></div>
+        <input type="range" id="sld-person_score_threshold" min="0.10" max="0.90" step="0.05"
+          oninput="sld(this,'person_score_threshold',2,'/settings')">
+      </div>
+    </div>""",
     ]

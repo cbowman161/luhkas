@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ast
+import collections
 import hashlib
 import json
 import re
@@ -1702,7 +1703,13 @@ class ScoutVaultBridge:
 
         persist_result = {"stored": [], "already_known": [], "conflicts": []}
         if route.get("route") in {"general_question", "direction"}:
-            persist_result = self.persist_user_facts(message, state)
+            # Pre-filter: only attempt fact extraction when the message
+            # plausibly contains a first-person declarative. extract_user_facts
+            # has the same guard internally, but skipping at the call site
+            # avoids identity lookups + unidentified_face_ref + thread setup
+            # for the common case (pure questions).
+            if self._message_might_contain_fact(message):
+                persist_result = self.persist_user_facts(message, state)
             if persist_result["stored"] or persist_result["already_known"] or persist_result["conflicts"]:
                 actions.append({
                     "name": "persist_user_facts",
@@ -2068,6 +2075,14 @@ class ScoutVaultBridge:
         if cached is not None:
             return _pronoun_route_guard(message, {**cached, "from_cache": True})
 
+        # Short-TTL in-memory cache: skip the router LLM call when the same
+        # phrase recurs within ~60s. The correction flow in _handle_confirmation
+        # was the biggest offender — a "no, the kitchen one" reply often
+        # produced a corrected_input that was identical to one we just routed.
+        memo = _ROUTE_RESULT_CACHE.get(message)
+        if memo is not None:
+            return _pronoun_route_guard(message, {**memo, "from_cache": "memo"})
+
         prompt = self._route_prompt(message, state)
         raw_attempts = []
         try:
@@ -2095,13 +2110,15 @@ class ScoutVaultBridge:
             confidence = float(confidence)
         except (TypeError, ValueError):
             confidence = 0.0
-        return _pronoun_route_guard(message, {
+        result = {
             "ok": True,
             "route": route,
             "confidence": max(0.0, min(1.0, confidence)),
             "reason": str(data.get("reason", ""))[:240],
             "attempts": len(raw_attempts),
-        })
+        }
+        _ROUTE_RESULT_CACHE.put(message, result)
+        return _pronoun_route_guard(message, result)
 
     def _generate_route_response(self, prompt: str, structured: bool, route_options=None):
         route_options = route_options or ROUTE_OPTIONS
@@ -2929,9 +2946,11 @@ STRICT WORD RULES:
         # generate_guarded_response/response_composer, which wraps the
         # prompt in its own scaffolding that drowns out the strict word
         # rules. We still run the identity violation validator manually.
+        # Streaming-aware helper so this path also fills the NDJSON stream
+        # when the caller is the /presence/message/stream endpoint.
         reply = None
         try:
-            raw = self.chat_model.generate(
+            raw = self._generate_user_facing(
                 prompt,
                 options={"num_predict": 220, "temperature": 0.55, "top_p": 0.9},
                 think=False,
@@ -3144,6 +3163,57 @@ STRICT WORD RULES:
         if "evening" in text:
             return "Good evening."
         return "Hello."
+
+    def _generate_user_facing(
+        self,
+        prompt: str,
+        *,
+        options: dict | None = None,
+        timeout: float = 30.0,
+        think: bool | None = None,
+        allow_empty: bool = False,
+    ) -> str:
+        """``chat_model.generate`` with optional streaming.
+
+        A handful of user-facing answer paths intentionally bypass
+        ``ResponseComposer`` (the composer's outer scaffold drowns out
+        path-specific rules). Those paths still want streaming when the
+        /presence/message/stream endpoint installed a sink, so this helper
+        bridges to ``BaseModel.generate_stream`` when a sink is present and
+        falls back to plain ``generate`` otherwise.
+
+        Either way it returns the full accumulated text so the caller can
+        run its sanitize/validate post-processing as before.
+        """
+        from streaming import get_stream_sink
+        sink = get_stream_sink()
+        stream_fn = getattr(self.chat_model, "generate_stream", None) if sink is not None else None
+        if stream_fn is not None:
+            parts: list[str] = []
+            try:
+                for chunk in stream_fn(
+                    prompt,
+                    options=options,
+                    timeout=timeout,
+                    think=think,
+                ):
+                    parts.append(chunk)
+                    try:
+                        sink("delta", chunk)
+                    except Exception:
+                        pass
+            except Exception:
+                if not allow_empty:
+                    raise
+                return ""
+            return "".join(parts)
+        return self.chat_model.generate(
+            prompt,
+            options=options,
+            timeout=timeout,
+            think=think,
+            allow_empty=allow_empty,
+        )
 
     def _compose_response(
         self,
@@ -3430,15 +3500,95 @@ User message:
         "required": ["facts"],
     }
 
+    # Cheap deterministic guard: only fire the fact-extractor LLM when the
+    # message *might* contain a first-person declarative statement. Without
+    # this, every general_question paid ~500ms on the chat model even for
+    # pure questions ("what is the capital of france") that have no facts.
+    #
+    # The patterns favor RECALL over precision: we'd rather run the
+    # extractor unnecessarily on an edge case than silently lose a fact.
+    # Anything matching ANY of these triggers the LLM:
+    #   - "i" / "i'm" / "i am" / "i was" / "i have" / "i'm a X" / etc.
+    #   - "my X is/are/was/were ..."
+    #   - "call me X" / "you can call me X"
+    #   - "remember (that) ..." / "remember I ..."
+    _FACT_INDICATOR_PATTERNS = (
+        # Question stems — short-circuit "looks-like-question" before we even
+        # bother checking fact patterns. We do this in a separate gate below
+        # so users can still get facts out of "I think my favorite color is
+        # blue, what's yours?" (mixed statement+question).
+        # Below: positive indicators.
+        re.compile(r"\bmy\s+\S+\s+(?:is|are|was|were|isn't|aren't|wasn't|weren't|='?s?)\b", re.I),
+        # Require content AFTER "i'm" / "i am" — this excludes question
+        # tail forms like "who am I" while still catching "I'm a doctor",
+        # "I'm 30 years old", "I am from Seattle", etc.
+        re.compile(r"\b(?:i'm|im|i\s+am|i\s+was|i'll|i've|i'd)\s+\S+", re.I),
+        re.compile(r"\bi\s+(?:have|had|own|like|love|hate|prefer|enjoy|use|drive|play|work|live|study|went|go|come|teach|teach|build|wrote|read|watched)\b", re.I),
+        re.compile(r"\b(?:call|name)\s+me\s+\w+", re.I),
+        re.compile(r"\bremember\s+(?:that|i|my|we|us|me)\b", re.I),
+        re.compile(r"\bmy\s+(?:name|pet|cat|dog|family|wife|husband|partner|kid|son|daughter|favorite|fav|job|hobby|home|address|car|bike|birthday|age|email|phone|number|company|team|boss|friend|neighbor|landlord)\b", re.I),
+    )
+    _QUESTION_STEMS = re.compile(
+        r"^\s*(?:what|who|where|when|why|how|which|whose|whom|is|are|was|were|do|does|did|can|could|will|would|should|may|might|tell\s+me|show\s+me|give\s+me|explain|describe|list)\b",
+        re.I,
+    )
+
+    # Small in-memory LRU for fact-extractor output. Avoids re-running the
+    # chat model when the same message recurs (correction flow, retries,
+    # benchmark scripts, etc.).
+    _FACT_EXTRACT_CACHE: collections.OrderedDict = collections.OrderedDict()
+    _FACT_EXTRACT_CACHE_MAX = 128
+    _FACT_EXTRACT_CACHE_LOCK = threading.Lock()
+
+    @classmethod
+    def _fact_cache_get(cls, key: str) -> list[str] | None:
+        with cls._FACT_EXTRACT_CACHE_LOCK:
+            value = cls._FACT_EXTRACT_CACHE.get(key)
+            if value is not None:
+                cls._FACT_EXTRACT_CACHE.move_to_end(key)
+                return list(value)
+            return None
+
+    @classmethod
+    def _fact_cache_put(cls, key: str, value: list[str]) -> None:
+        with cls._FACT_EXTRACT_CACHE_LOCK:
+            cls._FACT_EXTRACT_CACHE[key] = list(value)
+            cls._FACT_EXTRACT_CACHE.move_to_end(key)
+            while len(cls._FACT_EXTRACT_CACHE) > cls._FACT_EXTRACT_CACHE_MAX:
+                cls._FACT_EXTRACT_CACHE.popitem(last=False)
+
+    def _message_might_contain_fact(self, message: str) -> bool:
+        """Cheap heuristic: True if the message *might* contain a first-
+        person declarative fact worth handing to the LLM extractor."""
+        text = (message or "").strip()
+        if not text:
+            return False
+        # Pure question short-circuit: starts with a question stem AND has no
+        # positive fact indicator. (We still allow "I think X is Y" through.)
+        if self._QUESTION_STEMS.match(text):
+            for pat in self._FACT_INDICATOR_PATTERNS:
+                if pat.search(text):
+                    return True
+            return False
+        for pat in self._FACT_INDICATOR_PATTERNS:
+            if pat.search(text):
+                return True
+        return False
+
     def extract_user_facts(self, message: str) -> list[str]:
         """Pull declarative speaker-facts out of a turn.
         Returns a (possibly empty) list of third-person fact sentences.
 
         Uses chat_model (qwen3:8b) with structured output -- the 3B router
         model was dropping common preferences ("favorite drink", "favorite
-        movie", "favorite season") even with examples in the prompt. Cost is
-        ~300ms per general_question/direction turn, which is acceptable for
-        the reliability gain (silently losing facts corrupts memory)."""
+        movie", "favorite season") even with examples in the prompt. To
+        keep this off the hot path for pure questions we (a) deterministic
+        pre-filter via _message_might_contain_fact, and (b) memoize results
+        per normalized message text.
+
+        Net effect: pure-question turns ("what is X") skip the LLM entirely
+        (~500ms savings); repeated identical inputs hit the cache (~500ms
+        savings on the second occurrence)."""
         if not message or not message.strip():
             return []
         # Deterministic fast-path: name introductions ("my name is X", "I'm X",
@@ -3446,6 +3596,15 @@ User message:
         introduced = _extract_introduction_name(message)
         if introduced:
             return [f"the user's name is {introduced}"]
+        # Deterministic guard: skip the LLM if no first-person fact pattern
+        # is present at all. Conservative — we'd rather over-call than miss.
+        if not self._message_might_contain_fact(message):
+            return []
+        # Memoized extractor: identical messages reuse last result.
+        cache_key = " ".join(message.strip().lower().split())
+        cached = self._fact_cache_get(cache_key)
+        if cached is not None:
+            return cached
         prompt = self._FACT_EXTRACTOR_PROMPT.format(message=message.strip())
         try:
             raw = self.chat_model.generate(
@@ -3457,21 +3616,19 @@ User message:
             )
         except Exception:
             return []
-        if not raw:
-            return []
-        text = raw.strip()
-        # The schema gives us {"facts": [...]} — find the first object.
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            return []
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return []
-        facts = []
-        for item in (data.get("facts") if isinstance(data, dict) else []) or []:
-            if isinstance(item, str) and item.strip():
-                facts.append(item.strip())
+        facts: list[str] = []
+        if raw:
+            text = raw.strip()
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    data = None
+                for item in ((data or {}).get("facts") if isinstance(data, dict) else []) or []:
+                    if isinstance(item, str) and item.strip():
+                        facts.append(item.strip())
+        self._fact_cache_put(cache_key, facts)
         return facts
 
     @staticmethod
@@ -3589,11 +3746,45 @@ Output JSON only:
         "required": ["relation"],
     }
 
+    # Cache for (new_fact, old_fact) → relation. The same pair recurs often
+    # within a session: if a user repeats a fact, vector search returns the
+    # same candidate and we'd otherwise call the LLM with the identical
+    # prompt. Pure function on (new, old) so memoization is safe.
+    _FACT_RELATION_CACHE: collections.OrderedDict = collections.OrderedDict()
+    _FACT_RELATION_CACHE_MAX = 256
+    _FACT_RELATION_CACHE_LOCK = threading.Lock()
+
+    @classmethod
+    def _relation_cache_get(cls, key: tuple[str, str]) -> str | None:
+        with cls._FACT_RELATION_CACHE_LOCK:
+            value = cls._FACT_RELATION_CACHE.get(key)
+            if value is not None:
+                cls._FACT_RELATION_CACHE.move_to_end(key)
+            return value
+
+    @classmethod
+    def _relation_cache_put(cls, key: tuple[str, str], value: str) -> None:
+        with cls._FACT_RELATION_CACHE_LOCK:
+            cls._FACT_RELATION_CACHE[key] = value
+            cls._FACT_RELATION_CACHE.move_to_end(key)
+            while len(cls._FACT_RELATION_CACHE) > cls._FACT_RELATION_CACHE_MAX:
+                cls._FACT_RELATION_CACHE.popitem(last=False)
+
     def classify_fact_relation(self, new_fact: str, old_fact: str) -> str:
         """Use the chat model (qwen3:8b) for this — the smaller router model
         was flickering between contradicts/duplicate/extends on near-identical
         embeddings, and getting this wrong silently loses or corrupts memory.
-        Structured-output mode prevents free-form regressions."""
+        Structured-output mode prevents free-form regressions.
+
+        Memoized on the (new, old) pair: the same fact reasserted in a
+        later turn won't pay the LLM cost again."""
+        cache_key = (
+            " ".join((new_fact or "").lower().split()),
+            " ".join((old_fact or "").lower().split()),
+        )
+        cached = self._relation_cache_get(cache_key)
+        if cached is not None:
+            return cached
         prompt = self._FACT_RELATION_PROMPT.format(old=old_fact, new=new_fact)
         try:
             raw = self.chat_model.generate(
@@ -3605,19 +3796,19 @@ Output JSON only:
             )
         except Exception:
             return "unrelated"
-        if not raw:
-            return "unrelated"
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            return "unrelated"
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return "unrelated"
-        rel = str(data.get("relation", "")).strip().lower()
-        if rel in {"duplicate", "contradicts", "extends", "unrelated"}:
-            return rel
-        return "unrelated"
+        rel = "unrelated"
+        if raw:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    candidate = str(data.get("relation", "")).strip().lower()
+                    if candidate in {"duplicate", "contradicts", "extends", "unrelated"}:
+                        rel = candidate
+                except json.JSONDecodeError:
+                    pass
+        self._relation_cache_put(cache_key, rel)
+        return rel
 
     def _classify_and_route_fact(self, fact: str, identity: str | None,
                                   unidentified_face_ref: str | None,
@@ -4114,6 +4305,30 @@ English:
             out.append({"user": msg, "assistant": resp[:200]})
         return out
 
+    # Heuristic: messages that are clearly about the SPEAKER (their stuff,
+    # their state, their preferences) don't benefit from world-knowledge
+    # RAG and pay ~100-300ms for a wiki vector search whose results we
+    # forbid the model from using anyway. Skip the lookup entirely for
+    # those.
+    _SPEAKER_REFERENCE_RE = re.compile(
+        r"\b(my|mine|i\s+am|i'm|im|i\s+have|i've|i\s+had|i\s+like|i\s+love|i\s+hate|i\s+prefer|i\s+work|i\s+live|i\s+study|do\s+you\s+know\s+me|remember\s+me|am\s+i)\b",
+        re.I,
+    )
+
+    def _message_likely_world_question(self, message: str) -> bool:
+        """True when the message is asking about the world (facts, history,
+        definitions, public figures/places) rather than the speaker. Used
+        to skip the wiki RAG lookup on speaker questions."""
+        text = (message or "").strip()
+        if not text:
+            return False
+        if self._SPEAKER_REFERENCE_RE.search(text):
+            return False
+        # Everything else gets the RAG lookup. Cheap fallback when we're
+        # not sure: pay the ~100-300ms for the vector search rather than
+        # silently denying world context.
+        return True
+
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
@@ -4141,10 +4356,14 @@ English:
             self._third_to_second_person(r["content"])
             for r in self.recall_user_facts(message, top_k=5)
         ]
-        # World-knowledge lookup runs in parallel with user-fact recall and
-        # is identity-free. Composer prompt instructs the model to use these
-        # only for world facts (not speaker questions) and to cite by title.
-        world_hits = self.recall_world_knowledge(message, top_k=3)
+        # World-knowledge lookup is identity-free. Skip the ~100-300ms
+        # vector search entirely for messages that clearly ask about the
+        # speaker — the prompt forbids the model from using world hits
+        # for speaker questions anyway.
+        if self._message_likely_world_question(message):
+            world_hits = self.recall_world_knowledge(message, top_k=3)
+        else:
+            world_hits = []
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
         # Only inject recent_chat as a fallback when memory has nothing for
@@ -4174,33 +4393,55 @@ English:
             "wiki_hits": [h for h in world_hits if h["source"] == "wikipedia"],
             "media_hits": [h for h in world_hits if h["source"] == "media_vault"],
         }
+        # Snippet sizes trimmed from 600 → 360 chars: the chat model rarely
+        # needed more than the lead paragraph of a Wikipedia article, and
+        # the prompt-eval cost scales linearly with context tokens.
         world_knowledge_prompt = [
             {
                 "source": h["source"],
                 "title": h.get("title") or h.get("asset_id"),
                 "section": h.get("section") or h.get("modality"),
-                "snippet": h["snippet"],
+                "snippet": (h.get("snippet") or "")[:360],
             }
             for h in world_hits
         ]
+        # Build the context dict with only non-empty fields. Empty arrays
+        # and unused keys add ~100-200 tokens of noise to prompt-eval for
+        # no benefit — and the chat model has been documented to be more
+        # consistent when the context is minimal.
+        tracking_memory = (state.get("object_memory") or [])[:4]
+        response_guidance = self._format_response_lessons_for_prompt(
+            response_context.get("response_lessons", [])
+        )[-5:]
+        context: dict = {
+            "identity_context": identity_context,
+            "conversation_context": conversation_context,
+            "active_identity": active_identity_context or "unknown",
+        }
+        if response_guidance:
+            context["response_guidance"] = response_guidance
+        if recent_chat:
+            # Cap to 4 turns when memory has facts — the recent_chat fallback
+            # is just for when memory is empty; 4 turns is enough to keep the
+            # last exchange in view.
+            context["recent_chat"] = recent_chat[-4:]
+        if state.get("ok"):
+            context["tracking_available"] = True
+        if tracking_memory:
+            context["tracking_memory"] = tracking_memory
+        if recalled_facts:
+            context["remembered_user_facts"] = recalled_facts
+        if facts_just_stored:
+            context["facts_just_stored"] = facts_just_stored
+        if world_knowledge_prompt:
+            context["world_knowledge"] = world_knowledge_prompt
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
 User: {message}
 
 Context:
-{json.dumps({
-    "identity_context": identity_context,
-    "response_guidance": self._format_response_lessons_for_prompt(response_context.get("response_lessons", []))[-5:],
-    "conversation_context": conversation_context,
-    "recent_chat": recent_chat,
-    "tracking_available": bool(state.get("ok")),
-    "active_identity": active_identity_context or "unknown",
-    "tracking_memory": state.get("object_memory", [])[:4],
-    "remembered_user_facts": recalled_facts,
-    "facts_just_stored": facts_just_stored,
-    "world_knowledge": world_knowledge_prompt,
-}, separators=(",", ":"), default=str)}
+{json.dumps(context, separators=(",", ":"), default=str)}
 
 Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
 Answer ONLY the specific thing the user asked. Do NOT volunteer unrelated stored facts. If they asked "what's my name", answer with the name and nothing else — do not append their location or snack preference.
@@ -4226,10 +4467,21 @@ Do not address the user by name/title unless identity_context permits it.
             # answer..." scaffold treats this prompt as data ("Facts:
             # {legacy_prompt: ...}") instead of instructions, which drowned
             # out the world_knowledge / remembered_user_facts rules. Same
-            # reason _assistant_identity_answer goes direct.
-            text = (self.chat_model.generate(
+            # reason _assistant_identity_answer goes direct. Use the
+            # streaming-aware helper so the /presence/message/stream path
+            # actually emits per-token deltas here too.
+            #
+            # num_predict tightened from 140 → 40: the prompt rules already
+            # say "1-2 short sentences", but the model occasionally ignored
+            # that and ran long. 40 tokens fits 1-2 clean sentences with
+            # citation; cap saves ~400-800ms on the cases where the model
+            # would have rambled, and enforces conversational brevity.
+            # Replies that legitimately need more (e.g. "tell me three
+            # things about X") get the first item or two and stop — the
+            # user can ask "go on" for more.
+            text = (self._generate_user_facing(
                 prompt,
-                options={"num_predict": 140, "temperature": 0.45, "top_p": 0.9},
+                options={"num_predict": 40, "temperature": 0.45, "top_p": 0.9},
                 think=False,
                 allow_empty=True,
             ) or "").strip()
@@ -4893,23 +5145,22 @@ Raw tracking memory:
 Response context:
 {json.dumps(self.response_context(state), indent=2, default=str)}
 """
-        # Ollama multimodal endpoint, if a vision model is installed.
+        # Route through the BaseModel wrapper so this call inherits the
+        # vision role's keep_alive (24h, immediate) instead of Ollama's
+        # 5-minute default. Pre-wrapper this was a raw requests.post and
+        # the vision model would silently cold-load every few minutes.
         try:
-            response = requests.post(
-                "http://127.0.0.1:11434/api/generate",
-                json={
-                    "model": OLLAMA_VISION_MODEL,
-                    "prompt": prompt,
-                    "images": [image_b64],
-                    "stream": False,
-                    "options": self.chat_options({"num_predict": 260}),
-                },
+            vision_model = get_model("vision")
+            answer_raw = vision_model.generate(
+                prompt,
+                images=[image_b64],
+                options=self.chat_options({"num_predict": 260}),
+                think=False,
                 timeout=60,
+                allow_empty=True,
             )
-            if response.status_code == 200:
-                answer = _sanitize_generated_response(response.json().get("response", "")).strip()
-                return {"ok": True, "answer": answer}
-            return {"ok": False, "error": response.text}
+            answer = _sanitize_generated_response(answer_raw or "").strip()
+            return {"ok": True, "answer": answer}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -5384,6 +5635,49 @@ _IDENTITY_RECOGNITION_PHRASES = {
 }
 
 
+# Small in-memory LRU for LLM-routed messages. Hits skip the router LLM
+# call entirely on near-duplicate inputs — most useful when a correction
+# flow re-routes essentially the same phrase, or when test/dev fires the
+# same query rapidly. Bounded size, short TTL — cheap and self-limiting.
+class _RouteResultCache:
+    def __init__(self, max_size: int = 64, ttl_seconds: float = 60.0):
+        self._max = max_size
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        self._data: "collections.OrderedDict[str, tuple[dict, float]]" = collections.OrderedDict()
+
+    @staticmethod
+    def _key(message: str) -> str:
+        return (message or "").strip().lower()
+
+    def get(self, message: str) -> dict | None:
+        key = self._key(message)
+        now = time.time()
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            value, expires_at = entry
+            if expires_at < now:
+                del self._data[key]
+                return None
+            self._data.move_to_end(key)
+            # Return a shallow copy so callers can mutate without poisoning.
+            return dict(value)
+
+    def put(self, message: str, value: dict) -> None:
+        key = self._key(message)
+        now = time.time()
+        with self._lock:
+            self._data[key] = (dict(value), now + self._ttl)
+            self._data.move_to_end(key)
+            while len(self._data) > self._max:
+                self._data.popitem(last=False)
+
+
+_ROUTE_RESULT_CACHE = _RouteResultCache()
+
+
 def _pronoun_route_guard(message: str, route_result: dict) -> dict:
     """Enforce the pronoun convention from the router prompt: questions about
     the SPEAKER's own attributes ("what's my X", "where do I X") are
@@ -5632,7 +5926,10 @@ def _assistant_identity_response_violation(text: str) -> bool:
     body, node references) is now allowed because the assistant identity
     answer composes from MemoryStore-backed facts that explicitly include
     those — blocking them would force the LLM to lie or refuse."""
-    if re.search(r"\byou(?:'re| are| are not| aren't|re not)\b", str(text or "").casefold()):
+    lowered = str(text or "").casefold()
+    if re.search(r"\byou(?:'re| are| are not| aren't|re not)\b", lowered):
+        return True
+    if re.search(r"\bscout(?:'s)?\s+body\b|\bthrough\s+the\s+scout\b", lowered):
         return True
     return False
 

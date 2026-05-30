@@ -204,9 +204,18 @@ class VaultRuntime:
         # requests (ThreadingHTTPServer spawns one thread per call)
         # don't bleed alerts across each other.
         self._inline_alerts_tls = threading.local()
+        # Last time a user message landed at handle_presence / handle. Read by
+        # the world-ingest supervisor to decide whether the system is idle
+        # enough to resume background ingestion. Updated atomically; zero
+        # locking needed for a single float read/write.
+        self._last_user_activity_at: float = 0.0
+
+    def _touch_user_activity(self) -> None:
+        self._last_user_activity_at = time.time()
 
     def handle(self, user_input, node_id: str = "cli"):
         user_input = (user_input or "").strip()
+        self._touch_user_activity()
         # Use per-node active_task_id so concurrent sessions don't clobber each other
         self.active_task_id = self._node_task_ids.get(node_id)
 
@@ -412,6 +421,7 @@ class VaultRuntime:
     def handle_presence(self, message: str, node_id: str = "scout", presence_context: dict | None = None):
         """Route a presence/chat message through the scout bridge and return an
         enriched response with the same shape as handle()."""
+        self._touch_user_activity()
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
@@ -1620,7 +1630,7 @@ class VaultRuntime:
             original_message = (
                 pending.get("original_message")
                 if engine.correction_updates_previous_request(proposal, previous_proposal)
-                else message
+                else intent_info.get("correction_text") or message
             )
             self._set_pending({
                 "type": "learned_capability_confirmation",
@@ -1850,6 +1860,7 @@ class VaultRuntime:
                 "error": str(exc),
             }
 
+        last_user = float(self._last_user_activity_at or 0.0)
         return {
             "ok": True,
             "service": "vault_runtime",
@@ -1862,6 +1873,10 @@ class VaultRuntime:
                 "url": self.scout.scout_url,
                 "active_identity": self.scout.active_identity,
             },
+            # Used by the world-ingest supervisor (and useful for debugging
+            # idle detection generally). 0 means no user message seen yet.
+            "last_user_activity_at": last_user,
+            "seconds_since_user_activity": (time.time() - last_user) if last_user > 0 else None,
         }
 
     def _remember_active(self, response):

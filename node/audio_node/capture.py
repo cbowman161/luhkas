@@ -36,8 +36,10 @@ class MicCapture:
         sample_rate: int | None = None,
         chunk_bytes: int = 3200,  # 100 ms @ 16 kHz mono S16_LE
         arecord_bin: str | None = None,
+        on_chunk = None,
     ) -> None:
         self.stt = stt
+        self.on_chunk = on_chunk
         self.on_transcript = on_transcript
         self.device = device or os.environ.get("AUDIO_INPUT_DEVICE", "default")
         self.sample_rate = int(sample_rate or stt.sample_rate or 16000)
@@ -114,6 +116,11 @@ class MicCapture:
                     break
                 if self._muted.is_set():
                     continue
+                if self.on_chunk is not None:
+                    try:
+                        self.on_chunk(pcm)
+                    except Exception as exc:
+                        log.warning('on_chunk callback failed: %s', exc)
                 result = self.stt.accept(pcm)
                 if result is None or not result.text:
                     continue

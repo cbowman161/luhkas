@@ -6,5 +6,11 @@
     "rover_node",
     "light_node",
     "battery_node"
-  ]
+  ],
+  "extra_units": [
+    "luhkas"
+  ],
+  "sync": {
+    "host": "luhkas-scout.local"
+  }
 }

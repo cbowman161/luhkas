@@ -2,11 +2,33 @@
   "node_id": "kiosk",
   "modules": [
     "camera_node",
-    "battery_node",
     "audio_node",
     "display_node"
   ],
   "display": {
     "rotation": "right"
+  },
+  "extra_units": [
+    "luhkas"
+  ],
+  "services": {
+    "vision": {
+      "env": {
+        "SCOUT_HEF_PATH": "/usr/share/hailo-models/yolov8m_h10.hef",
+        "SCOUT_POSE_ENABLED": "0",
+        "SCOUT_SEARCH_ENABLED": "0",
+        "SCOUT_WHEEL_ENABLED": "0",
+        "SCOUT_VAULT_MEMORY_ENABLED": "1",
+        "SCOUT_VAULT_MEMORY_URL": "http://luhkas-vault.local:7000"
+      }
+    },
+    "display": {
+      "env": {
+        "DISPLAY_PORT": "5006"
+      }
+    }
+  },
+  "sync": {
+    "host": "luhkas-kiosk.local"
   }
 }

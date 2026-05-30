@@ -23,10 +23,19 @@ DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent / "profiles"
 # module's service (e.g. pantilt + light commands ride on robot_api).
 _MODULE_SERVICES = {
     "camera_node": "vision",
+    "pantilt_node": "pantilt",
     "rover_node": "robot-api",
     "battery_node": "battery",
     "audio_node": "audio",
     "display_node": "display",
+}
+
+# Additional services implied by a module beyond its primary one. Used when
+# a single module needs both a hardware-proxy service and a higher-level
+# logic service. rover_node maps to robot-api (UART proxy) AND rover
+# (wheel-drive logic that polls vision /meta + dispatches via robot-api).
+_MODULE_EXTRA_SERVICES = {
+    "rover_node": ["rover"],
 }
 
 # Module → extra systemd unit (no network port). Chromium kiosk, gamepad
@@ -49,6 +58,8 @@ _DEFAULT_PORTS = {
     "battery": 5003,
     "audio": 5004,
     "display": 5005,
+    "pantilt": 5006,
+    "rover": 5007,
 }
 
 
@@ -57,6 +68,21 @@ _DEFAULT_PORTS = {
 # Lets us encode "vision tracks a person when camera + pantilt + rover are
 # all on the same node" without those settings leaking into kiosk's vision.
 _SERVICE_COMBO_DEFAULTS: list[dict] = [
+    # Pantilt service polls vision /meta and dispatches commands to robot_api;
+    # start it after both are up on the same node.
+    {
+        "requires": ["pantilt_node"],
+        "service": "pantilt",
+        "after": ["{NODE_ID}-vision.service", "{NODE_ID}-robot-api.service"],
+        "wants": ["{NODE_ID}-vision.service", "{NODE_ID}-robot-api.service"],
+    },
+    # Rover service polls vision /meta and dispatches wheel commands to robot_api.
+    {
+        "requires": ["rover_node"],
+        "service": "rover",
+        "after": ["{NODE_ID}-vision.service", "{NODE_ID}-robot-api.service"],
+        "wants": ["{NODE_ID}-vision.service", "{NODE_ID}-robot-api.service"],
+    },
     {
         "requires": ["camera_node", "pantilt_node", "rover_node"],
         "service": "vision",
@@ -154,6 +180,9 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
         name = _MODULE_SERVICES.get(m)
         if name and name not in inferred_names:
             inferred_names.append(name)
+        for extra in _MODULE_EXTRA_SERVICES.get(m, []):
+            if extra not in inferred_names:
+                inferred_names.append(extra)
     # Profile may declare extra services not implied by any module.
     for name in overrides.keys():
         if name not in inferred_names:
@@ -224,17 +253,6 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
     rdp = dict(raw.get("rdp") or {})
     rdp.setdefault("enabled", False)
 
-    # ── sync ───────────────────────────────────────────────────────────────
-    sync_raw = dict(raw.get("sync") or {})
-    sync = {
-        "host": sync_raw.get("host") or f"luhkas-{node_id}",
-        "user": sync_raw.get("user") or "luhkas",
-        "node_dir": sync_raw.get("node_dir") or "luhkas/node",
-    }
-    sync["services"] = sync_raw.get("services") or [
-        f"{node_id}-{name}" for name in services.keys()
-    ]
-
     # ── extra units (inferred from modules; profile may add more) ──────────
     inferred_extras = [
         _MODULE_EXTRA_UNITS[m] for m in modules if m in _MODULE_EXTRA_UNITS
@@ -249,6 +267,24 @@ def resolve(raw: dict, *, default_node_id: str = "") -> dict:
             continue
         seen.add(key)
         extras.append(name)
+
+    # ── sync ───────────────────────────────────────────────────────────────
+    sync_raw = dict(raw.get("sync") or {})
+    sync = {
+        "host": sync_raw.get("host") or f"luhkas-{node_id}",
+        "user": sync_raw.get("user") or "luhkas",
+        "node_dir": sync_raw.get("node_dir") or "luhkas/node",
+    }
+    if sync_raw.get("services"):
+        sync["services"] = sync_raw["services"]
+    else:
+        service_names = [f"{node_id}-{name}.service" for name in services.keys()]
+        extra_names = [
+            f"{node_id}-{(extra if isinstance(extra, str) else extra.get('name', ''))}.service"
+            for extra in extras
+            if (extra if isinstance(extra, str) else extra.get("name", "")) != "controller"
+        ]
+        sync["services"] = [name for name in service_names + extra_names if name != f"{node_id}-.service"]
 
     resolved = dict(raw)
     resolved.update({

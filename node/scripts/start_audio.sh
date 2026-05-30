@@ -12,4 +12,18 @@ if [ -f "$NODE_DIR/.env" ]; then
 fi
 
 cd "$NODE_DIR"
-exec python3 audio_node/service.py
+
+if [ "${AUDIO_AUTO_CONFIGURE_HAT:-1}" != "0" ] \
+  && [ -r /proc/asound/cards ] \
+  && grep -Eq "wm8960soundcard|wm8960-soundcard" /proc/asound/cards; then
+  "$NODE_DIR/audio_node/configure_raspiaudio_mic_ultra_3.sh"
+  export AUDIO_INPUT_DEVICE="${AUDIO_INPUT_DEVICE:-plughw:CARD=wm8960soundcard,DEV=0}"
+  export AUDIO_OUTPUT_DEVICE="${AUDIO_OUTPUT_DEVICE:-plughw:CARD=wm8960soundcard,DEV=0}"
+fi
+
+AUDIO_PYTHON="${AUDIO_PYTHON:-$HOME/.local/share/luhkas/audio_node/venv/bin/python}"
+if [ ! -x "$AUDIO_PYTHON" ]; then
+  AUDIO_PYTHON="python3"
+fi
+
+exec "$AUDIO_PYTHON" audio_node/service.py

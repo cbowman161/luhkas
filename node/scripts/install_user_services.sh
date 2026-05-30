@@ -65,17 +65,43 @@ shopt -u nullglob
 
 # Render this node's systemd units from the shared templates + profile.
 # render_units.py is the single source of truth for what unit files exist.
-python3 "${NODE_DIR}/scripts/render_units.py" \
+RENDER_OUTPUT="$(python3 "${NODE_DIR}/scripts/render_units.py" \
   "${NODE_ID}" \
   --dest "${UNIT_DIR}" \
   --node-dir "${NODE_DIR}" \
-  --vault-url "${VAULT_URL}"
+  --vault-url "${VAULT_URL}")"
+printf '%s\n' "${RENDER_OUTPUT}"
 
 PREFIX="${NODE_ID}-"
-shopt -s nullglob
 RENDERED=()
-for svc_path in "${UNIT_DIR}/${PREFIX}"*.service; do
-  RENDERED+=("$(basename "${svc_path}")")
+while IFS= read -r line; do
+  case "${line}" in
+    "[render] "*)
+      RENDERED+=("$(basename "${line#"[render] "}")")
+      ;;
+  esac
+done <<< "${RENDER_OUTPUT}"
+
+# Remove same-node LUHKAS-rendered units that are no longer part of the
+# current profile. This matters when hardware modules are removed from a node
+# after first install, e.g. kiosk no longer carrying a battery/UPS HAT.
+shopt -s nullglob
+for unit in "${UNIT_DIR}/${PREFIX}"*.service; do
+  name="$(basename "${unit}")"
+  if grep -qE "^ExecStart=${NODE_DIR}/scripts/start_" "${unit}" 2>/dev/null; then
+    keep=0
+    for rendered in "${RENDERED[@]}"; do
+      if [ "${name}" = "${rendered}" ]; then
+        keep=1
+        break
+      fi
+    done
+    if [ "${keep}" = "0" ]; then
+      echo "Removing stale unit (not in current profile): ${name}"
+      systemctl --user disable --now "${name}" 2>/dev/null || true
+      rm -f "${unit}"
+    fi
+  fi
 done
 shopt -u nullglob
 
@@ -83,7 +109,7 @@ systemctl --user daemon-reload
 
 # Always-on services for every node (start with --now). Controller, if present,
 # is enabled but not auto-started (gamepad is optional).
-ALWAYS_ON_SUFFIXES=("robot-api" "vision" "presence" "battery" "audio" "display")
+ALWAYS_ON_SUFFIXES=("robot-api" "vision" "presence" "battery" "audio" "display" "browser" "luhkas" "pantilt" "rover")
 for svc in "${RENDERED[@]}"; do
   suffix="${svc#${PREFIX}}"
   suffix="${suffix%.service}"

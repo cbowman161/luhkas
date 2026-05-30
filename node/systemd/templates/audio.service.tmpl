@@ -10,8 +10,9 @@ Type=simple
 WorkingDirectory={NODE_DIR}
 Environment=LUHKAS_NODE_ID={NODE_ID}
 Environment=AUDIO_STT_ENGINE=vosk
-Environment=AUDIO_TTS_ENGINE=espeak
-Environment=AUDIO_DISPLAY_URL=http://127.0.0.1:5005
+Environment=AUDIO_TTS_ENGINE=piper
+Environment=AUDIO_PIPER_MODEL=/home/luhkas/.local/share/luhkas/audio_node/piper/en_US-joe-medium.onnx
+Environment=AUDIO_UI_EVENT_URL=http://127.0.0.1:5005/ui/event
 Environment=AUDIO_PRESENCE_URL=http://127.0.0.1:5002/presence/message
 {EXTRA_ENV}
 ExecStart={NODE_DIR}/scripts/start_audio.sh

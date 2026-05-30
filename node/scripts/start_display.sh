@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Launcher for the physical display service.
+# luhkas_node owns /ui and /chat; display_node owns what the kiosk screen shows.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

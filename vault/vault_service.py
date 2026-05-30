@@ -1,8 +1,11 @@
 import argparse
 import json
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from streaming import reset_stream_sink, set_stream_sink
 from vault_runtime import VaultRuntime
 
 
@@ -11,6 +14,154 @@ _PUSHABLE_EVENT_TYPES = {
     "install_succeeded", "install_failed",
     "world_ingest_stalled", "world_ingest_completed",
 }
+
+
+_VAULT_FACE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05070a">
+<title>LUHKAS Presence</title>
+<style>
+*{box-sizing:border-box} html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05070a;color:#eef7ff;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{display:grid;place-items:center}
+.stage{position:relative;width:100vw;height:100vh;min-height:100vh;background:radial-gradient(circle at 50% 42%,#18232a 0,#091015 48%,#030506 100%);isolation:isolate}
+.stage:before{content:"";position:absolute;inset:0;background:linear-gradient(120deg,rgba(78,187,181,.11),transparent 36%,rgba(255,178,91,.08) 70%,transparent);mix-blend-mode:screen}
+.stage:after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,rgba(255,255,255,.035) 0 1px,transparent 1px 4px);opacity:.18;pointer-events:none}
+.presence{position:absolute;inset:0;display:grid;grid-template-rows:minmax(0,1fr) auto;align-items:center;justify-items:center;padding:5.5vh 5vw 4.5vh}
+.face-wrap{position:relative;width:min(72vw,72vh);aspect-ratio:1;display:grid;place-items:center}
+.aura{position:absolute;inset:3%;border-radius:50%;background:conic-gradient(from var(--spin),rgba(102,231,214,.12),rgba(255,191,120,.17),rgba(144,183,255,.16),rgba(102,231,214,.12));filter:blur(16px);animation:spin 16s linear infinite,pulse 4s ease-in-out infinite}
+.orb{position:absolute;inset:10%;border-radius:50%;background:radial-gradient(circle at 50% 40%,#122932 0,#071014 68%,#020304 100%);box-shadow:0 0 0 1px rgba(180,245,255,.12),0 28px 120px rgba(46,198,190,.24),inset 0 0 70px rgba(107,219,209,.12)}
+.orb:before{content:"";position:absolute;inset:9%;border-radius:50%;border:1px solid rgba(167,240,235,.18);box-shadow:inset 0 0 45px rgba(102,231,214,.11)}
+.eyes{position:absolute;top:37%;left:22%;right:22%;height:18%;display:flex;align-items:center;justify-content:space-between}
+.eye{width:28%;height:78%;border-radius:999px;background:#dffcff;box-shadow:0 0 20px rgba(160,246,255,.82),0 0 70px rgba(45,205,232,.42);transform:scaleY(var(--eye-open))}
+.pupil{width:38%;height:55%;margin:8% auto;border-radius:50%;background:#061318;box-shadow:inset 0 0 8px rgba(255,255,255,.18);transform:translate(var(--look-x),var(--look-y))}
+.mouth{position:absolute;top:59%;width:32%;height:9%;border-radius:0 0 999px 999px;border-bottom:clamp(5px,1.2vh,10px) solid #c9fbff;filter:drop-shadow(0 0 13px rgba(135,238,255,.72));transform:scaleX(var(--mouth-x)) scaleY(var(--mouth-y))}
+.signal{position:absolute;inset:0;border-radius:50%;border:1px solid rgba(135,238,255,.12);animation:ripple 4.8s ease-out infinite}
+.signal.two{animation-delay:1.6s}.signal.three{animation-delay:3.2s}
+.name{position:absolute;top:6vh;left:6vw;font-size:clamp(24px,4vw,54px);font-weight:700;letter-spacing:0;color:#f5fbff;text-shadow:0 0 30px rgba(120,230,255,.18)}
+.state{position:absolute;top:6.8vh;right:6vw;font-size:clamp(14px,1.8vw,24px);color:#a8bdc5;text-align:right}
+.caption{width:min(1120px,88vw);min-height:16vh;display:grid;align-content:end;gap:1.4vh;text-align:center;text-wrap:balance}
+.line{font-size:clamp(26px,5vw,76px);line-height:1.04;font-weight:650;letter-spacing:0;color:#f4fbff;text-shadow:0 0 38px rgba(96,223,229,.16)}
+.subline{font-size:clamp(14px,1.7vw,24px);color:#a9c2c9;min-height:1.4em}
+.awake .orb{box-shadow:0 0 0 1px rgba(180,245,255,.16),0 28px 140px rgba(46,198,190,.34),inset 0 0 84px rgba(107,219,209,.18)}
+.speaking .mouth{animation:talk .28s ease-in-out infinite alternate}.speaking .aura{filter:blur(12px);opacity:1}
+.alert .aura{background:conic-gradient(from var(--spin),rgba(255,114,114,.25),rgba(255,198,91,.2),rgba(255,114,114,.25))}
+.sleepy{--eye-open:.42;--mouth-y:.55}
+@property --spin{syntax:"<angle>";inherits:false;initial-value:0deg}
+:root{--eye-open:1;--look-x:0px;--look-y:0px;--mouth-x:1;--mouth-y:1}
+@keyframes spin{to{--spin:360deg}} @keyframes pulse{50%{transform:scale(1.035);opacity:.84}} @keyframes ripple{0%{transform:scale(.72);opacity:.36}100%{transform:scale(1.13);opacity:0}} @keyframes talk{from{transform:scaleX(.82) scaleY(.62)}to{transform:scaleX(1.16) scaleY(1.4)}}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="presence" id="presence">
+    <div class="name">LUHKAS</div>
+    <div class="state" id="state">connecting</div>
+    <div class="face-wrap" aria-hidden="true">
+      <div class="aura"></div><div class="signal"></div><div class="signal two"></div><div class="signal three"></div>
+      <div class="orb"></div>
+      <div class="eyes"><div class="eye"><div class="pupil"></div></div><div class="eye"><div class="pupil"></div></div></div>
+      <div class="mouth"></div>
+    </div>
+    <div class="caption"><div class="line" id="line">Listening.</div><div class="subline" id="subline"></div></div>
+  </div>
+</div>
+<script>
+const qs=new URLSearchParams(location.search); const nodeId=qs.get("node_id")||"kiosk";
+const presence=document.getElementById("presence"), line=document.getElementById("line"), subline=document.getElementById("subline"), state=document.getElementById("state");
+let lastText="", lastChange=Date.now(), speakingUntil=0;
+function setText(text, detail){ text=(text||"Listening.").trim(); if(text!==lastText){ lastText=text; lastChange=Date.now(); speakingUntil=Date.now()+Math.min(9000,1200+text.length*48); } line.textContent=text; subline.textContent=detail||""; }
+function applyMood(data){
+  const now=Date.now(); const health=data.node&&data.node.ok; const stale=data.node&&data.node.age_seconds>90; const alerts=(data.events||[]).length;
+  presence.classList.toggle("awake", !!health && !stale); presence.classList.toggle("sleepy", stale || !health); presence.classList.toggle("alert", alerts>0); presence.classList.toggle("speaking", now<speakingUntil);
+  state.textContent=(data.identity||"presence")+" / "+(health?"online":"waiting");
+  document.documentElement.style.setProperty("--look-x", (Math.sin(now/1700)*7).toFixed(1)+"px");
+  document.documentElement.style.setProperty("--look-y", (Math.cos(now/2300)*3).toFixed(1)+"px");
+  document.documentElement.style.setProperty("--eye-open", (stale ? .62 : 1).toString());
+}
+async function tick(){
+  try{
+    const r=await fetch(`/vault/face/state?node_id=${encodeURIComponent(nodeId)}`,{cache:"no-store"});
+    const data=await r.json();
+    const msg=data.latest_assistant||data.latest_user||"Listening.";
+    const detail=data.latest_user&&data.latest_assistant?data.latest_user:"";
+    setText(msg, detail);
+    applyMood(data);
+  }catch(e){ state.textContent="reconnecting"; presence.classList.add("sleepy"); }
+}
+setInterval(()=>presence.classList.toggle("speaking",Date.now()<speakingUntil),120);
+setInterval(tick,1200); tick();
+</script>
+</body>
+</html>"""
+
+
+def _event_age_seconds(event: dict) -> float | None:
+    created_at = event.get("created_at") if isinstance(event, dict) else None
+    if not created_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _presence_face_state(runtime, node_id: str) -> dict:
+    node_id = (node_id or "kiosk").strip()
+    session = {}
+    try:
+        session = runtime.scout.session() or {}
+    except Exception:
+        session = {}
+    turns = session.get("turns") if isinstance(session, dict) else []
+    latest_user = ""
+    latest_assistant = ""
+    if isinstance(turns, list):
+        for turn in reversed(turns[-20:]):
+            if not latest_assistant:
+                latest_assistant = str(turn.get("response") or turn.get("message") or "").strip()
+            if not latest_user:
+                latest_user = str(turn.get("message") or "").strip()
+            if latest_user and latest_assistant:
+                break
+    nodes = {}
+    try:
+        nodes = (runtime.node_registry.health_summary() or {}).get("nodes") or {}
+    except Exception:
+        nodes = {}
+    raw_node = nodes.get(node_id) if isinstance(nodes, dict) else {}
+    node = {"ok": False, "age_seconds": None, "person_count": 0}
+    if isinstance(raw_node, dict):
+        now = time.time()
+        last_active = raw_node.get("last_active_at") or 0
+        node = {
+            "ok": bool((raw_node.get("selftest") or {}).get("ok", raw_node.get("last_active_at"))),
+            "age_seconds": round(max(0.0, now - float(last_active or 0)), 1) if last_active else None,
+            "person_count": raw_node.get("person_count") or 0,
+            "last_identity_seen": raw_node.get("last_identity_seen"),
+        }
+    events = []
+    try:
+        events = [
+            event for event in (_events_feed(runtime, 0).get("events") or [])
+            if (_event_age_seconds(event) or 999999) <= 900
+        ][-3:]
+    except Exception:
+        events = []
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "identity": session.get("active_identity") if isinstance(session, dict) else None,
+        "latest_user": latest_user,
+        "latest_assistant": latest_assistant,
+        "node": node,
+        "events": events,
+    }
 
 
 def _events_feed(runtime, since_id: int) -> dict:
@@ -125,6 +276,16 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 self._send(200, self.runtime.health())
                 return
 
+            if path == "/vault/face":
+                self._send_html(200, _VAULT_FACE_HTML)
+                return
+
+            if path == "/vault/face/state":
+                qs = parse_qs(urlparse(self.path).query)
+                node_id = (qs.get("node_id") or ["kiosk"])[0]
+                self._send(200, _presence_face_state(self.runtime, node_id))
+                return
+
             if path == "/updates":
                 self._send(200, self.runtime.handle("updates"))
                 return
@@ -191,7 +352,6 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/events/feed":
-                from urllib.parse import parse_qs
                 qs = parse_qs(urlparse(self.path).query)
                 try:
                     since_id = int((qs.get("since_id") or ["0"])[0])
@@ -210,7 +370,6 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/alerts/pending":
-                from urllib.parse import parse_qs
                 qs = parse_qs(urlparse(self.path).query)
                 node_id = (qs.get("node_id") or [""])[0].strip() or "scout"
                 alerts = self.runtime.node_registry.pop_alerts(node_id)
@@ -258,6 +417,21 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                     args=(node_id,), daemon=True
                 ).start()
                 self._send(200, {"ok": True, "response": response})
+                return
+
+            if path == "/presence/message/stream":
+                payload = self._read_json()
+                message = str(payload.get("message") or "").strip()
+                node_id = str(
+                    payload.get("node_id")
+                    or payload.get("source")
+                    or payload.get("client")
+                    or "scout"
+                ).strip()
+                if not message:
+                    self._send(400, {"ok": False, "error": "Missing required JSON field: message"})
+                    return
+                self._handle_presence_stream(message, node_id, payload)
                 return
 
             if path == "/vision/analyze":
@@ -468,6 +642,109 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_presence_stream(self, message, node_id, payload):
+        """Run handle_presence with a streaming sink, emitting NDJSON events.
+
+        Wire format (one JSON object per line, application/x-ndjson):
+          {"type": "start"}
+          {"type": "delta", "text": "..."}   # zero or more, raw model tokens
+          {"type": "done",  "text": "..."}   # final validated text
+          {"type": "redo",  "text": "..."}   # sanitizer/validator replaced the
+                                             # streamed text; client should
+                                             # discard buffered deltas and use
+                                             # this instead
+          {"type": "error", "error": "..."}  # exception during handling
+
+        Only the ResponseComposer path emits deltas. Deterministic and
+        non-composer routes yield no deltas; the full reply arrives as a
+        single delta + done.
+        """
+        self.send_response(200)
+        self.send_header("content-type", "application/x-ndjson")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(event):
+            try:
+                self.wfile.write((json.dumps(event, default=str) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        emit({"type": "start"})
+
+        accumulated_parts: list[str] = []
+
+        def sink(kind: str, text: str) -> None:
+            if kind == "delta":
+                accumulated_parts.append(text)
+                emit({"type": "delta", "text": text})
+
+        token = set_stream_sink(sink)
+        response = None
+        try:
+            response = self.runtime.handle_presence(
+                message, node_id=node_id, presence_context=payload
+            )
+        except Exception as exc:
+            emit({"type": "error", "error": str(exc)})
+            return
+        finally:
+            reset_stream_sink(token)
+
+        import threading as _t
+        _t.Thread(target=self._update_person_count, args=(node_id,), daemon=True).start()
+
+        final_text = ""
+        if isinstance(response, dict):
+            final_text = str(
+                response.get("tts")
+                or response.get("message")
+                or response.get("response")
+                or ""
+            )
+
+        streamed_text = "".join(accumulated_parts).strip()
+        final_clean = final_text.strip()
+
+        # Whitespace-collapsed comparison — sanitizers that only normalize
+        # spacing should NOT trigger a "redo" hiccup.
+        def _norm(s: str) -> str:
+            return " ".join(s.split())
+
+        streamed_norm = _norm(streamed_text)
+        final_norm = _norm(final_clean)
+
+        if streamed_text and final_clean:
+            if streamed_norm == final_norm:
+                emit({"type": "done", "text": final_text})
+            elif final_norm and streamed_norm.startswith(final_norm):
+                # Common case: sanitizer trimmed a trailing closer/customer-
+                # service phrase. The streamed prefix is the kept content;
+                # tell the consumer to stop here without speaking anything
+                # buffered after the trim point.
+                emit({"type": "truncate", "text": final_text})
+            else:
+                # Validator/sanitizer materially changed the text. Consumer
+                # should interrupt and re-speak final_text.
+                emit({"type": "redo", "text": final_text})
+        elif not streamed_text and final_clean:
+            emit({"type": "delta", "text": final_text})
+            emit({"type": "done", "text": final_text})
+        else:
+            emit({"type": "done", "text": final_text or streamed_text})
+
+    def _send_html(self, status, html):
+        body = str(html).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.send_header("cache-control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 

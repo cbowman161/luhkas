@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -343,14 +344,14 @@ class LearnedCapabilityStore:
         except Exception:
             return {"version": 1, "capabilities": {}, "pending_code_monkey": {}}
 
-    def save(self, data: dict) -> None:
+    def save(self, data: dict, *, allow_empty_capabilities: bool = False) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Defensive: refuse to overwrite a populated file with an empty one.
         # The whole learned-capabilities feature depends on this file, and a
         # bug elsewhere (e.g. a load failure followed by a save) could silently
         # nuke every confirmed cap.
         new_caps = (data.get("capabilities") or {}) if isinstance(data, dict) else {}
-        if not new_caps and self.path.exists():
+        if not new_caps and self.path.exists() and not allow_empty_capabilities:
             try:
                 existing = json.loads(self.path.read_text(encoding="utf-8"))
                 existing_caps = (existing.get("capabilities") or {}) if isinstance(existing, dict) else {}
@@ -372,7 +373,7 @@ class LearnedCapabilityStore:
                 bak.write_bytes(self.path.read_bytes())
             except Exception:
                 pass
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 
@@ -475,7 +476,7 @@ class LearnedCapabilityStore:
         existed = key in caps
         if existed:
             del caps[key]
-            self.save(data)
+            self.save(data, allow_empty_capabilities=True)
         return existed
 
     def remember_pending_code_monkey(self, text: str, proposal: dict, task: dict) -> dict:
@@ -571,7 +572,7 @@ class LearnedCapabilityEngine:
         The LLM decides whether it's a correction; no leading-"no"/"actually"
         regex required."""
         if self.model is None:
-            return {"intent": "unrelated", "topic": None, "aspect": None}
+            return self._fallback_pending_intent(message, previous_topic, previous_aspect)
         prompt = _PENDING_INTENT_PROMPT % {
             "prev_topic": previous_topic or "none",
             "prev_aspect": previous_aspect or "none",
@@ -580,18 +581,22 @@ class LearnedCapabilityEngine:
             "user_message": json.dumps(str(message or "")),
         }
         try:
-            raw = self.model.generate(prompt, think=False, timeout=10)
+            # Tiny JSON output ({"intent":"affirm","topic":"…","aspect":"…"});
+            # the chat default of 240 tokens is wasteful here. 60 is plenty.
+            raw = self.model.generate(prompt, think=False, timeout=10, options={"num_predict": 60})
         except Exception:
-            return {"intent": "unrelated", "topic": None, "aspect": None}
+            return self._fallback_pending_intent(message, previous_topic, previous_aspect)
         parsed = self._parse_json_object(raw)
         if not isinstance(parsed, dict):
-            return {"intent": "unrelated", "topic": None, "aspect": None}
+            return self._fallback_pending_intent(message, previous_topic, previous_aspect)
         raw_intent = parsed.get("intent")
         intent = (raw_intent.strip().lower() if isinstance(raw_intent, str) else "unrelated")
         if intent not in {"affirm", "deny", "correct", "unrelated"}:
             intent = "unrelated"
         topic = self._clean_noun(parsed.get("topic"))
         aspect = self._clean_noun(parsed.get("aspect"))
+        if intent == "correct" and topic is None and aspect is None:
+            return self._fallback_pending_intent(message, previous_topic, previous_aspect)
         return {"intent": intent, "topic": topic, "aspect": aspect}
 
     def classify_correction(
@@ -606,7 +611,7 @@ class LearnedCapabilityEngine:
         Unlike `_infer_topic_and_aspect`, this is not memoized: the result
         depends on the previous proposal/cap, so each correction is fresh."""
         if self.model is None:
-            return None, None
+            return self._fallback_system_info_concept(correction, previous_topic=previous_topic)
         prompt = _CORRECTION_PROMPT % {
             "prev_topic": previous_topic or "none",
             "prev_aspect": previous_aspect or "none",
@@ -614,24 +619,113 @@ class LearnedCapabilityEngine:
             "correction": json.dumps(str(correction or "")),
         }
         try:
-            raw = self.model.generate(prompt, think=False, timeout=10)
+            # Short topic/aspect JSON; cap output to keep latency low.
+            raw = self.model.generate(prompt, think=False, timeout=10, options={"num_predict": 60})
         except Exception:
-            return None, None
+            return self._fallback_system_info_concept(correction, previous_topic=previous_topic)
         return self._parse_classification(raw)
 
     def _llm_classify(self, text: str) -> tuple[str | None, str | None]:
         if self.model is None:
-            return None, None
+            return self._fallback_system_info_concept(text)
         prompt = _CLASSIFIER_PROMPT % json.dumps(str(text or ""))
         try:
-            raw = self.model.generate(prompt, think=False, timeout=10)
+            # Short topic/aspect JSON; cap output to keep latency low.
+            raw = self.model.generate(prompt, think=False, timeout=10, options={"num_predict": 60})
         except Exception:
-            return None, None
+            return self._fallback_system_info_concept(text)
         topic, aspect = self._parse_classification(raw)
         # Plain classify path requires a topic; aspect-only doesn't make sense
         # for a fresh request.
         if topic is None:
+            return self._fallback_system_info_concept(text)
+        return topic, aspect
+
+    def _fallback_pending_intent(
+        self,
+        message: str,
+        previous_topic: str | None = None,
+        previous_aspect: str | None = None,
+    ) -> dict:
+        normalized = normalize_text(message)
+        if normalized in {"yes", "yeah", "yep", "yup", "correct", "right", "sure", "ok", "okay", "exactly"}:
+            return {"intent": "affirm", "topic": None, "aspect": None}
+        if normalized in {"no", "nope", "nah", "wrong", "not right", "negative"}:
+            return {"intent": "deny", "topic": None, "aspect": None}
+
+        correction = normalized
+        for pattern in (
+            r"^no[,.]?\s+(.+)$",
+            r"^nope[,.]?\s+(.+)$",
+            r"^nah[,.]?\s+(.+)$",
+            r"^actually[,.]?\s+(.+)$",
+        ):
+            match = re.match(pattern, correction)
+            if match:
+                correction = match.group(1).strip()
+                break
+        correction = re.sub(r"^(i\s+mean|mean|it'?s|its)\s+", "", correction).strip()
+        topic, aspect = self._fallback_system_info_concept(correction, previous_topic=previous_topic)
+        if topic is not None or aspect is not None:
+            return {
+                "intent": "correct",
+                "topic": topic,
+                "aspect": aspect or previous_aspect,
+                "correction_text": correction,
+            }
+        return {"intent": "unrelated", "topic": None, "aspect": None}
+
+    def _fallback_system_info_concept(
+        self,
+        text: str,
+        *,
+        previous_topic: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        normalized = normalize_text(text)
+        if not normalized:
             return None, None
+
+        hardware = bool(re.search(r"\b(hardware|brand|model|chip|processor|spec|specs)\b", normalized))
+        usage = bool(re.search(r"\b(usage|use|used|available|free|load|percent|percentage|space|left)\b", normalized))
+        status = bool(re.search(r"\b(status|state|running|uptime|up)\b", normalized))
+
+        topic = None
+        if re.search(r"\b(cpu|processor)\b", normalized):
+            topic = "cpu"
+        elif re.search(r"\b(ram|memory)\b", normalized):
+            topic = "memory"
+        elif re.search(r"\b(gpu|graphics)\b", normalized):
+            topic = "gpu"
+        elif re.search(r"\b(python|executable|interpreter)\b", normalized):
+            topic = "python"
+        elif re.search(r"\b(disk|storage|space)\b", normalized):
+            topic = "disk"
+        elif re.search(r"\b(hostname|host name)\b", normalized):
+            topic = "hostname"
+        elif re.search(r"\b(uptime|how long.*\bup\b)\b", normalized):
+            topic = "uptime"
+
+        aspect = None
+        if hardware:
+            aspect = "hardware"
+        elif usage:
+            aspect = "usage"
+        elif "version" in normalized or "path" in normalized:
+            aspect = "version"
+        elif status:
+            aspect = "status"
+
+        if topic is None and previous_topic and aspect:
+            topic = previous_topic
+        if topic is None:
+            return None, aspect
+        if aspect is None:
+            if topic in {"memory", "gpu"}:
+                aspect = "usage"
+            elif topic in {"python", "disk", "hostname", "uptime"}:
+                aspect = "status"
+            else:
+                aspect = "hardware"
         return topic, aspect
 
     @staticmethod
@@ -1034,7 +1128,8 @@ class LearnedCapabilityEngine:
             "don't know.\n\nPackage:"
         )
         try:
-            raw = self.model.generate(prompt, think=False, timeout=10)
+            # Output is a single apt package name token (or "unknown").
+            raw = self.model.generate(prompt, think=False, timeout=10, options={"num_predict": 15})
         except Exception:
             return None
         candidate = (raw or "").strip().splitlines()[0].strip() if raw else ""

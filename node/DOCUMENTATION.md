@@ -47,7 +47,7 @@ behavior.
 | Service | Port | Source | Role |
 |---------|------|--------|------|
 | `scout-robot-api` | 5001 | `services/robot_api.py` | HTTP to serial bridge, telemetry, OLED, heartbeat watchdog |
-| `scout-vision` | 5000 | `services/vision_service.py` | Camera, inference, tracking, UI, behavior, manual controller |
+| `scout-vision` | 5000 | `services/vision_service.py` | Camera, inference, tracking, behavior, manual controller |
 | `scout-presence` | 5002 | `services/presence_client_service.py` | Edge proxy to the vault brain |
 | `scout-battery` | 5003 | `battery_node/service.py` | Canonical battery state (UART proxy backend on scout; INA219 on UPS-HAT nodes) |
 | `scout-controller` | none | `tools/controller_drive.py` | Legacy/manual-start gamepad client; normal controller support now lives in `scout-vision` |
@@ -334,7 +334,6 @@ dark, it restores the previous brightness.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /` or `/ui` | Browser UI |
 | `GET /health` | Health plus latest meta |
 | `GET /meta` | Full per-frame state snapshot |
 | `GET /chat_log?limit=200` | Session chat/prompt input-output log |
@@ -351,7 +350,6 @@ dark, it restores the previous brightness.
 | `POST /move` | Manual wheel movement proxy |
 | `POST /collision` | Collision settings |
 | `POST /settings` | Live tuning values |
-| `POST /chat` | Proxy/deterministic chat command path |
 | `POST /people/<identity>/remember` | Store fact/preference |
 | `POST /people/<identity>/preference` | Preference shorthand |
 
@@ -359,11 +357,10 @@ Important `/meta` fields include detections, object memory, tracker stats,
 poses, target/target state, search phase, behavior state, guard status,
 collision status, light state, ambient light, gamepad state, follow settings,
 pan/tilt settings, face settings, vault memory status, and reference pose
-coverage. `/meta.chat_log` includes the last 25 chat-log entries, and
-`GET /chat_log?limit=200` returns a larger session log. The same entries are
-also appended as JSONL to `captures/chat_session.jsonl` by default. The service
-creates the file at startup and records a `session_start` entry. Override the
-path with `SCOUT_CHAT_LOG_PATH`.
+coverage.
+
+Node web chat is owned by `luhkas_node` on `/ui` and `/chat`; physical display
+rendering is owned by `display_node`.
 
 `POST /settings` can live-edit:
 

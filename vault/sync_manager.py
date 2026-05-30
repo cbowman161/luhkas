@@ -10,6 +10,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROFILES_DIR = _REPO_ROOT / "node" / "profiles"
 _NODE_DIR = _REPO_ROOT / "node"
+_DEFAULT_VAULT_URL = "http://luhkas-vault.local:7000"
 
 # Use the canonical profile loader so sync.host / user / node_dir / services
 # are filled in from node_id + modules when the profile doesn't spell them out.
@@ -77,6 +78,7 @@ def push_node(profile: dict) -> dict:
             # Build artifacts and editor cruft (never canonical)
             "--exclude=__pycache__/",
             "--exclude=*.pyc",
+            "--exclude=*.bak*",
             "--exclude=._*",
             "--exclude=.DS_Store",
             # Logs (runtime, per-node)
@@ -109,20 +111,40 @@ def push_node(profile: dict) -> dict:
 
     files_changed = bool(rsync.stdout.strip())
     restarted: list[str] = []
-    if files_changed and services:
-        restart = subprocess.run(
-            ["ssh"] + _SSH_OPTS + [f"{user}@{host}", f"systemctl --user restart {' '.join(services)}"],
+    install_output = ""
+    if services:
+        install_cmd = (
+            f"cd ~/{node_dir} && "
+            f"LUHKAS_NODE_ID={node_id} VAULT_CHAT_URL={_DEFAULT_VAULT_URL} "
+            "./scripts/install_user_services.sh"
+        )
+        install = subprocess.run(
+            ["ssh"] + _SSH_OPTS + [f"{user}@{host}", install_cmd],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
-        if restart.returncode != 0:
+        install_output = (install.stdout + install.stderr).strip()
+        if install.returncode != 0:
             return {
                 "ok": False,
                 "node_id": node_id,
-                "error": f"service restart failed: {restart.stderr.strip()}",
+                "error": f"service render failed: {install_output}",
             }
-        restarted = services
+        if files_changed:
+            restart = subprocess.run(
+                ["ssh"] + _SSH_OPTS + [f"{user}@{host}", f"systemctl --user restart {' '.join(services)}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if restart.returncode != 0:
+                return {
+                    "ok": False,
+                    "node_id": node_id,
+                    "error": f"service restart failed: {restart.stderr.strip()}",
+                }
+            restarted = services
 
     return {
         "ok": True,
@@ -130,6 +152,7 @@ def push_node(profile: dict) -> dict:
         "host": host,
         "files_changed": files_changed,
         "services_restarted": restarted,
+        "services_rendered": bool(install_output),
     }
 
 

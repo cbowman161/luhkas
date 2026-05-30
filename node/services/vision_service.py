@@ -30,10 +30,6 @@ from camera_node.media import save_clip as _camera_save_clip
 from camera_node.media import save_snapshot as _camera_save_snapshot
 from camera_node.settings import apply_settings as _camera_apply_settings
 from light_node.runtime import AutoLightRuntime
-from luhkas_node.chat_context import build_presence_payload
-from luhkas_node.ui import ui_html as _ui_html
-from luhkas_node.wakeword import is_wakeword_only as _is_wakeword_only
-from luhkas_node.wakeword import response as _wakeword_response
 from pantilt_node.runtime import apply_settings as _pantilt_apply_settings
 from pantilt_node.runtime import dispatch_robot_command
 from pantilt_node.runtime import handle_manual_pantilt as _pantilt_handle_manual
@@ -44,10 +40,8 @@ from rover_node.runtime import handle_manual_move as _rover_handle_manual_move
 from rover_node.runtime import set_collision as _rover_set_collision
 
 try:
-    from luhkas_node.local_commands import handle as _local_command_handle
     from luhkas_node.local_commands import capabilities as _local_command_capabilities
 except ImportError:
-    _local_command_handle = None
     _local_command_capabilities = None
 
 import cv2
@@ -70,8 +64,6 @@ from scout.vision import bbox_iou, draw_detections, is_face_label, letterbox, pa
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("vision_service")
-
-_VAULT_CHAT_URL = os.environ.get("VAULT_CHAT_URL", "http://luhkas-vault.local:7000").rstrip("/")
 
 vision_config = VisionConfig()
 face_config = FaceDetectionConfig()
@@ -141,8 +133,8 @@ latest_meta = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rover Hailo object detection and person tracking service.")
-    parser.add_argument("--hef-path", default=None, help="Path to the Hailo HEF model. If omitted, a known local detector is selected.")
-    parser.add_argument("--labels", default=None, help="Path to labels file, one label per line.")
+    parser.add_argument("--hef-path", default=os.environ.get("SCOUT_HEF_PATH") or None, help="Path to the Hailo HEF model. If omitted, a known local detector is selected.")
+    parser.add_argument("--labels", default=os.environ.get("SCOUT_LABELS_PATH") or None, help="Path to labels file, one label per line.")
     parser.add_argument("--camera-index", type=int, default=vision_config.camera_index)
     parser.add_argument("--host", default=vision_config.host)
     parser.add_argument("--port", type=int, default=vision_config.port)
@@ -159,6 +151,134 @@ def resolve_pose_estimator(args: argparse.Namespace) -> PoseEstimator | None:
     return _resolve_pose_estimator(args, vision_config, PoseEstimator)
 
 
+class _ScopedRobot:
+    """Wraps RobotClient so robot.pantilt() is a no-op (pantilt-service
+    owns servo control now via /meta polling) and robot.move() is a no-op
+    when the local node profile does not include rover_node. Enforces the
+    rule that robot.* only ever affects the local node's own hardware.
+
+    On scout (has pantilt_node + rover_node), only pantilt calls are
+    no-op'd here — the rover wheel calls still go through pending a
+    future rover-service. On kiosk (has neither), both are no-op'd."""
+    def __init__(self, real, modules):
+        self._real = real
+        self._has_rover = "rover_node" in modules
+
+    def pantilt(self, payload):
+        # Always no-op: pantilt-service polls /meta and dispatches commands.
+        return True
+
+    def move(self, x, z):
+        # Always no-op: rover-service owns wheel commands now (polls /meta).
+        return True
+
+    def camera_light(self, brightness):
+        # Camera-light hardware sits on the same UART as the rover servos.
+        if self._has_rover:
+            return self._real.camera_light(brightness)
+        return True
+
+
+def _open_camera(camera_index, width, height):
+    """Open the camera. Prefer picamera2/libcamera so Pi 5 CSI sensors
+    (IMX708, IMX219, etc.) are debayered by the pispbe ISP into a proper
+    RGB image. cv2.VideoCapture on Pi 5 /dev/video0 returns raw Bayer/CSI2
+    data which displays as static. For environments without libcamera
+    (typical USB UVC nodes like scout), fall back to cv2.VideoCapture.
+
+    Override with env var LUHKAS_CAPTURE_BACKEND=picamera2 or cv2;
+    default auto tries picamera2 first."""
+    backend = os.environ.get("LUHKAS_CAPTURE_BACKEND", "auto").lower()
+    if backend in ("auto", "picamera2"):
+        try:
+            from picamera2 import Picamera2
+            infos = Picamera2.global_camera_info()
+            if infos and camera_index < len(infos):
+                model = infos[camera_index].get("Model", "unknown")
+                log.info("Opening camera via picamera2: idx=%s model=%s", camera_index, model)
+                picam = Picamera2(camera_num=camera_index)
+                # ---- CAMERA ROTATION / FLIP -----------------------------
+                # Frames are returned in raw sensor orientation. IMX708
+                # Camera Module 3 reports Rotation: 180 (its sensor reads
+                # out 180 vs the PCB "natural" orientation because the
+                # ribbon exits the top of the board). If the displayed
+                # feed looks upside-down, pick ONE of:
+                #
+                #   (a) Zero-CPU, applied at capture time:
+                #         from libcamera import Transform
+                #         cfg = picam.create_video_configuration(
+                #             main={...},
+                #             buffer_count=2,
+                #             transform=Transform(vflip=1, hflip=1),  # 180
+                #         )
+                #     For 90/270 set rotation=90 or rotation=270 instead
+                #     of vflip/hflip (libcamera supports both).
+                #
+                #   (b) Per-frame, in _Picamera2Capture.retrieve():
+                #         frame = cv2.rotate(frame, cv2.ROTATE_180)
+                #     Costs a memcpy per frame; useful if you need to
+                #     toggle rotation at runtime.
+                #
+                # Currently no rotation is applied (intentional — see
+                # CLAUDE.md / luhkas_gotchas memory for context).
+                # ---------------------------------------------------------
+                cfg = picam.create_video_configuration(
+                    main={"size": (width, height), "format": "BGR888"},
+                    buffer_count=2,
+                )
+                picam.configure(cfg)
+                picam.start()
+                return _Picamera2Capture(picam)
+            log.info("picamera2 found no camera at index %s; falling back", camera_index)
+            if backend == "picamera2":
+                raise RuntimeError(f"picamera2 has no camera at index {camera_index}")
+        except ImportError:
+            log.info("picamera2 not installed; falling back to cv2.VideoCapture")
+            if backend == "picamera2":
+                raise
+        except Exception as exc:
+            log.warning("picamera2 capture init failed (%s); falling back to cv2", exc)
+            if backend == "picamera2":
+                raise
+    log.info("Opening camera via cv2.VideoCapture(%s, CAP_V4L2)", camera_index)
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    except Exception:
+        pass
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {camera_index}")
+    return cap
+
+
+class _Picamera2Capture:
+    """Minimal cv2.VideoCapture-compatible shim around picamera2 so the
+    rest of run_vision doesn't need to know which backend it got."""
+    def __init__(self, picam):
+        self._picam = picam
+    def grab(self):
+        # picamera2 internally maintains a ring buffer; capture_array
+        # always returns the latest frame, so grab() is a no-op.
+        return True
+    def retrieve(self):
+        try:
+            frame = self._picam.capture_array("main")
+            return (frame is not None), frame
+        except Exception:
+            return False, None
+    def isOpened(self):
+        return True
+    def release(self):
+        try:
+            self._picam.stop()
+            self._picam.close()
+        except Exception:
+            pass
+
+
 def run_vision(args: argparse.Namespace) -> None:
     labels_path = args.labels or default_labels_path(args.hailo_apps_dir)
     labels = load_labels(labels_path)
@@ -167,6 +287,17 @@ def run_vision(args: argparse.Namespace) -> None:
     search_controller = SearchController(search_config)
     behavior = BehaviorStateMachine(BehaviorConfig())
     robot = RobotClient(args.robot_api_url)
+    # Scope robot calls to local hardware: pantilt is always no-op'd here
+    # (the pantilt-service owns servo control; it polls /meta), and move/
+    # camera_light are no-op'd when rover_node is not in the profile.
+    try:
+        from profile_loader import load_profile
+        _profile = load_profile(os.environ.get("LUHKAS_NODE_ID") or "scout")
+        _modules = set(_profile.get("modules", []))
+    except Exception as _exc:
+        log.warning("_ScopedRobot: could not load profile (%s); defaulting to full hardware", _exc)
+        _modules = {"pantilt_node", "rover_node"}
+    robot = _ScopedRobot(robot, _modules)
     cfg_telemetry = TelemetryConfig()
     if cfg_telemetry.enabled:
         threading.Thread(
@@ -215,17 +346,11 @@ def run_vision(args: argparse.Namespace) -> None:
     pose_queue: queue.Queue = queue.Queue(maxsize=1)
     latest_poses = []
 
-    cap = cv2.VideoCapture(args.camera_index, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, vision_config.camera_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, vision_config.camera_height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    except Exception:
-        pass
-
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {args.camera_index}")
+    cap = _open_camera(
+        args.camera_index,
+        vision_config.camera_width,
+        vision_config.camera_height,
+    )
 
     robot.pantilt(controller.center_command())
     output_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -398,6 +523,42 @@ def run_vision(args: argparse.Namespace) -> None:
                 if behavior.time_in_state() < 0.1:
                     robot.pantilt(controller.center_command())
 
+            # ---- tracking_state: public contract for pantilt-service ----
+            # Carries everything a downstream pantilt service (or any other
+            # consumer) needs to compute servo commands without reaching
+            # into vision_service internals. Exposed via /meta below; the
+            # in-process pantilt call sites above remain for nodes that
+            # don't yet poll /meta.
+            tracking_state = {
+                "frame_id": frame_id,
+                "frame_shape": [int(input_h), int(input_w), 3],
+                "behavior_state": getattr(bstate, "name", str(bstate)),
+                "tracking_enabled": bool(controller.config.enabled),
+                "guard_enabled": bool(guard_mode_enabled),
+                "collision_blocked": bool(obstacle_detected),
+                "search_enabled": bool(search_controller.config.enabled) if search_controller is not None else False,
+                "target": None,
+            }
+            if target is not None:
+                _tx, _ty, _tw, _th = target.bbox
+                _aim = target.aim_point  # property: aim_x/aim_y or center fallback
+                tracking_state["target"] = {
+                    "id": int(target.id),
+                    "label": target.label,
+                    "class_id": int(getattr(target, "class_id", 0)),
+                    "identity": getattr(target, "identity", None),
+                    "bbox": [int(_tx), int(_ty), int(_tw), int(_th)],
+                    "center": [int(_tx + _tw / 2), int(_ty + _th / 2)],
+                    "confidence": float(target.confidence),
+                    "velocity": [float(getattr(target, "vx", 0.0)), float(getattr(target, "vy", 0.0))],
+                    "predicted": bool(getattr(target, "predicted", False)),
+                    "aim": {
+                        "x": float(_aim[0]),
+                        "y": float(_aim[1]),
+                        "source": getattr(target, "aim_source", "bbox"),
+                    },
+                }
+
             display_detections = tracked
             if target is not None and target.predicted and all(det.id != target.id for det in tracked):
                 display_detections = [*tracked, target]
@@ -422,6 +583,7 @@ def run_vision(args: argparse.Namespace) -> None:
                 latest_meta = {
                     "ok": True,
                     "frame_id": frame_id,
+                    "tracking_state": tracking_state,
                     "hef_path": hef_path,
                     "pose_hef_path": pose_estimator.hef_path if pose_estimator else None,
                     "labels_path": labels_path,
@@ -634,7 +796,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/ui"):
-            self._serve_ui()
+            # The UI moved off the vision service (commit 0a5bbe2) and now
+            # lives on the luhkas_node web service (default port 5005, via
+            # extra_units: ["luhkas"]). Redirect so old bookmarks still
+            # land on the right page without surprising users with a 404.
+            self._redirect_to_ui()
         elif parsed.path == "/health":
             self._json({"ok": True, "meta": latest_meta})
         elif parsed.path == "/capabilities":
@@ -675,8 +841,6 @@ class Handler(BaseHTTPRequestHandler):
             self._set_tracking(parsed)
         elif parsed.path == "/guard":
             self._set_guard()
-        elif parsed.path == "/chat":
-            self._chat()
         elif parsed.path == "/clip":
             self._clip()
         elif parsed.path == "/snapshot":
@@ -687,16 +851,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log.debug(fmt, *args)
 
-    def _serve_ui(self) -> None:
-        # This is Scout's vision service, so the label is "scout" unless
-        # overridden via LUHKAS_NODE_ID (which ui_html honors as the
-        # env-level fallback). Other node services pass their own.
-        data = _ui_html(node_label="scout").encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
+    def _redirect_to_ui(self) -> None:
+        # Build the new URL from the inbound Host header so we keep whatever
+        # name the user actually typed (luhkas-scout, luhkas-scout.local, an
+        # IP, etc). Falls back to localhost if Host is absent.
+        ui_port = os.environ.get("LUHKAS_WEB_PORT", "5005")
+        host_header = self.headers.get("Host", "127.0.0.1")
+        hostname = host_header.split(":", 1)[0]
+        target = f"http://{hostname}:{ui_port}/ui"
+        self.send_response(301)
+        self.send_header("Location", target)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        body = f"UI moved to {target}\n".encode("utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def _capabilities(self) -> None:
         local = (
@@ -904,77 +1073,6 @@ class Handler(BaseHTTPRequestHandler):
                 guard_alert_last_sent = {}
         self._json({"ok": True, "guard_enabled": guard_mode_enabled})
 
-    def _chat(self) -> None:
-        body = self._read_json()
-        if body is None:
-            return
-        message = str(body.get("message", "")).strip()
-        if not message:
-            self.send_error(400, "message required")
-            return
-        _chat_log_add("user", message, source="chat_input")
-        if _is_wakeword_only(message):
-            response = _wakeword_response()
-            _chat_log_add("assistant", response["message"], source="wakeword")
-            self._json({"ok": True, "response": response})
-            return
-        identity_response = face_runtime.learn_identity_from_active_prompt(
-            message,
-            _latest_frame_detections,
-            lambda: active_face_recognizer,
-            recognition_lock,
-        )
-        if identity_response is not None:
-            status = 200 if identity_response.get("ok") else 409
-            response = identity_response.get("response") or {}
-            text = response.get("message") or identity_response.get("error") or json.dumps(identity_response)
-            _chat_log_add(
-                "assistant" if identity_response.get("ok") else "error",
-                text,
-                source="identity_response",
-                face_id=response.get("face_id"),
-                skipped=response.get("skipped"),
-                waiting_for_identity=response.get("waiting_for_identity"),
-            )
-            self._json(identity_response, status=status)
-            return
-        if _local_command_handle is not None:
-            local_response = None
-            try:
-                local_response = _local_command_handle(message)
-            except Exception as exc:
-                log.warning("local chat command failed: %s", exc)
-                local_response = {"ok": False, "message": "I could not run that local scout command.", "error": str(exc)}
-            if local_response is not None:
-                _chat_log_add(
-                    "assistant",
-                    local_response.get("tts") or local_response.get("message") or json.dumps(local_response),
-                    source="local_command",
-                )
-                self._json({"ok": True, "response": local_response})
-                return
-        try:
-            import requests as _requests
-            vault_payload = build_presence_payload(message, _chat_log_snapshot(), "scout")
-            resp = _requests.post(
-                f"{_VAULT_CHAT_URL}/presence/message",
-                json=vault_payload,
-                timeout=30,
-            )
-            payload = resp.json()
-            response = payload.get("response") if isinstance(payload, dict) else None
-            if response is None:
-                response = payload
-            _chat_log_add(
-                "assistant",
-                response.get("tts") or response.get("message") or json.dumps(response),
-                source="vault_chat",
-            )
-            self._json({"ok": True, "response": response})
-        except Exception as exc:
-            _chat_log_add("error", str(exc), source="vault_chat")
-            self._json({"ok": False, "error": str(exc)}, status=503)
-
     def _set_settings(self) -> None:
         body = self._read_json()
         if body is None:
@@ -1008,11 +1106,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, payload, status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            log.debug("client disconnected while writing JSON response")
 
 
 def main() -> None:

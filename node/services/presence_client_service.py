@@ -290,21 +290,38 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
         self._send(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/presence/message":
-            self._send(404, {"ok": False, "error": "not_found"})
+        path = self.path.rstrip("/")
+        if path == "/presence/message":
+            payload = self._read_json()
+            message = str(payload.get("message") or "").strip()
+            if not message:
+                self._send(400, {"ok": False, "error": "missing_message"})
+                return
+            if _is_wakeword_only(message):
+                self._send(200, {"ok": True, "response": _wakeword_response()})
+                return
+            payload["message"] = message
+            payload.setdefault("source", self.config["source"])
+            payload.setdefault("node_id", self.config.get("node_id") or self.config["source"])
+            self._send_upstream("POST", "/presence/message", payload=payload)
             return
-        payload = self._read_json()
-        message = str(payload.get("message") or "").strip()
-        if not message:
-            self._send(400, {"ok": False, "error": "missing_message"})
+        if path == "/presence/message/stream":
+            payload = self._read_json()
+            message = str(payload.get("message") or "").strip()
+            if not message:
+                self._send(400, {"ok": False, "error": "missing_message"})
+                return
+            if _is_wakeword_only(message):
+                # Wakeword-only: synthesize a single-event stream locally so
+                # callers can use the same wire format regardless of route.
+                self._emit_synthetic_stream(_wakeword_response())
+                return
+            payload["message"] = message
+            payload.setdefault("source", self.config["source"])
+            payload.setdefault("node_id", self.config.get("node_id") or self.config["source"])
+            self._stream_upstream("/presence/message/stream", payload=payload)
             return
-        if _is_wakeword_only(message):
-            self._send(200, {"ok": True, "response": _wakeword_response()})
-            return
-        payload["message"] = message
-        payload.setdefault("source", self.config["source"])
-        payload.setdefault("node_id", self.config.get("node_id") or self.config["source"])
-        self._send_upstream("POST", "/presence/message", payload=payload)
+        self._send(404, {"ok": False, "error": "not_found"})
 
     def log_message(self, fmt, *args):
         print("[scout_presence] " + fmt % args, flush=True)
@@ -323,6 +340,68 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
             self._send(502, {"ok": False, "error": "brain_unreachable", "brain_url": self.config["brain_url"]})
             return
         self._send(200, result)
+
+    def _stream_upstream(self, path: str, payload: dict) -> None:
+        """Proxy an NDJSON stream from the vault to our client, line-by-line."""
+        url = self.config["brain_url"] + path
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+            method="POST",
+        )
+        try:
+            upstream = urlopen(request, timeout=120)
+        except (OSError, URLError, TimeoutError) as exc:
+            self._send(502, {"ok": False, "error": str(exc), "brain_url": self.config["brain_url"]})
+            return
+        self.send_response(200)
+        self.send_header("content-type", "application/x-ndjson")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for raw_line in upstream:
+                if not raw_line:
+                    continue
+                try:
+                    self.wfile.write(raw_line if raw_line.endswith(b"\n") else raw_line + b"\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _emit_synthetic_stream(self, response_payload: dict) -> None:
+        """Emit a single-event NDJSON stream for locally-handled wakeword replies."""
+        text = ""
+        if isinstance(response_payload, dict):
+            text = str(
+                response_payload.get("tts")
+                or response_payload.get("message")
+                or response_payload.get("response")
+                or ""
+            )
+        self.send_response(200)
+        self.send_header("content-type", "application/x-ndjson")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for event in (
+                {"type": "start"},
+                {"type": "delta", "text": text},
+                {"type": "done", "text": text},
+            ):
+                self.wfile.write((json.dumps(event) + "\n").encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _read_json(self):
         length = int(self.headers.get("content-length") or "0")

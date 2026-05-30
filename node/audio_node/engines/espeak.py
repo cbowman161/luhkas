@@ -7,8 +7,10 @@ Piper voices are installed.
 from __future__ import annotations
 
 import os
+import signal
 import shutil
 import subprocess
+import threading
 
 from .base import TTSEngine
 
@@ -33,6 +35,9 @@ class EspeakEngine(TTSEngine):
         self.binary = binary or os.environ.get("AUDIO_TTS_BIN", "espeak-ng")
         self.device = device or os.environ.get("AUDIO_OUTPUT_DEVICE", "default")
         self.aplay = os.environ.get("AUDIO_APLAY_BIN", "aplay")
+        self._proc_lock = threading.Lock()
+        self._synth: subprocess.Popen | None = None
+        self._play: subprocess.Popen | None = None
         self.available = bool(shutil.which(self.binary)) and bool(shutil.which(self.aplay))
 
     def speak(self, text: str) -> None:
@@ -43,15 +48,55 @@ class EspeakEngine(TTSEngine):
             [self.binary, "--stdout", "-v", self.voice, "-s", str(self.rate_wpm), text],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
+        play = None
+        with self._proc_lock:
+            self._synth = synth
         try:
-            subprocess.run(
+            play = subprocess.Popen(
                 [self.aplay, "-q", "-D", self.device],
                 stdin=synth.stdout,
-                check=False,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
+            with self._proc_lock:
+                self._play = play
+            play.wait()
         finally:
             if synth.stdout is not None:
                 synth.stdout.close()
-            synth.wait(timeout=5)
+            try:
+                synth.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                synth.kill()
+            with self._proc_lock:
+                if self._synth is synth:
+                    self._synth = None
+                if self._play is play:
+                    self._play = None
+
+    def interrupt(self) -> None:
+        with self._proc_lock:
+            procs = [self._play, self._synth]
+        for proc in procs:
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+        for proc in procs:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
