@@ -137,6 +137,51 @@ def _is_denial(text: str) -> bool:
     return _command_text(text) in {"no", "nope", "nah", "wrong", "not right", "negative"}
 
 
+# Pending types that strictly expect a yes/no/correct response. Used by
+# Phase 1C's topic-switch detector — if the user's next message after one
+# of these isn't affirmative/denial/correction, they've moved on and the
+# pending session should be parked (not extended).
+_BINARY_CONFIRM_PENDING_TYPES = frozenset({
+    "learned_capability_confirmation",
+    "learned_install_confirmation",
+    "audit_merge_confirmation",
+    "memory_update_confirmation",
+    "vision_full_analysis_confirmation",
+})
+
+
+def _looks_like_pending_response(message: str, awaiting: dict | None) -> bool:
+    """Phase 1C heuristic: does ``message`` look like the user answering
+    the question in ``awaiting``, vs. switching to a new topic?
+
+    True  -> extend the active chat_session (user is responding)
+    False -> park the active chat_session and start a new one
+
+    For non-binary-confirm awaiting types (e.g. code_monkey_requirements
+    which accepts freeform answers) we default True — anything could be
+    a response, and mis-parking is worse than mis-extending.
+    """
+    if not awaiting:
+        return True
+    msg = str(message or "").strip()
+    if not msg:
+        return True
+    atype = awaiting.get("type")
+    if atype in _BINARY_CONFIRM_PENDING_TYPES:
+        if _is_affirmative(msg) or _is_denial(msg):
+            return True
+        if _extract_correction(msg):
+            return True
+        # "no, I meant X" forms not caught by the simple extractor — be
+        # generous: a message starting with "no" or "not" is probably
+        # still a correction even if loosely phrased.
+        first_word = msg.split(None, 1)[0].lower().rstrip(",.")
+        if first_word in {"no", "not", "nope", "nah", "actually"}:
+            return True
+        return False
+    return True
+
+
 def _extract_correction(text: str) -> str | None:
     """Deprecated fast-path heuristic — only catches the most unambiguous
     leading-"no"/"nope"/"nah" forms. Anything subtler is now decided by the
@@ -431,21 +476,36 @@ class VaultRuntime:
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
-        # Phase 1A: decide whether this message extends the active
-        # session (the user is answering a pending question) or starts a
-        # new one. Observational only — does not affect dispatch.
+        # Phase 1A/1C: chat-session bookkeeping. Decide whether this
+        # message extends the active session, parks it (topic switch),
+        # or starts a fresh one.
         try:
             active = self.chat_sessions.get_active(node_id)
+            identity = self.scout.active_identity if hasattr(self.scout, "active_identity") else None
             if active is not None and active.state == "awaiting":
-                # User is responding to an outstanding prompt — extend
-                # the active session by NOT opening a new one. The
-                # response will be attached as another turn via
-                # add_turn() at the end.
-                pass
+                if _looks_like_pending_response(message, active.awaiting):
+                    # User is answering the pending question — extend
+                    # the active session. The response will be attached
+                    # as another turn via add_turn() at the end.
+                    pass
+                else:
+                    # Phase 1C: topic switch. Park the awaiting session
+                    # so it's resumable later ("back to that"), and
+                    # clear the pending dict so the existing
+                    # confirmation handlers don't mis-fire on this
+                    # unrelated message. The parked session keeps its
+                    # awaiting payload, which Phase 1D will use to
+                    # restore both session AND pending on resume.
+                    self.chat_sessions.park(node_id)
+                    self._clear_pending()
+                    self.chat_sessions.open_session(
+                        node_id=node_id,
+                        identity=identity,
+                        original_message=message,
+                    )
             else:
-                # Either no active session, or the previous one is no
-                # longer waiting — close/park it and start fresh.
-                identity = self.scout.active_identity if hasattr(self.scout, "active_identity") else None
+                # No active session, or previous wasn't awaiting — open
+                # a new one. (open_session closes/parks any existing.)
                 self.chat_sessions.open_session(
                     node_id=node_id,
                     identity=identity,
