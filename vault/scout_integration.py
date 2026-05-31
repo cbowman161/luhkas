@@ -202,10 +202,63 @@ def _extract_context_fact(text: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-# Vision routing is gated on the LLM router's own confidence — see the dispatcher.
-# Calls below this threshold get downgraded out of analyze_vision so unfamiliar
-# phrasings don't fall through to "describe what's in the camera view".
-VISION_ROUTE_CONFIDENCE_FLOOR = 0.85
+# Vision routing is keyword-gated, NOT just router-confidence gated. The
+# router occasionally picks analyze_vision for prompts like "describe a
+# sunset" or "compose a haiku about rain on the lake" because they
+# contain scene-like words; the keyword check requires the message to be
+# *about* the live camera scene before vision actually fires. If the LLM
+# later decides scene analysis would help, it can ask the user explicitly
+# (see _llm_asks_for_vision) — that path also bypasses the keyword gate.
+_VISION_TRIGGER_PHRASES = (
+    # Direct sight questions
+    "do you see", "can you see", "are you seeing",
+    "what do you see", "what can you see",
+    "tell me what you see",
+    # Scene/room/area description (live)
+    "describe the scene", "describe the room", "describe the area",
+    "describe what you see", "describe what's there", "describe what is there",
+    "describe what's visible", "what's visible", "what is visible",
+    # Spatial "what/who is here/there/in front/around/behind"
+    "what's in front of you", "what is in front of you", "in front of you",
+    "what's around you", "what is around you", "around you",
+    "what's behind you", "what is behind you", "behind you",
+    "what's there", "what is there",
+    "who is here", "who's here", "who is there", "who's there",
+    "is anyone here", "is anyone there",
+    # Direct camera/view references
+    "the camera", "your camera", "from your camera", "through your camera",
+    "the picture", "the image",
+    "current view", "current scene", "live view", "the scene",
+    "in your view", "in your field of view",
+    "look at", "looking at",
+    "in the room", "in this room", "in the area",
+)
+
+
+def _has_vision_trigger(message: str) -> bool:
+    """True iff message contains an explicit live-camera phrasing."""
+    low = (message or "").casefold()
+    return any(phrase in low for phrase in _VISION_TRIGGER_PHRASES)
+
+
+# Phrases the LLM uses when it wants to ask the user for permission to
+# run a full vision analysis. If we detect one in a response, we stash
+# the same marker the deterministic vision short-circuit uses, so the
+# user's next "yes" routes back through the analyze_vision branch with
+# force_full_vision=True.
+_LLM_VISION_REQUEST_PHRASES = (
+    "would you like me to analyze the scene",
+    "would you like me to look at the scene",
+    "would you like me to look at what",
+    "should i analyze the scene",
+    "should i look at the scene",
+    "should i look at what's",
+)
+
+
+def _llm_asks_for_vision(text: str) -> bool:
+    low = (text or "").casefold()
+    return any(p in low for p in _LLM_VISION_REQUEST_PHRASES)
 
 
 def _detection_summary(state: dict | None) -> str | None:
@@ -1667,6 +1720,20 @@ class ScoutVaultBridge:
                 "routing_error", message, state, {"route": route}, max_tokens=100
             )
 
+        # force_full_vision override: vault_runtime sets this flag in
+        # presence_context after the user confirms an LLM-initiated scene-
+        # analysis request. At that point the message is the ORIGINAL one
+        # the user asked (e.g., "what color is my mug"), which the router
+        # likely won't classify as analyze_vision. Override the route
+        # regardless so analyze_vision actually fires.
+        if (
+            isinstance(presence_context, dict)
+            and presence_context.get("force_full_vision")
+            and route.get("route") != "analyze_vision"
+        ):
+            route["route"] = "analyze_vision"
+            route.setdefault("forced_by", "force_full_vision_after_confirmation")
+
         # Reset per-turn transient sources so provenance for this turn doesn't
         # carry recall results from a prior turn that bypassed answer_with_context.
         self._current_memory_sources = {"recalled_facts": [], "recent_chat_turns": 0, "identity_scope": (self.active_identity or "unknown")}
@@ -1828,20 +1895,23 @@ class ScoutVaultBridge:
                     return action_result.get("message") or action_result.get("error") or "Done."
 
         if route["route"] == "analyze_vision":
-            # Gate analyze_vision on the router LLM's own confidence — we
-            # already have that signal, no need to hardcode phrases.  The
-            # router prompt rates explicit vision questions at 0.9+ and
-            # falls into the 0.5-0.7 band when it's guessing on unfamiliar
-            # phrasings (which is when it used to spuriously produce
-            # "describe the chairs and clock" answers).
-            route_confidence = float(route.get("confidence") or 0.0)
-            if route_confidence < VISION_ROUTE_CONFIDENCE_FLOOR:
+            # Keyword gate: vision only fires when the message is
+            # explicitly about the live camera scene (see
+            # _VISION_TRIGGER_PHRASES). The router LLM occasionally
+            # picks analyze_vision for prompts like "describe a sunset"
+            # or "compose a haiku about rain" because they contain
+            # scene-like words; the keyword check filters those out.
+            # force_full_vision (set by vault_runtime after the user
+            # confirms an LLM-initiated scene-analysis request) bypasses
+            # the gate so the confirmation flow still routes to vision
+            # even when the original message lacks trigger keywords.
+            force_full = False
+            if isinstance(presence_context, dict):
+                force_full = bool(presence_context.get("force_full_vision"))
+            if not force_full and not _has_vision_trigger(message):
                 route["route"] = "general_question"
                 route.setdefault("downgraded_from", "analyze_vision")
-                route["downgrade_reason"] = (
-                    f"router confidence {route_confidence:.2f} "
-                    f"< floor {VISION_ROUTE_CONFIDENCE_FLOOR}"
-                )
+                route["downgrade_reason"] = "no vision-trigger keyword in message"
             else:
                 # Short-circuit: if the camera node has identifiable
                 # detections, answer from those first and ask whether the
@@ -1849,9 +1919,6 @@ class ScoutVaultBridge:
                 # through to analyze_scene when the caller explicitly
                 # forced it (via presence_context.force_full_vision, set
                 # by vault_runtime when the user has just confirmed).
-                force_full = False
-                if isinstance(presence_context, dict):
-                    force_full = bool(presence_context.get("force_full_vision"))
                 summary = _detection_summary(state)
                 if summary and not force_full:
                     actions.append({"name": "analyze_vision", "ok": True, "result": {"short_circuit": True, "summary": summary}})
@@ -1905,7 +1972,20 @@ class ScoutVaultBridge:
                 max_tokens=120,
             )
 
-        return self.answer_with_context(message, state, presence_context=presence_context)
+        response = self.answer_with_context(message, state, presence_context=presence_context)
+        # If the LLM ended up asking the user for permission to look at
+        # the scene, stash the same marker the deterministic vision
+        # short-circuit uses. vault_runtime will turn it into a
+        # vision_full_analysis_confirmation pending state, and the
+        # user's next "yes" will arrive with force_full_vision=True —
+        # which the override above redirects straight to analyze_vision.
+        if response and _llm_asks_for_vision(response):
+            self._stash_vision_short_circuit_marker = {
+                "needs_vision_confirmation": True,
+                "original_message": message,
+                "vision_summary": "",
+            }
+        return response
 
     def _handle_confirmation(
         self,
@@ -4461,6 +4541,7 @@ Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
+If answering ACCURATELY would require seeing the live camera scene (e.g. questions about colors of nearby objects, who is in the room right now, what is on a specific surface in front of you), reply with EXACTLY the phrase "Would you like me to analyze the scene?" — do NOT guess from generic knowledge or invent details. This is the ONLY way to invoke scene analysis on the user's behalf; the next "yes" will run the full vision pipeline against the live camera.
 """
         try:
             # Bypass response_composer: its outer "Write the final user-facing
