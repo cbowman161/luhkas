@@ -816,6 +816,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def _handle_tts(self, body: dict) -> None:
+        """Route arbitrary text through the same TTS dispatch path the
+        streaming consumer uses.
+
+        Always uses ``_start_tts`` — never inline ``_speak`` — so HTTP-
+        sourced and stream-sourced speech share the same _tts_lock queue,
+        generation counter, and state-update timeline. Returns as soon as
+        the dispatch is queued (fire-and-forget). Callers that want
+        "wait until playback finishes" can pass ``{"wait": true}``.
+        """
         text = str(body.get("text") or "").strip()
         if not text:
             self.send_error(400, "missing text")
@@ -832,12 +841,22 @@ class Handler(BaseHTTPRequestHandler):
                     "source": str(body.get("source") or "audio_node_tts"),
                 },
             )
+        wait = bool(body.get("wait"))
         try:
-            _speak(self.tts, text)
+            _start_tts(self.tts, text)
         except Exception as exc:
             self._json({"ok": False, "error": str(exc)}, status=500)
             return
-        self._json({"ok": True, "engine": self.tts.name})
+        if wait:
+            # Block until the queued chunk has actually finished playing.
+            # _tts_threads is a deque; the most recently appended is ours.
+            try:
+                last = _tts_threads[-1]
+            except IndexError:
+                last = None
+            if last is not None and last.is_alive():
+                last.join(timeout=60)
+        self._json({"ok": True, "engine": self.tts.name, "queued": True, "waited": wait})
 
     def _handle_listen(self, body: dict) -> None:
         muted = bool(body.get("muted"))
