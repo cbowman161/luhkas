@@ -4446,11 +4446,19 @@ English:
             world_hits = []
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
-        # Only inject recent_chat as a fallback when memory has nothing for
-        # this query. Otherwise it can leak rejected-conflict statements
-        # ("I work as an architect" then "no, keep teacher" -> LLM still
-        # sees the architect statement and tends to use it).
-        recent_chat = self._recent_chat_for_recall(limit=6) if not recalled_facts else []
+        # Layer 2: always include recent conversation turns as continuity
+        # context, not just as a fallback when memory is empty. Without
+        # this, multi-turn exchanges feel transactional ("what's my
+        # name?" → factual answer with zero awareness that we were just
+        # discussing CPU). With it, the LLM can ground "and the next
+        # one?" against the previous turn's topic. The
+        # rejected-conflict-leakage risk the old comment described
+        # (e.g., "I work as an architect" → "no, keep teacher" → model
+        # still sees architect) is mitigated by (1) the memory_update
+        # confirmation flow scrubbing the rejected fact and (2) limiting
+        # recent_chat to a small window so old conflicts age out.
+        chat_limit = 3 if recalled_facts else 5
+        recent_chat = self._recent_chat_for_recall(limit=chat_limit)
         # If we can't address by name, scrub primary_user out of
         # recent_chat too — once the model emits a bad "Your name is X"
         # reply, that text sits in recent_chat and reinforces itself on
@@ -4501,10 +4509,10 @@ English:
         if response_guidance:
             context["response_guidance"] = response_guidance
         if recent_chat:
-            # Cap to 4 turns when memory has facts — the recent_chat fallback
-            # is just for when memory is empty; 4 turns is enough to keep the
-            # last exchange in view.
-            context["recent_chat"] = recent_chat[-4:]
+            # Always include — conversation continuity is primary
+            # grounding, not a fallback. Window size already chosen
+            # above (small when facts exist, larger when not).
+            context["recent_chat"] = recent_chat
         if state.get("ok"):
             context["tracking_available"] = True
         if tracking_memory:
@@ -4530,7 +4538,7 @@ If the user is asking about YOURSELF (your mood, feelings, opinions, personality
 For recall about the SPEAKER (their name, possessions, preferences, plans — anything starting with "my" / "I"):
   1. remembered_user_facts is the AUTHORITATIVE source. Pick the SINGLE fact from that list that matches what was asked and use its value verbatim. Ignore the others.
   2. Questions phrased as "do you know my X", "do you remember my X", "do I have an X", "what's my X" all ask for the VALUE of X. If a fact about X exists in remembered_user_facts, answer with the value verbatim from the matching fact (e.g. if a fact reads "the user's favorite drink is coffee", answer "Your favorite drink is coffee."), not a yes/no.
-  3. If remembered_user_facts is empty AND recent_chat is provided, recent_chat is a fallback — only used when nothing was stored.
+  3. recent_chat is the conversation continuity context — it shows the last few exchanges so you can ground references like "and the next one", "that one", "go on". It is NOT a substitute for remembered_user_facts; when both exist, facts win for VALUES (names, preferences) and recent_chat wins for TOPIC ("we were just discussing X"). Don't mine recent_chat for stored facts — if it's not in remembered_user_facts, you don't know it.
   4. If none of remembered_user_facts actually matches what was asked (e.g. user asked for their name but only location/snack are stored), say plainly "I don't have that stored." Do NOT substitute an unrelated fact.
 For world-fact questions (NOT about the speaker — e.g. capitals, history, science, definitions, public people/places):
   - world_knowledge is your offline reference corpus (Wikipedia + ingested media transcripts).

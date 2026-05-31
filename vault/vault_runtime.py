@@ -137,6 +137,43 @@ def _is_denial(text: str) -> bool:
     return _command_text(text) in {"no", "nope", "nah", "wrong", "not right", "negative"}
 
 
+# Phase B: detect when the user expresses that the previous response
+# was wrong/off-target — used to flag the most recent session as
+# user-corrected so the learning aggregator can decay confidence on
+# whatever it thinks it just "learned". Anchored at message start so
+# tail occurrences like "not really, but tell me anyway" don't trigger.
+_CORRECTION_OF_PREVIOUS_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        no [,.!]? \s+ (?: that(?:'s|s|\s+is|\s+was)? \s+ (?: wrong | not | incorrect)
+                       | i \s+ meant
+                       | i \s+ asked
+                       | i \s+ said
+                       | not \s+ what )
+      | that(?:'s|s|\s+is|\s+was)? \s+ (?: not \s+ (?: right | what | it | correct)
+                                  | wrong
+                                  | incorrect )
+      | wrong (?: \s+ answer)?
+      | incorrect
+      | nope[,.! ]+ (?: that | i )
+      | not \s+ quite
+      | not \s+ what \s+ i
+      | you(?:'re|re|\s+are) \s+ wrong
+      | actually [,.]? \s+ (?: i \s+ meant | no | that(?:'s|s|\s+is|\s+was)?\s+not )
+    )
+    \b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_correction_of_previous(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_CORRECTION_OF_PREVIOUS_RE.search(str(text).strip()))
+
+
 def _extract_correction(text: str) -> str | None:
     """Deprecated fast-path heuristic — only catches the most unambiguous
     leading-"no"/"nope"/"nah" forms. Anything subtler is now decided by the
@@ -431,6 +468,17 @@ class VaultRuntime:
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
+        # Phase B: if the user is correcting the previous response
+        # ("no, that was wrong" / "incorrect" / "not what i asked"),
+        # flag the most recent session so the eventual learning
+        # aggregator can decay confidence on whatever it "learned".
+        # Done BEFORE session bookkeeping so we mark the OUTGOING
+        # session, not the new one we're about to open.
+        try:
+            if _is_correction_of_previous(message):
+                self.chat_sessions.flag_last_wrong(node_id, message)
+        except Exception:
+            pass
         # Phase 1A: decide whether this message extends the active
         # session (the user is answering a pending question) or starts a
         # new one. Observational only — does not affect dispatch.

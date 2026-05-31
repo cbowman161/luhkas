@@ -266,6 +266,44 @@ class ChatSessionManager:
             session.updated_at = time.time()
             self._persist(session)
 
+    def flag_last_wrong(self, node_id: str, correction_text: str) -> ChatSession | None:
+        """Mark the most recent active-or-closed session as having
+        produced a response the user just corrected. Writes a
+        "user_corrected" outcome (or merges into an existing outcome's
+        ``learned`` list) so the eventual learning aggregator can decay
+        confidence on whatever that session "learned" — the user
+        rejected its result.
+
+        Returns the flagged session, or None if there's nothing to flag.
+        """
+        if not self.enabled:
+            return None
+        state = self._node_state(node_id)
+        now = time.time()
+        with state["lock"]:
+            target = state["active"]
+            if target is None:
+                # Try the most recently closed session by reading the
+                # tail of the JSONL (the active sessions we hold in
+                # memory are gone after close — they're only on disk).
+                # Don't bother for Phase B MVP; if no active session
+                # exists, just no-op. The active-session path is the
+                # common case.
+                return None
+            existing = target.outcome or {"action": "open_ended", "result": {}, "learned": []}
+            corrections = existing.get("corrections") or []
+            corrections.append({"at": now, "text": str(correction_text or "").strip()[:300]})
+            existing["corrections"] = corrections
+            # If the outcome was a confirmation of something, demote it
+            # so the aggregator sees the contradiction (confirmed-then-
+            # corrected = low confidence).
+            if existing.get("action", "").endswith("_confirmed"):
+                existing["action"] = existing["action"].replace("_confirmed", "_confirmed_then_corrected")
+            target.outcome = existing
+            target.updated_at = now
+            self._persist(target)
+            return target
+
     def close(self, node_id: str, outcome: dict | None = None) -> ChatSession | None:
         if not self.enabled:
             return None
