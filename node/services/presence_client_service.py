@@ -326,13 +326,26 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("[scout_presence] " + fmt % args, flush=True)
 
+    def _auth_headers(self) -> dict:
+        """Authorization header for vault calls, if a shared secret is set.
+
+        The secret comes from VAULT_PRESENCE_SECRET (same env var read by
+        vault_service). When unset on either end, no header is sent and
+        vault doesn't require one — backward compatible with deployments
+        that haven't opted in to auth.
+        """
+        secret = str(self.config.get("presence_secret") or "").strip()
+        if secret:
+            return {"Authorization": f"Bearer {secret}"}
+        return {}
+
     def _send_upstream(self, method: str, path: str, payload: dict | None = None):
         url = self.config["brain_url"] + path
         try:
             if method == "GET":
                 result = self._get_json(url, timeout=8)
             else:
-                result = self._post_json(url, payload or {}, timeout=60)
+                result = self._post_json(url, payload or {}, timeout=60, extra_headers=self._auth_headers())
         except Exception as exc:
             self._send(502, {"ok": False, "error": str(exc), "brain_url": self.config["brain_url"]})
             return
@@ -344,10 +357,12 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
     def _stream_upstream(self, path: str, payload: dict) -> None:
         """Proxy an NDJSON stream from the vault to our client, line-by-line."""
         url = self.config["brain_url"] + path
+        headers = {"Content-Type": "application/json", "Accept": "application/x-ndjson"}
+        headers.update(self._auth_headers())
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -424,11 +439,14 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
             return json.loads(response.read().decode("utf-8"))
 
     @staticmethod
-    def _post_json(url: str, payload: dict, timeout: float):
+    def _post_json(url: str, payload: dict, timeout: float, extra_headers: dict | None = None):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -460,6 +478,10 @@ def main():
         "brain_url": args.brain_url.rstrip("/"),
         "source": args.source,
         "node_id": args.node_id,
+        # Shared-secret auth (matches VAULT_PRESENCE_SECRET on the vault).
+        # Optional: when unset on both ends, no auth header is sent and
+        # vault doesn't require one — backward compatible.
+        "presence_secret": os.environ.get("VAULT_PRESENCE_SECRET", "").strip(),
     }
     server = PresenceProxyServer((args.host, args.port), PresenceProxyHandler, config)
     print(f"[scout_presence] listening on http://{args.host}:{args.port}", flush=True)

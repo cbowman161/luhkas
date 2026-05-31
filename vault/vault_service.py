@@ -1,5 +1,7 @@
 import argparse
+import hmac
 import json
+import os
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -7,6 +9,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from streaming import StreamSink, reset_stream_sink, set_stream_sink
 from vault_runtime import VaultRuntime
+
+
+# Shared-secret auth for the presence endpoints. Opt-in: when
+# VAULT_PRESENCE_SECRET is unset, all endpoints work without auth (current
+# behaviour). When set, /presence/message and /presence/message/stream
+# require a matching ``Authorization: Bearer <secret>`` header. The
+# presence proxy forwards the header from its own env (set by the same
+# value at deploy time), so the audio_node never needs to know the
+# secret — only vault and the proxy do.
+_PRESENCE_SECRET = os.environ.get("VAULT_PRESENCE_SECRET", "").strip()
+_AUTH_PROTECTED_PATHS = {"/presence/message", "/presence/message/stream"}
 
 
 _PUSHABLE_EVENT_TYPES = {
@@ -393,6 +406,16 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urlparse(self.path).path.rstrip("/") or "/"
+
+            # Optional shared-secret auth on the presence endpoints. Off
+            # when VAULT_PRESENCE_SECRET is unset (no behavioural change
+            # for unauthed deployments / dev).
+            if _PRESENCE_SECRET and path in _AUTH_PROTECTED_PATHS:
+                auth = self.headers.get("Authorization", "") or ""
+                expected = f"Bearer {_PRESENCE_SECRET}"
+                if not hmac.compare_digest(auth, expected):
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
 
             if path == "/presence/message":
                 payload = self._read_json()
