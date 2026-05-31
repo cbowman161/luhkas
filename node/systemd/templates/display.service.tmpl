@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory={NODE_DIR}
 Environment=LUHKAS_NODE_ID={NODE_ID}
 Environment=AUDIO_SERVICE_URL=http://127.0.0.1:5004
+Environment=VAULT_CHAT_URL={VAULT_URL}
 {EXTRA_ENV}
 ExecStart={NODE_DIR}/scripts/start_display.sh
 Restart=always

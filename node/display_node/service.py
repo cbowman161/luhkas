@@ -45,7 +45,10 @@ _status: dict = {
     "muted": False,
 }
 _FACE_MESSAGE_TTL_SECONDS = float(os.environ.get("DISPLAY_FACE_MESSAGE_TTL_SECONDS", "45"))
-_VAULT_URL = os.environ.get("VAULT_SERVICE_URL", os.environ.get("VAULT_CHAT_URL", "http://luhkas-vault.local:7000")).rstrip("/")
+_VAULT_URL = os.environ.get(
+    "VAULT_SERVICE_URL",
+    os.environ.get("VAULT_CHAT_URL", "http://100.70.245.116:7000"),
+).rstrip("/")  # default = vault Tailscale IP (see sync_manager for why mDNS is avoided)
 _cpu_lock = threading.Lock()
 _cpu_last_sample: tuple[float, float] | None = None
 _cpu_last_percent: float | None = None
