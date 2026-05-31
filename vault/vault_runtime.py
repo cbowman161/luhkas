@@ -498,13 +498,27 @@ class VaultRuntime:
         if isinstance(pending, dict) and pending.get("type") == "vision_full_analysis_confirmation":
             if _is_affirmative(message):
                 force_full_vision = True
-                message_for_scout = pending.get("original_message") or message
-                self._clear_pending()
+                # Phase 1B: session is source of truth for original input.
+                message_for_scout = (
+                    self._session_original_message(node_id)
+                    or pending.get("original_message")
+                    or message
+                )
+                self._resolve_pending(node_id, outcome={
+                    "action": "vision_analysis_confirmed",
+                    "result": {"original_message": message_for_scout,
+                               "vision_summary": pending.get("summary")},
+                    "learned": [],
+                })
                 presence_context = dict(presence_context or {})
                 presence_context["force_full_vision"] = True
                 message = message_for_scout
             elif _is_denial(message):
-                self._clear_pending()
+                self._resolve_pending(node_id, outcome={
+                    "action": "vision_analysis_declined",
+                    "result": {"original_message": pending.get("original_message")},
+                    "learned": [],
+                })
                 return self._remember_active({
                     "mode": "direct",
                     "message": "OK, I won't run the full vision analysis.",
@@ -517,7 +531,12 @@ class VaultRuntime:
             else:
                 # Ambiguous → drop the pending and let the new message route
                 # normally; the short-circuit will re-arm if it's a vision ask.
-                self._clear_pending()
+                self._resolve_pending(node_id, outcome={
+                    "action": "vision_analysis_abandoned",
+                    "result": {"original_message": pending.get("original_message"),
+                               "user_said": message},
+                    "learned": [],
+                })
         # Clear any prior short-circuit marker on scout before calling.
         for attr in ("_stash_vision_short_circuit_marker", "_stash_memory_conflict_marker"):
             if hasattr(self.scout, attr):
@@ -984,13 +1003,43 @@ class VaultRuntime:
             self.blackboard.clear_pending_decision()
         else:
             self.blackboard.pending = None
-        # Mirror to the active session — clearing pending typically means
-        # the confirmation resolved. Phase 1B will pass a richer outcome
-        # dict; for 1A we just note that the awaiting prompt resolved.
+        # Just clear the awaiting prompt — does NOT close the session.
+        # Use _resolve_pending(node_id, outcome) when the confirmation
+        # actually resolved and the session should close with a record.
         try:
             nid = self._current_node_id
             if nid:
                 self.chat_sessions.set_awaiting(nid, None)
+        except Exception:
+            pass
+
+    # ---- Phase 1B: session as source of truth -------------------------
+
+    def _session_original_message(self, node_id: str | None) -> str | None:
+        """Return the active session's original_message (the user's first
+        input in this conversation thread). This is the durable source
+        of truth — pending dicts hold the same value but only for as
+        long as the 5-minute TTL.
+        """
+        if not node_id:
+            return None
+        try:
+            session = self.chat_sessions.get_active(node_id)
+            return session.original_message if session else None
+        except Exception:
+            return None
+
+    def _resolve_pending(self, node_id: str | None, outcome: dict | None = None) -> None:
+        """Clear pending dict AND close the active session with a
+        structured outcome. Confirmation handlers should call this
+        instead of ``_clear_pending`` when their resolution is final
+        (yes/no/correct accepted, action executed). The outcome becomes
+        the session's canonical record of what got learned.
+        """
+        self._clear_pending()
+        try:
+            if node_id:
+                self.chat_sessions.close(node_id, outcome=outcome)
         except Exception:
             pass
 
@@ -1258,15 +1307,25 @@ class VaultRuntime:
 
         store = getattr(self.scout, "memory_store", None)
         if store is None or not new_fact or not old_id:
-            self._clear_pending()
+            self._resolve_pending(node_id, outcome={
+                "action": "memory_update_unavailable",
+                "result": {"reason": "no_store_or_missing_fact"},
+                "learned": [],
+            })
             return None
 
         bridge = self.scout
         old_phrase = bridge._third_to_second_person(old_fact)
         new_phrase = bridge._third_to_second_person(new_fact)
+        original = self._session_original_message(node_id) or pending.get("original_message")
 
         if _is_denial(message):
-            self._clear_pending()
+            self._resolve_pending(node_id, outcome={
+                "action": "memory_update_declined",
+                "result": {"original_message": original, "kept": old_fact,
+                           "rejected": new_fact},
+                "learned": [],
+            })
             return self._remember_active({
                 "mode": "direct",
                 "message": f"OK, I'll keep it as {old_phrase}.",
@@ -1291,7 +1350,13 @@ class VaultRuntime:
             category="fact",
             source_message=conflict.get("source_message", ""),
         )
-        self._clear_pending()
+        self._resolve_pending(node_id, outcome={
+            "action": "memory_update_confirmed" if result.get("ok") else "memory_update_failed",
+            "result": {"original_message": original, "replaced": old_fact,
+                       "now": new_fact, "error": result.get("error")},
+            "learned": [{"kind": "fact_replacement", "old": old_fact, "new": new_fact}]
+                       if result.get("ok") else [],
+        })
         if not result.get("ok"):
             return self._remember_active({
                 "mode": "direct",
@@ -1516,14 +1581,38 @@ class VaultRuntime:
             return None
         engine = self._learned_engine()
         if _is_affirmative(message):
-            original = pending.get("original_message") or ""
+            # Phase 1B: prefer the session's original_message over the
+            # pending dict's. The session value survives the 5-minute
+            # pending TTL; the pending value can age out mid-confirmation
+            # if the user takes too long to reply.
+            original = (
+                self._session_original_message(node_id)
+                or pending.get("original_message")
+                or ""
+            )
             proposal = pending.get("proposal") or {}
             confirmed_by = str(message or "user_confirmation")
-            self._clear_pending()
-            # Learning is async: spawn the planner+smoke+save work in a
-            # background thread and ack the user immediately. When the
-            # background finishes it writes a notification to the event log
-            # so subsequent /ui calls report "new notifications received".
+            # _resolve_pending closes the session with a structured
+            # outcome — the canonical record of what got learned in
+            # this thread. The async learn happens after, but the
+            # session is closed now with the proposal info; Layer 3
+            # (learning aggregator) can correlate async completions
+            # back to this session via original_message later.
+            self._resolve_pending(node_id, outcome={
+                "action": "learned_capability_confirmed",
+                "result": {
+                    "original_message": original,
+                    "proposal": proposal,
+                    "confirmed_by": confirmed_by,
+                    "async": True,
+                },
+                "learned": [{"kind": "pending_capability", "phrase": original,
+                             "canonical": proposal.get("description")}],
+            })
+            # Spawn the planner+smoke+save work in a background thread
+            # and ack the user immediately. When the background finishes
+            # it writes a notification to the event log so subsequent
+            # /ui calls report "new notifications received".
             self._spawn_async_learn(
                 original_message=original,
                 proposal=proposal,
