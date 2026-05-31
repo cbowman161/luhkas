@@ -74,7 +74,15 @@ def push_node(profile: dict) -> dict:
     dest = f"{user}@{host}:{node_dir}/"
     rsync = subprocess.run(
         [
-            "rsync", "-a", "--delete", "--itemize-changes",
+            # -O / --omit-dir-times: don't propagate directory timestamps. The
+            # Hailo runtime writes hailort.log and rotates it inside node/,
+            # which bumps the dir's mtime on the kiosk. Without -O, rsync sees
+            # ".d..t...... ./" every cycle and counts it as files_changed,
+            # which then restarts every service every ~3 min, killing the
+            # display + browser + audio mid-use. File mtimes are still
+            # preserved (we only skip the dir mtime, which is meaningless for
+            # our deploy semantics).
+            "rsync", "-a", "-O", "--delete", "--itemize-changes",
             # Build artifacts and editor cruft (never canonical)
             "--exclude=__pycache__/",
             "--exclude=*.pyc",
