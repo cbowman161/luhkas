@@ -728,19 +728,18 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
         _t.Thread(target=self._update_person_count, args=(node_id,), daemon=True).start()
 
         streamed_text = "".join(accumulated_parts).strip()
-        # Deterministic / non-composer routes don't stream — emit their
-        # final text as a single delta so the node receives it through
-        # the same wire format.
+        # Deterministic / non-composer routes don't stream — put the full
+        # response text directly into done.text. The node treats a done
+        # event with no preceding deltas as "speak this whole thing now,
+        # in one TTS dispatch" — no word-count threshold, no last-word
+        # chunking. This is the lowest-latency path for canned answers.
         if not streamed_text and isinstance(response, dict):
-            final_text = str(
+            streamed_text = str(
                 response.get("tts")
                 or response.get("message")
                 or response.get("response")
                 or ""
             )
-            if final_text:
-                emit({"type": "delta", "text": final_text})
-                streamed_text = final_text
         emit({"type": "done", "text": streamed_text})
 
     def _send_html(self, status, html):

@@ -408,9 +408,11 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         try:
+            # Wakeword reply is fully canned; emit start + done (no delta)
+            # so the node speaks it as a single TTS dispatch via the
+            # "deterministic" path (see audio_node/service.py).
             for event in (
                 {"type": "start"},
-                {"type": "delta", "text": text},
                 {"type": "done", "text": text},
             ):
                 self.wfile.write((json.dumps(event) + "\n").encode("utf-8"))

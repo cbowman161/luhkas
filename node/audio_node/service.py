@@ -345,12 +345,21 @@ def _stream_presence_to_tts(
             elif etype == "done":
                 final_text = str(event.get("text") or "")
                 tail = speech_buffer.strip()
-                if tail:
-                    _start_tts(tts, tail)
+                # Two cases:
+                #   1. We streamed deltas (LLM path): flush whatever's left
+                #      in the buffer (the trailing partial sentence/word
+                #      that hadn't met the word-count threshold yet).
+                #   2. No deltas arrived (deterministic path: vault sent
+                #      start + done with the whole text in done.text):
+                #      speak final_text as one TTS dispatch — no word-
+                #      count gate, no chunking. Lowest latency path.
+                to_speak = tail if tail else (final_text if not spoken_anything else "")
+                if to_speak:
+                    _start_tts(tts, to_speak)
                     if not spoken_anything:
                         _notify_ui_event(
                             event_url,
-                            {"type": "assistant_message", "text": tail},
+                            {"type": "assistant_message", "text": to_speak},
                         )
                     spoken_anything = True
                     speech_buffer = ""
