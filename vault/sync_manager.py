@@ -10,7 +10,12 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PROFILES_DIR = _REPO_ROOT / "node" / "profiles"
 _NODE_DIR = _REPO_ROOT / "node"
-_DEFAULT_VAULT_URL = "http://luhkas-vault.local:7000"
+# Tailscale IP, not luhkas-vault.local mDNS. The mDNS name on this LAN
+# resolves to a stale 192.168.4.37 (a host that used to be vault) so the
+# nodes' presence proxies time out trying to reach the brain. The Tailscale
+# 100.x IP is stable for vault's lifetime in the tailnet. Same reasoning as
+# the sync.host switch in node/profiles/{kiosk,scout}.json.
+_DEFAULT_VAULT_URL = "http://100.70.245.116:7000"
 
 # Use the canonical profile loader so sync.host / user / node_dir / services
 # are filled in from node_id + modules when the profile doesn't spell them out.

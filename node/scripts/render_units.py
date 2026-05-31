@@ -46,7 +46,7 @@ from profile_loader import load_profile
 TEMPLATE_DIR = REPO_NODE_DIR / "systemd" / "templates"
 PROFILE_DIR = REPO_NODE_DIR / "profiles"
 DEFAULT_DEST = Path.home() / ".config" / "systemd" / "user"
-DEFAULT_VAULT_URL = "http://luhkas-vault.local:7000"
+DEFAULT_VAULT_URL = "http://100.70.245.116:7000"  # Tailscale IP — see sync_manager._DEFAULT_VAULT_URL for why
 
 
 def _service_spec(value) -> dict:
