@@ -285,6 +285,76 @@ class ChatSessionManager:
             state["active"] = None
             return session
 
+    def resume(self, node_id: str, session_id: str | None = None) -> ChatSession | None:
+        """Un-park a parked session, restoring it as active.
+
+        If ``session_id`` is None, picks the most-recently-updated parked
+        session. Any currently-active session is parked first so we
+        don't lose it. Returns the resumed session, or None if nothing
+        to resume.
+
+        The resumed session's state is restored from its `awaiting`
+        payload: "awaiting" if the original confirmation was still
+        open, else "open". The caller (vault_runtime) is responsible
+        for re-arming the pending dict from session.awaiting and
+        re-posing the question to the user.
+        """
+        if not self.enabled:
+            return None
+        state = self._node_state(node_id)
+        now = time.time()
+        with state["lock"]:
+            # Park any current active first (don't silently lose it).
+            prev = state["active"]
+            if prev is not None:
+                prev.state = "parked"
+                prev.updated_at = now
+                state["parked"].insert(0, prev)
+                state["parked"] = state["parked"][:PARKED_PER_NODE_MAX]
+                state["active"] = None
+                self._persist(prev)
+            # Pick the target.
+            target_idx = None
+            if session_id:
+                for i, s in enumerate(state["parked"]):
+                    if s.id == session_id:
+                        target_idx = i
+                        break
+            elif state["parked"]:
+                # Most recent first — parked list is kept sorted on
+                # insert. Pick index 0.
+                target_idx = 0
+            if target_idx is None:
+                return None
+            target = state["parked"].pop(target_idx)
+            target.state = "awaiting" if target.awaiting else "open"
+            target.updated_at = now
+            state["active"] = target
+            self._persist(target)
+            return target
+
+    def find_parked(self, node_id: str, keywords: list[str]) -> ChatSession | None:
+        """Best-fuzzy-match a parked session by keyword overlap with the
+        session's original_message or topic_summary. Returns the highest-
+        scoring match, or None if no parked session contains any of the
+        keywords. Phase 1D uses this when the resume request includes
+        a hint ("back to the network thing" -> look for 'network' in
+        parked sessions)."""
+        if not self.enabled or not keywords:
+            return None
+        kws = [k.casefold() for k in keywords if k]
+        state = self._node_state(node_id)
+        with state["lock"]:
+            best = None
+            best_score = 0
+            for s in state["parked"]:
+                hay = " ".join(filter(None, [s.original_message, s.topic_summary])).casefold()
+                score = sum(1 for k in kws if k in hay)
+                if score > best_score:
+                    best_score = score
+                    best = s
+            return best if best_score > 0 else None
+
     def park(self, node_id: str) -> ChatSession | None:
         if not self.enabled:
             return None

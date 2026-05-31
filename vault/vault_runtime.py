@@ -150,6 +150,59 @@ _BINARY_CONFIRM_PENDING_TYPES = frozenset({
 })
 
 
+# Phase 1D: resume-request detection. Matches a wide variety of "go
+# back" / "back to that"-style phrasings so the user can speak naturally
+# instead of having to say a magic incantation. Anchored at the start
+# of the (lower-cased, lightly-cleaned) message so "I'll send the box
+# back to you" doesn't accidentally trigger resume.
+_RESUME_REQUEST_RE = re.compile(
+    r"""
+    ^\s*
+    (?: (?: let'?s | let \s+ us | can \s+ we | could \s+ we
+          | please | ok | okay
+        )
+        \s+
+    )?
+    (?:
+        back \s+ to (?: \s+ (?: the | that | my | what | where | our ) )?
+      | go \s+ back (?: \s+ to )?
+      | resume (?: \s+ that | \s+ the )?
+      | pick \s+ up \s+ (?: where | the )
+      | continue \s+ (?: where | with | the | from )
+      | where \s+ were \s+ we
+      | what \s+ were \s+ we \s+ (?: just \s+ )? talking \s+ about
+    )
+    \b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_resume_request(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_RESUME_REQUEST_RE.search(str(text).strip().rstrip("?.!,;")))
+
+
+def _resume_keywords(text: str) -> list[str]:
+    """Extract content words from a resume request, used to disambiguate
+    when multiple parked sessions exist ('back to the network thing' ->
+    ['network', 'thing']). Strips resume-grammar words so they don't
+    dominate the keyword score."""
+    low = (text or "").casefold()
+    # Drop the matched resume verb so the keyword list is the *target*
+    # description, not the request grammar.
+    low = _RESUME_REQUEST_RE.sub(" ", low)
+    stop = {"the", "to", "that", "what", "we", "were", "was", "about",
+            "a", "an", "and", "or", "of", "in", "on", "is", "be",
+            "back", "talking", "previous", "last", "prior", "topic",
+            "thing", "one", "resume", "go", "let", "lets", "pick", "up",
+            "continue", "where", "left", "off", "earlier", "again",
+            "before", "just", "now", "my", "our", "ours", "yours"}
+    words = re.findall(r"[a-z0-9]+", low)
+    return [w for w in words if w not in stop and len(w) > 2]
+
+
 def _looks_like_pending_response(message: str, awaiting: dict | None) -> bool:
     """Phase 1C heuristic: does ``message`` look like the user answering
     the question in ``awaiting``, vs. switching to a new topic?
@@ -476,6 +529,17 @@ class VaultRuntime:
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
+        # Phase 1D: "back to that"-style resume. Fires before any other
+        # session bookkeeping so we don't accidentally close/park the
+        # session we're about to restore. Returns early with the
+        # restored session's awaiting question re-posed.
+        try:
+            resumed = self._handle_resume_request(message, node_id)
+        except Exception:
+            resumed = None
+        if resumed is not None:
+            self.node_registry.update_activity(node_id, identity=None)
+            return resumed
         # Phase 1A/1C: chat-session bookkeeping. Decide whether this
         # message extends the active session, parks it (topic switch),
         # or starts a fresh one.
@@ -1072,6 +1136,88 @@ class VaultRuntime:
                 self.chat_sessions.set_awaiting(nid, None)
         except Exception:
             pass
+
+    # ---- Phase 1D: resume parked sessions -----------------------------
+
+    def _resume_prompt(self, session) -> str:
+        """Compose a natural re-pose of the question that was awaiting
+        when the session was parked. Used so the user gets context
+        when they say 'back to that' instead of an empty acknowledgment.
+        """
+        aw = session.awaiting or {}
+        atype = aw.get("type")
+        orig = session.original_message or "what we were discussing"
+        if atype == "learned_capability_confirmation":
+            desc = ((aw.get("proposal") or {}).get("description")) or orig
+            return f"Back to '{orig}'. I was about to set up '{desc}'. Still want that?"
+        if atype == "vision_full_analysis_confirmation":
+            summary = aw.get("summary") or aw.get("vision_summary") or ""
+            tail = f"{summary} " if summary else ""
+            return f"Back to '{orig}'. {tail}Want me to analyze the scene?"
+        if atype == "memory_update_confirmation":
+            conflict = aw.get("conflict") or {}
+            old = conflict.get("old_fact")
+            new = conflict.get("new_fact")
+            if old and new:
+                return f"Back to '{orig}'. Should I replace '{old}' with '{new}'?"
+            return f"Back to '{orig}'. Should I update the stored fact?"
+        if atype == "learned_install_confirmation":
+            missing = aw.get("missing_binary")
+            pkg = aw.get("package")
+            if missing and pkg:
+                return f"Back to '{orig}'. Install '{missing}' via apt (package: {pkg})?"
+            return f"Back to '{orig}'. Should I install the missing tool?"
+        if aw:
+            return f"Back to '{orig}'. The previous question was about a {atype or 'pending'} confirmation."
+        return f"Back to '{orig}'. What would you like to do?"
+
+    def _handle_resume_request(self, message: str, node_id: str) -> dict | None:
+        """If the user's message asks to resume a parked session, do so
+        and return a direct response. Returns None when no resume
+        applies — caller proceeds with normal routing.
+        """
+        if not _is_resume_request(message):
+            return None
+        # Pick target by keyword hint if any, else most-recent parked.
+        keywords = _resume_keywords(message)
+        target = None
+        if keywords:
+            target = self.chat_sessions.find_parked(node_id, keywords)
+        if target is None:
+            parked = self.chat_sessions.get_parked(node_id, limit=1)
+            target = parked[0] if parked else None
+        if target is None:
+            return self._remember_active({
+                "mode": "direct",
+                "message": "I don't have a recent topic parked to go back to.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "chat_session_resume_empty",
+                "compose": False,
+                "response_composed": True,
+            })
+        resumed = self.chat_sessions.resume(node_id, session_id=target.id)
+        if resumed is None:
+            return None
+        # Re-arm the pending dict from the parked awaiting payload, so
+        # the existing confirmation handlers fire on the user's next
+        # yes/no answer.
+        if isinstance(resumed.awaiting, dict):
+            payload = {k: v for k, v in resumed.awaiting.items()
+                       if not k.startswith("_")}
+            self._set_pending(payload, node_id=node_id)
+        prompt = self._resume_prompt(resumed)
+        return self._remember_active({
+            "mode": "direct",
+            "message": prompt,
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "chat_session_resume",
+            "data": {"resumed_session": resumed.id,
+                     "awaiting_type": (resumed.awaiting or {}).get("type")},
+            "compose": False,
+            "response_composed": True,
+        })
 
     # ---- Phase 1B: session as source of truth -------------------------
 
