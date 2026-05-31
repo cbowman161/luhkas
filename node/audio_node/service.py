@@ -243,67 +243,41 @@ def _derive_stream_url(presence_url: str, override: str = "") -> str:
     return ""
 
 
-# Streaming chunk dispatch: word-count threshold instead of "wait for the
-# full sentence." Once the buffer has at least this many words, dispatch
-# whatever is bounded by the latest natural break (sentence > clause >
-# word). This minimises time-to-first-audio at the cost of occasionally
-# cutting at a clause/word boundary mid-sentence, which Piper handles
-# without audible artifacts.
+# Streaming dispatch: accumulate deltas into a buffer; once the buffer has
+# at least this many complete words AND ends at a word boundary (so we
+# don't cut a token mid-stream), hand the whole buffer to TTS and clear.
+# Simple by design — no sentence/clause detection, no abbreviation
+# handling, no validation interplay. The vault streams whatever the LLM
+# produces; the node speaks it as it accumulates.
 _TTS_STREAM_MIN_WORDS = int(os.environ.get("AUDIO_TTS_STREAM_MIN_WORDS", "8"))
 
 
-def _find_natural_break(buffer: str) -> int:
-    """Index (just past) the latest natural break in ``buffer``.
-
-    Preference order: sentence end (``.!?`` + whitespace) > clause end
-    (``,;:`` + whitespace) > word boundary (trailing whitespace position).
-    Returns 0 if no clean break exists (the buffer is one long unbroken
-    token). Abbreviations like "Mr." are honored — those don't count as
-    sentence ends.
-    """
-    n = len(buffer)
-    # Sentence boundary, abbreviation-aware
-    for i in range(n - 1, -1, -1):
-        if buffer[i] in ".!?" and i + 1 < n and buffer[i + 1].isspace():
-            word_start = buffer.rfind(" ", 0, i) + 1
-            word = buffer[word_start:i].lower().rstrip(".")
-            if word not in _TTS_SENTENCE_ABBREVIATIONS:
-                return i + 1
-    # Clause boundary
-    for i in range(n - 1, -1, -1):
-        if buffer[i] in ",;:" and i + 1 < n and buffer[i + 1].isspace():
-            return i + 1
-    # Word boundary (split on the last full whitespace position)
-    last_space = buffer.rfind(" ")
-    return last_space + 1 if last_space >= 0 else 0
-
-
-def _drain_streamed_chunks(
+def _maybe_dispatch_buffer(
     buffer: str,
     min_words: int = _TTS_STREAM_MIN_WORDS,
-) -> tuple[list[str], str]:
-    """Pull speakable chunks from a streaming buffer.
+) -> tuple[str | None, str]:
+    """Return (chunk_to_speak_or_None, remaining_buffer).
 
-    Strategy: only dispatch when the buffer has at least ``min_words``
-    complete words AND a natural break is available. This gets the first
-    chunk out fast (no waiting for a sentence to complete) while keeping
-    chunk boundaries at points where Piper synthesizes naturally.
-
-    Returns (chunks, remaining_buffer).
+    Dispatches when the buffer holds at least ``min_words`` whitespace-
+    delimited tokens AND has a whitespace character somewhere to cut at
+    (so we never hand TTS half a word that's still streaming in). The
+    chunk runs from the start of the buffer up to the last whitespace
+    position; any partial trailing word stays in the buffer for the
+    next pass.
     """
-    chunks: list[str] = []
-    while True:
-        if len(buffer.split()) < min_words:
-            break
-        break_at = _find_natural_break(buffer)
-        if break_at <= 0:
-            break  # no break point yet — wait for whitespace/punct
-        chunk = buffer[:break_at].strip()
-        if not chunk:
-            break
-        buffer = buffer[break_at:].lstrip()
-        chunks.append(chunk)
-    return chunks, buffer
+    if not buffer:
+        return None, buffer
+    if len(buffer.split()) < min_words:
+        return None, buffer
+    last_ws = max(buffer.rfind(" "), buffer.rfind("\n"), buffer.rfind("\t"))
+    if last_ws < 0:
+        # Pathological single-token buffer — wait for whitespace.
+        return None, buffer
+    chunk = buffer[:last_ws].strip()
+    remaining = buffer[last_ws:].lstrip()
+    if not chunk:
+        return None, buffer
+    return chunk, remaining
 
 
 def _stream_presence_to_tts(
@@ -337,11 +311,14 @@ def _stream_presence_to_tts(
         log.warning("stream POST failed: %s", exc)
         return None
 
+    # Buffer accumulates incoming text exactly as it streams from vault.
+    # When enough words have piled up AND the buffer ends at a word
+    # boundary, we hand the chunk to TTS and clear. On "done", we flush
+    # whatever remains. No truncate / redo / validation interplay — what
+    # the vault streams is what the user hears.
     speech_buffer = ""
     final_text = ""
-    saw_terminal = False
     spoken_anything = False
-    redo_text = None
     try:
         for raw_line in upstream:
             if not raw_line:
@@ -356,13 +333,10 @@ def _stream_presence_to_tts(
             etype = event.get("type")
             if etype == "delta":
                 speech_buffer += str(event.get("text") or "")
-                chunks, speech_buffer = _drain_streamed_chunks(speech_buffer)
-                for chunk in chunks:
+                chunk, speech_buffer = _maybe_dispatch_buffer(speech_buffer)
+                if chunk:
                     _start_tts(tts, chunk)
                     if not spoken_anything:
-                        # First chunk: mirror to UI as the assistant message
-                        # so the display starts showing text alongside the
-                        # audio rather than waiting for "done".
                         _notify_ui_event(
                             event_url,
                             {"type": "assistant_message", "text": chunk},
@@ -373,59 +347,19 @@ def _stream_presence_to_tts(
                 tail = speech_buffer.strip()
                 if tail:
                     _start_tts(tts, tail)
+                    if not spoken_anything:
+                        _notify_ui_event(
+                            event_url,
+                            {"type": "assistant_message", "text": tail},
+                        )
                     spoken_anything = True
                     speech_buffer = ""
-                saw_terminal = True
                 break
-            elif etype == "truncate":
-                # Vault sanitizer trimmed a trailing portion. The streamed
-                # prefix IS the validated content. Two cases:
-                #   1. We already dispatched some chunks (spoken_anything):
-                #      discard the buffer — what's spoken is correct.
-                #   2. Nothing dispatched yet (e.g., short reply with no
-                #      natural break before the closer): speak final_text
-                #      so the user isn't left in silence.
-                final_text = str(event.get("text") or "")
-                speech_buffer = ""
-                if not spoken_anything and final_text:
-                    _start_tts(tts, final_text)
-                    _notify_ui_event(
-                        event_url,
-                        {"type": "assistant_message", "text": final_text},
-                    )
-                    spoken_anything = True
-                saw_terminal = True
-                break
-            elif etype == "redo":
-                # Validator rejected the streamed text and replaced it with
-                # final. Cancel everything queued/playing, then speak the
-                # replacement. _cancel_queued_tts bumps the generation so
-                # threads waiting on _tts_lock bail out instead of playing
-                # stale chunks after our fallback.
-                redo_text = str(event.get("text") or "")
-                _cancel_queued_tts(tts)
-                speech_buffer = ""
-                if redo_text:
-                    _start_tts(tts, redo_text)
-                    _notify_ui_event(
-                        event_url,
-                        {"type": "assistant_message", "text": redo_text},
-                    )
-                    spoken_anything = True
-                final_text = redo_text
-                saw_terminal = True
-                break
-            elif etype == "working":
-                # Vault-side progress hint ("composing", "checking vision",
-                # etc.). Don't speak; just keep the UI alive. Useful when
-                # the pre-LLM phase is slow.
-                hint = str(event.get("text") or "")
-                if hint:
-                    log.debug("vault working: %s", hint)
             elif etype == "error":
                 log.warning("vault stream error: %s", event.get("error"))
                 break
-            # "start" and unknown types ignored
+            # "start" / "working" / unknown types ignored — they're not
+            # text we should speak, and we don't need them for control.
     finally:
         try:
             upstream.close()

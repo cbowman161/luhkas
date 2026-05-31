@@ -38,13 +38,16 @@ class ResponseComposer:
         if contract:
             prompt = f"{prompt}\n\nNon-negotiable response contract:\n{contract}\n"
         try:
-            # Stream this compose only if (a) a sink is installed for the
-            # current request, (b) the model supports streaming, and (c)
-            # we successfully *claim* the sink. claim() is single-shot per
-            # sink so subsequent compose calls in the same request (fact
-            # extractors, retries, etc.) silently fall back to the sync
-            # path instead of also broadcasting their tokens to the
-            # user-facing channel.
+            # Streaming path: when a sink is installed for the current
+            # request and the model supports streaming, claim the sink
+            # and stream raw tokens directly to the consumer. Skip
+            # sanitizer / validator / required_terms / recent-dedup
+            # entirely — once a token is sent to the audio_node it has
+            # already been queued for TTS, so post-hoc validation can't
+            # take it back. The node speaks whatever the LLM produces.
+            # claim() is single-shot per sink so intermediate compose
+            # calls in the same request fall through to the sync path
+            # and don't also broadcast their tokens.
             sink = get_stream_sink()
             stream_fn = (
                 getattr(self.model, "generate_stream", None)
@@ -52,9 +55,6 @@ class ResponseComposer:
                 else None
             )
             if stream_fn is not None:
-                # Tell the consumer we're about to produce — useful when
-                # pre-LLM work (router pick, prompt assembly) added latency.
-                sink.emit("working", "composing")
                 parts: list[str] = []
                 for chunk in stream_fn(
                     prompt,
@@ -64,14 +64,14 @@ class ResponseComposer:
                 ):
                     parts.append(chunk)
                     sink.emit("delta", chunk)
-                text = "".join(parts).strip()
-            else:
-                text = self.model.generate(
-                    prompt,
-                    options=self._options(options),
-                    timeout=timeout,
-                    think=False,
-                ).strip()
+                return "".join(parts).strip() or self.fallback(fallback, "empty model response")
+            # Sync path: full validation as before.
+            text = self.model.generate(
+                prompt,
+                options=self._options(options),
+                timeout=timeout,
+                think=False,
+            ).strip()
             text = sanitizer(text) if sanitizer is not None else text
             if not text:
                 return self.fallback(fallback, "empty model response")

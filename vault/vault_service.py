@@ -672,18 +672,19 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
         """Run handle_presence with a streaming sink, emitting NDJSON events.
 
         Wire format (one JSON object per line, application/x-ndjson):
-          {"type": "start"}
-          {"type": "delta", "text": "..."}   # zero or more, raw model tokens
-          {"type": "done",  "text": "..."}   # final validated text
-          {"type": "redo",  "text": "..."}   # sanitizer/validator replaced the
-                                             # streamed text; client should
-                                             # discard buffered deltas and use
-                                             # this instead
-          {"type": "error", "error": "..."}  # exception during handling
+          {"type": "start"}                  — connection open, work begins
+          {"type": "delta", "text": "..."}   — raw model token (zero or more)
+          {"type": "done",  "text": "..."}   — terminal; ``text`` is the full
+                                               streamed concatenation, or the
+                                               full response text if no tokens
+                                               streamed (deterministic route)
+          {"type": "error", "error": "..."}  — exception during handling
 
-        Only the ResponseComposer path emits deltas. Deterministic and
-        non-composer routes yield no deltas; the full reply arrives as a
-        single delta + done.
+        The node speaks whatever the LLM streams. Vault does NOT post-validate
+        the streamed text — by the time a token reaches the client it's
+        already queued for TTS, so a "take it back" event would be too late.
+        Non-streaming requests via /presence/message still get full
+        sanitizer / validator / required_terms enforcement.
         """
         self.send_response(200)
         self.send_header("content-type", "application/x-ndjson")
@@ -707,17 +708,10 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
             if kind == "delta":
                 accumulated_parts.append(text)
                 emit({"type": "delta", "text": text})
-            elif kind == "working":
-                # Progress hint from a slow producer (composer about to
-                # call the LLM, etc.). Consumer can show a "thinking"
-                # indicator while waiting for the first delta.
-                emit({"type": "working", "text": text})
+            # Other sink kinds intentionally dropped — the node only
+            # acts on delta / done.
 
         sink = StreamSink(_on_sink_event)
-        # Immediate "working" event so the client sees liveness before
-        # the synchronous pre-LLM work (deterministic check, scout
-        # dispatch, vision lookups) completes and the first delta lands.
-        emit({"type": "working", "text": "received"})
         token = set_stream_sink(sink)
         response = None
         try:
@@ -733,44 +727,21 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
         import threading as _t
         _t.Thread(target=self._update_person_count, args=(node_id,), daemon=True).start()
 
-        final_text = ""
-        if isinstance(response, dict):
+        streamed_text = "".join(accumulated_parts).strip()
+        # Deterministic / non-composer routes don't stream — emit their
+        # final text as a single delta so the node receives it through
+        # the same wire format.
+        if not streamed_text and isinstance(response, dict):
             final_text = str(
                 response.get("tts")
                 or response.get("message")
                 or response.get("response")
                 or ""
             )
-
-        streamed_text = "".join(accumulated_parts).strip()
-        final_clean = final_text.strip()
-
-        # Whitespace-collapsed comparison — sanitizers that only normalize
-        # spacing should NOT trigger a "redo" hiccup.
-        def _norm(s: str) -> str:
-            return " ".join(s.split())
-
-        streamed_norm = _norm(streamed_text)
-        final_norm = _norm(final_clean)
-
-        if streamed_text and final_clean:
-            if streamed_norm == final_norm:
-                emit({"type": "done", "text": final_text})
-            elif final_norm and streamed_norm.startswith(final_norm):
-                # Common case: sanitizer trimmed a trailing closer/customer-
-                # service phrase. The streamed prefix is the kept content;
-                # tell the consumer to stop here without speaking anything
-                # buffered after the trim point.
-                emit({"type": "truncate", "text": final_text})
-            else:
-                # Validator/sanitizer materially changed the text. Consumer
-                # should interrupt and re-speak final_text.
-                emit({"type": "redo", "text": final_text})
-        elif not streamed_text and final_clean:
-            emit({"type": "delta", "text": final_text})
-            emit({"type": "done", "text": final_text})
-        else:
-            emit({"type": "done", "text": final_text or streamed_text})
+            if final_text:
+                emit({"type": "delta", "text": final_text})
+                streamed_text = final_text
+        emit({"type": "done", "text": streamed_text})
 
     def _send_html(self, status, html):
         body = str(html).encode("utf-8")
