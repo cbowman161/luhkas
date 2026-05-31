@@ -31,6 +31,33 @@ _SSH_OPTS = [
 _last_result: dict = {}
 _last_sync_at: float = 0.0
 _auto_synced: set[str] = set()  # nodes pushed this session; reset on vault restart
+# (node_id, host) pairs whose systemd units have been rendered in this process.
+# Used to skip the ssh+install_user_services.sh round-trip on no-op autosync
+# cycles. Cleared on vault-runtime restart, when units are re-rendered anyway.
+_rendered_nodes: set[tuple[str, str]] = set()
+
+
+def _is_connection_failure(stderr: str) -> bool:
+    """Heuristic: does this rsync/ssh stderr look like a transport-layer
+    failure (worth retrying against a fallback host), versus a content
+    or auth error (where retrying changes nothing)?
+    """
+    needle_set = (
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "no route to host",
+        "host is down",
+        "host is unreachable",
+        "network is unreachable",
+        "name or service not known",
+        "could not resolve",
+        "ssh: connect to host",
+        "kex_exchange_identification",
+        "host key verification failed",
+    )
+    s = (stderr or "").lower()
+    return any(needle in s for needle in needle_set)
 
 
 def pubkey() -> str:
@@ -60,17 +87,58 @@ def pull() -> dict:
 
 
 def push_node(profile: dict) -> dict:
-    """Rsync node/ to one node device and restart its services."""
+    """Rsync node/ to one node device and restart its services.
+
+    Primary host comes from ``sync.host``. If that connection fails at
+    the transport layer (refused/timeout/unreachable), fall back to
+    ``sync._lan_host`` if present. Auth/content errors do NOT trigger
+    fallback — retrying the same broken state on a different host
+    wouldn't help.
+    """
     sync = profile.get("sync") or {}
-    host = sync.get("host", "")
+    primary = str(sync.get("host", "")).strip()
+    fallback = str(sync.get("_lan_host", "")).strip()
     user = sync.get("user", "luhkas")
     node_dir = sync.get("node_dir", "luhkas/node")
     services = sync.get("services") or []
     node_id = profile.get("node_id", "?")
 
-    if not host:
+    if not primary:
         return {"ok": False, "error": "no sync.host configured in profile"}
 
+    result = _push_to_host(node_id, primary, user, node_dir, services)
+    if not result.get("ok") and fallback and fallback != primary:
+        if _is_connection_failure(result.get("error", "")):
+            print(
+                f"[sync_manager] {node_id}: primary host {primary} unreachable; "
+                f"retrying via _lan_host {fallback}",
+                flush=True,
+            )
+            fb = _push_to_host(node_id, fallback, user, node_dir, services)
+            if fb.get("ok"):
+                fb["fallback_used"] = fallback
+                fb["primary_failure"] = result.get("error")
+                return fb
+            # Both failed — return the fallback error (more recent)
+            fb["primary_failure"] = result.get("error")
+            return fb
+    return result
+
+
+def _push_to_host(
+    node_id: str,
+    host: str,
+    user: str,
+    node_dir: str,
+    services: list,
+) -> dict:
+    """Rsync + install + restart against one specific host.
+
+    Render-units only when files actually changed or we haven't rendered
+    on this (node_id, host) in this process lifetime. That skips one
+    ssh round-trip per node per autosync tick when nothing's changed,
+    which is most ticks.
+    """
     dest = f"{user}@{host}:{node_dir}/"
     rsync = subprocess.run(
         [
@@ -115,30 +183,42 @@ def push_node(profile: dict) -> dict:
         timeout=120,
     )
     if rsync.returncode != 0:
-        return {"ok": False, "node_id": node_id, "error": rsync.stderr.strip()}
+        return {"ok": False, "node_id": node_id, "host": host, "error": rsync.stderr.strip()}
 
     files_changed = bool(rsync.stdout.strip())
     restarted: list[str] = []
     install_output = ""
+    rendered_now = False
     if services:
-        install_cmd = (
-            f"cd ~/{node_dir} && "
-            f"LUHKAS_NODE_ID={node_id} VAULT_CHAT_URL={_DEFAULT_VAULT_URL} "
-            "./scripts/install_user_services.sh"
-        )
-        install = subprocess.run(
-            ["ssh"] + _SSH_OPTS + [f"{user}@{host}", install_cmd],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        install_output = (install.stdout + install.stderr).strip()
-        if install.returncode != 0:
-            return {
-                "ok": False,
-                "node_id": node_id,
-                "error": f"service render failed: {install_output}",
-            }
+        # Skip the install/render ssh round-trip when nothing changed AND
+        # we've already rendered units against this (node_id, host) in
+        # this vault-runtime process. Saves a round-trip per node per
+        # autosync tick (timer fires every 60s; rendering is idempotent
+        # so it doesn't matter we did it last time the process started).
+        cache_key = (node_id, host)
+        needs_render = files_changed or cache_key not in _rendered_nodes
+        if needs_render:
+            install_cmd = (
+                f"cd ~/{node_dir} && "
+                f"LUHKAS_NODE_ID={node_id} VAULT_CHAT_URL={_DEFAULT_VAULT_URL} "
+                "./scripts/install_user_services.sh"
+            )
+            install = subprocess.run(
+                ["ssh"] + _SSH_OPTS + [f"{user}@{host}", install_cmd],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            install_output = (install.stdout + install.stderr).strip()
+            if install.returncode != 0:
+                return {
+                    "ok": False,
+                    "node_id": node_id,
+                    "host": host,
+                    "error": f"service render failed: {install_output}",
+                }
+            _rendered_nodes.add(cache_key)
+            rendered_now = True
         if files_changed:
             restart = subprocess.run(
                 ["ssh"] + _SSH_OPTS + [f"{user}@{host}", f"systemctl --user restart {' '.join(services)}"],
@@ -150,6 +230,7 @@ def push_node(profile: dict) -> dict:
                 return {
                     "ok": False,
                     "node_id": node_id,
+                    "host": host,
                     "error": f"service restart failed: {restart.stderr.strip()}",
                 }
             restarted = services
@@ -160,7 +241,7 @@ def push_node(profile: dict) -> dict:
         "host": host,
         "files_changed": files_changed,
         "services_restarted": restarted,
-        "services_rendered": bool(install_output),
+        "services_rendered": rendered_now,
     }
 
 
