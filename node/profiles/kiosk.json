@@ -30,6 +30,8 @@
     }
   },
   "sync": {
-    "host": "luhkas-kiosk.local"
+    "host": "192.168.4.57",
+    "_comment": "LAN IP, not luhkas-kiosk.local mDNS, so autosync survives Tailscale SSH session-check gating AND tailscaled outages. Reserve this IP on the router. Tailnet hostname still works for human ssh.",
+    "_tailscale_host": "luhkas-kiosk.local"
   }
 }

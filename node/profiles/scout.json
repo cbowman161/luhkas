@@ -11,6 +11,8 @@
     "luhkas"
   ],
   "sync": {
-    "host": "luhkas-scout.local"
+    "host": "10.10.1.178",
+    "_comment": "LAN IP, not luhkas-scout.local mDNS, so autosync survives Tailscale SSH session-check gating AND tailscaled outages. Reserve this IP on the router. Tailnet hostname still works for human ssh.",
+    "_tailscale_host": "luhkas-scout.local"
   }
 }
