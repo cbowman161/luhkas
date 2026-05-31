@@ -97,6 +97,13 @@ def _contains_audio_wakeword(text: str) -> bool:
     return bool(words & _WAKEWORD_VARIANTS) or _is_audio_wakeword_only(text)
 _tts_lock = threading.Lock()
 _tts_speaking = threading.Event()
+# Generation counter for queue-drain. Bumping it invalidates any _speak
+# thread that hasn't started speaking yet (queued on _tts_lock) AND short-
+# circuits the inter-chunk loop inside a running _speak. Used by the
+# streaming "redo" path so chunks queued behind the now-invalid speech
+# don't play after the corrective fallback.
+_tts_gen_lock = threading.Lock()
+_tts_generation = 0
 _tts_text_lock = threading.Lock()
 _tts_current_text = ""
 _tts_last_started_at = 0.0
@@ -236,37 +243,67 @@ def _derive_stream_url(presence_url: str, override: str = "") -> str:
     return ""
 
 
-def _drain_streamed_sentences(buffer: str) -> tuple[list[str], str]:
-    """Pull complete sentences out of a growing streaming buffer.
+# Streaming chunk dispatch: word-count threshold instead of "wait for the
+# full sentence." Once the buffer has at least this many words, dispatch
+# whatever is bounded by the latest natural break (sentence > clause >
+# word). This minimises time-to-first-audio at the cost of occasionally
+# cutting at a clause/word boundary mid-sentence, which Piper handles
+# without audible artifacts.
+_TTS_STREAM_MIN_WORDS = int(os.environ.get("AUDIO_TTS_STREAM_MIN_WORDS", "8"))
 
-    Returns (sentences, remaining). Same abbreviation-aware sentence rules
-    as _split_speech_chunks; nothing is emitted until the period is followed
-    by whitespace and a sentence-start signal (uppercase/digit), so we don't
-    speak a partial mid-token "sentence".
+
+def _find_natural_break(buffer: str) -> int:
+    """Index (just past) the latest natural break in ``buffer``.
+
+    Preference order: sentence end (``.!?`` + whitespace) > clause end
+    (``,;:`` + whitespace) > word boundary (trailing whitespace position).
+    Returns 0 if no clean break exists (the buffer is one long unbroken
+    token). Abbreviations like "Mr." are honored — those don't count as
+    sentence ends.
     """
-    sentences: list[str] = []
-    work = buffer
+    n = len(buffer)
+    # Sentence boundary, abbreviation-aware
+    for i in range(n - 1, -1, -1):
+        if buffer[i] in ".!?" and i + 1 < n and buffer[i + 1].isspace():
+            word_start = buffer.rfind(" ", 0, i) + 1
+            word = buffer[word_start:i].lower().rstrip(".")
+            if word not in _TTS_SENTENCE_ABBREVIATIONS:
+                return i + 1
+    # Clause boundary
+    for i in range(n - 1, -1, -1):
+        if buffer[i] in ",;:" and i + 1 < n and buffer[i + 1].isspace():
+            return i + 1
+    # Word boundary (split on the last full whitespace position)
+    last_space = buffer.rfind(" ")
+    return last_space + 1 if last_space >= 0 else 0
+
+
+def _drain_streamed_chunks(
+    buffer: str,
+    min_words: int = _TTS_STREAM_MIN_WORDS,
+) -> tuple[list[str], str]:
+    """Pull speakable chunks from a streaming buffer.
+
+    Strategy: only dispatch when the buffer has at least ``min_words``
+    complete words AND a natural break is available. This gets the first
+    chunk out fast (no waiting for a sentence to complete) while keeping
+    chunk boundaries at points where Piper synthesizes naturally.
+
+    Returns (chunks, remaining_buffer).
+    """
+    chunks: list[str] = []
     while True:
-        pos = 0
-        found_split = False
-        while True:
-            m = _TTS_SENT_END_RE.search(work, pos)
-            if not m:
-                break
-            token = m.group(1).lower().rstrip(".")
-            if token in _TTS_SENTENCE_ABBREVIATIONS:
-                pos = m.end()
-                continue
-            end = m.end()
-            sent = work[:end].strip()
-            if sent:
-                sentences.append(sent)
-            work = work[end:]
-            found_split = True
+        if len(buffer.split()) < min_words:
             break
-        if not found_split:
+        break_at = _find_natural_break(buffer)
+        if break_at <= 0:
+            break  # no break point yet — wait for whitespace/punct
+        chunk = buffer[:break_at].strip()
+        if not chunk:
             break
-    return sentences, work
+        buffer = buffer[break_at:].lstrip()
+        chunks.append(chunk)
+    return chunks, buffer
 
 
 def _stream_presence_to_tts(
@@ -303,6 +340,7 @@ def _stream_presence_to_tts(
     speech_buffer = ""
     final_text = ""
     saw_terminal = False
+    spoken_anything = False
     redo_text = None
     try:
         for raw_line in upstream:
@@ -318,45 +356,72 @@ def _stream_presence_to_tts(
             etype = event.get("type")
             if etype == "delta":
                 speech_buffer += str(event.get("text") or "")
-                sentences, speech_buffer = _drain_streamed_sentences(speech_buffer)
-                for sent in sentences:
-                    _start_tts(tts, sent)
-                    if not final_text:
-                        # First spoken chunk: mirror to UI as the assistant
-                        # message so the display starts showing text alongside
-                        # the audio rather than waiting for "done".
+                chunks, speech_buffer = _drain_streamed_chunks(speech_buffer)
+                for chunk in chunks:
+                    _start_tts(tts, chunk)
+                    if not spoken_anything:
+                        # First chunk: mirror to UI as the assistant message
+                        # so the display starts showing text alongside the
+                        # audio rather than waiting for "done".
                         _notify_ui_event(
                             event_url,
-                            {"type": "assistant_message", "text": sent},
+                            {"type": "assistant_message", "text": chunk},
                         )
+                    spoken_anything = True
             elif etype == "done":
                 final_text = str(event.get("text") or "")
                 tail = speech_buffer.strip()
                 if tail:
                     _start_tts(tts, tail)
+                    spoken_anything = True
                     speech_buffer = ""
                 saw_terminal = True
                 break
             elif etype == "truncate":
                 # Vault sanitizer trimmed a trailing portion. The streamed
-                # prefix is the validated content; discard whatever is still
-                # in our buffer instead of speaking it.
+                # prefix IS the validated content. Two cases:
+                #   1. We already dispatched some chunks (spoken_anything):
+                #      discard the buffer — what's spoken is correct.
+                #   2. Nothing dispatched yet (e.g., short reply with no
+                #      natural break before the closer): speak final_text
+                #      so the user isn't left in silence.
                 final_text = str(event.get("text") or "")
                 speech_buffer = ""
+                if not spoken_anything and final_text:
+                    _start_tts(tts, final_text)
+                    _notify_ui_event(
+                        event_url,
+                        {"type": "assistant_message", "text": final_text},
+                    )
+                    spoken_anything = True
                 saw_terminal = True
                 break
             elif etype == "redo":
+                # Validator rejected the streamed text and replaced it with
+                # final. Cancel everything queued/playing, then speak the
+                # replacement. _cancel_queued_tts bumps the generation so
+                # threads waiting on _tts_lock bail out instead of playing
+                # stale chunks after our fallback.
                 redo_text = str(event.get("text") or "")
-                try:
-                    if hasattr(tts, "interrupt"):
-                        tts.interrupt()
-                except Exception:
-                    pass
+                _cancel_queued_tts(tts)
                 speech_buffer = ""
-                _start_tts(tts, redo_text)
+                if redo_text:
+                    _start_tts(tts, redo_text)
+                    _notify_ui_event(
+                        event_url,
+                        {"type": "assistant_message", "text": redo_text},
+                    )
+                    spoken_anything = True
                 final_text = redo_text
                 saw_terminal = True
                 break
+            elif etype == "working":
+                # Vault-side progress hint ("composing", "checking vision",
+                # etc.). Don't speak; just keep the UI alive. Useful when
+                # the pre-LLM phase is slow.
+                hint = str(event.get("text") or "")
+                if hint:
+                    log.debug("vault working: %s", hint)
             elif etype == "error":
                 log.warning("vault stream error: %s", event.get("error"))
                 break
@@ -689,8 +754,38 @@ def _is_likely_self_speech(text: str) -> bool:
     return False
 
 
-def _speak(tts, text: str) -> None:
+def _current_tts_generation() -> int:
+    with _tts_gen_lock:
+        return _tts_generation
+
+
+def _cancel_queued_tts(tts) -> None:
+    """Drain queued TTS chunks and stop current playback.
+
+    Bumps the generation counter so any thread queued on _tts_lock — or
+    looping through internal chunks inside a running _speak — short-
+    circuits and returns. Also signals the engine to abort its current
+    subprocess pair. Use before queueing replacement speech (e.g., when
+    the vault emits a `redo` event).
+    """
+    global _tts_generation
+    with _tts_gen_lock:
+        _tts_generation += 1
+    try:
+        if hasattr(tts, "interrupt"):
+            tts.interrupt()
+    except Exception:
+        pass
+
+
+def _speak(tts, text: str, my_gen: int | None = None) -> None:
+    # If this _speak was queued behind speech that has since been cancelled
+    # (gen bump), bail before holding the lock — keeps the queue drained.
+    if my_gen is not None and my_gen != _current_tts_generation():
+        return
     with _tts_lock:
+        if my_gen is not None and my_gen != _current_tts_generation():
+            return
         global _tts_current_text, _tts_last_started_at, _tts_last_ended_at
         with _tts_text_lock:
             _tts_current_text = str(text or "")
@@ -709,6 +804,11 @@ def _speak(tts, text: str) -> None:
             if not chunks:
                 chunks = [text or ""]
             for chunk in chunks:
+                # Cancellation can happen mid-utterance (long reply,
+                # streaming "redo" fires after several chunks). Check each
+                # iteration so we abandon the remaining chunks.
+                if my_gen is not None and my_gen != _current_tts_generation():
+                    break
                 chunk = chunk.strip()
                 if not chunk:
                     continue
@@ -731,7 +831,11 @@ def _speak(tts, text: str) -> None:
 
 
 def _start_tts(tts, text: str) -> None:
-    thread = threading.Thread(target=_speak, args=(tts, text), daemon=True, name="audio-tts")
+    my_gen = _current_tts_generation()
+    thread = threading.Thread(
+        target=_speak, args=(tts, text), kwargs={"my_gen": my_gen},
+        daemon=True, name="audio-tts",
+    )
     _tts_threads.append(thread)
     thread.start()
 
@@ -831,6 +935,7 @@ class Handler(BaseHTTPRequestHandler):
                 "streaming": {
                     "enabled": _PRESENCE_STREAM_ENABLE,
                     "stream_url": self.stream_url or None,
+                    "min_words": _TTS_STREAM_MIN_WORDS,
                 },
             },
             "capture": {
