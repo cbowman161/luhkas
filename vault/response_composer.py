@@ -38,9 +38,23 @@ class ResponseComposer:
         if contract:
             prompt = f"{prompt}\n\nNon-negotiable response contract:\n{contract}\n"
         try:
+            # Stream this compose only if (a) a sink is installed for the
+            # current request, (b) the model supports streaming, and (c)
+            # we successfully *claim* the sink. claim() is single-shot per
+            # sink so subsequent compose calls in the same request (fact
+            # extractors, retries, etc.) silently fall back to the sync
+            # path instead of also broadcasting their tokens to the
+            # user-facing channel.
             sink = get_stream_sink()
-            stream_fn = getattr(self.model, "generate_stream", None) if sink is not None else None
+            stream_fn = (
+                getattr(self.model, "generate_stream", None)
+                if sink is not None and sink.claim()
+                else None
+            )
             if stream_fn is not None:
+                # Tell the consumer we're about to produce — useful when
+                # pre-LLM work (router pick, prompt assembly) added latency.
+                sink.emit("working", "composing")
                 parts: list[str] = []
                 for chunk in stream_fn(
                     prompt,
@@ -49,10 +63,7 @@ class ResponseComposer:
                     think=False,
                 ):
                     parts.append(chunk)
-                    try:
-                        sink("delta", chunk)
-                    except Exception:
-                        pass
+                    sink.emit("delta", chunk)
                 text = "".join(parts).strip()
             else:
                 text = self.model.generate(

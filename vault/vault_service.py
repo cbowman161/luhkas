@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from streaming import reset_stream_sink, set_stream_sink
+from streaming import StreamSink, reset_stream_sink, set_stream_sink
 from vault_runtime import VaultRuntime
 
 
@@ -680,11 +680,21 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
 
         accumulated_parts: list[str] = []
 
-        def sink(kind: str, text: str) -> None:
+        def _on_sink_event(kind: str, text: str) -> None:
             if kind == "delta":
                 accumulated_parts.append(text)
                 emit({"type": "delta", "text": text})
+            elif kind == "working":
+                # Progress hint from a slow producer (composer about to
+                # call the LLM, etc.). Consumer can show a "thinking"
+                # indicator while waiting for the first delta.
+                emit({"type": "working", "text": text})
 
+        sink = StreamSink(_on_sink_event)
+        # Immediate "working" event so the client sees liveness before
+        # the synchronous pre-LLM work (deterministic check, scout
+        # dispatch, vision lookups) completes and the first delta lands.
+        emit({"type": "working", "text": "received"})
         token = set_stream_sink(sink)
         response = None
         try:
