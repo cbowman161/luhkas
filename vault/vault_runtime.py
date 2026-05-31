@@ -8,8 +8,9 @@ import time
 from blackboard import Blackboard
 from background_manager import BackgroundManager
 from capability_registry import CapabilityRegistry
+from chat_sessions import ChatSessionManager
 from command_agent import CommandAgent
-from config import INSTALLED_CAPABILITIES_DIR
+from config import DATA_DIR, INSTALLED_CAPABILITIES_DIR
 from event_log import EventLog
 from interaction_interpreter import InteractionInterpreter
 from job_manager import JobManager
@@ -192,6 +193,11 @@ class VaultRuntime:
         self.active_task_id = None
         self._last_active_node_id = "cli"
         self.learned_capabilities = LearnedCapabilityEngine()
+        # Phase 1A shadow tracking — observational only, no behavior
+        # change. Sessions persist to data/chat_sessions/{node_id}.jsonl
+        # for the learning aggregator (Layer 3) to consume later. Disable
+        # via VAULT_CHAT_SESSIONS_ENABLE=0.
+        self.chat_sessions = ChatSessionManager(DATA_DIR / "chat_sessions")
         # Per-node active_task_id so multi-node sessions don't clobber each other
         self._node_task_ids: dict = {}
         # In-flight background workers — description/package → started_at unix.
@@ -425,6 +431,31 @@ class VaultRuntime:
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
         self._last_active_node_id = node_id
+        # Phase 1A: decide whether this message extends the active
+        # session (the user is answering a pending question) or starts a
+        # new one. Observational only — does not affect dispatch.
+        try:
+            active = self.chat_sessions.get_active(node_id)
+            if active is not None and active.state == "awaiting":
+                # User is responding to an outstanding prompt — extend
+                # the active session by NOT opening a new one. The
+                # response will be attached as another turn via
+                # add_turn() at the end.
+                pass
+            else:
+                # Either no active session, or the previous one is no
+                # longer waiting — close/park it and start fresh.
+                identity = self.scout.active_identity if hasattr(self.scout, "active_identity") else None
+                self.chat_sessions.open_session(
+                    node_id=node_id,
+                    identity=identity,
+                    original_message=message,
+                )
+            # Lazy idle sweep — keeps stale sessions from lingering
+            # without needing a background thread.
+            self.chat_sessions.sweep_idle()
+        except Exception:
+            pass
         # User-is-here signal: bump activity FIRST so the registry's
         # currently_active_node_ids() check sees this node as active,
         # then drain any deferred alerts onto this node's queue, then
@@ -536,6 +567,15 @@ class VaultRuntime:
         active_id = result.get("active_identity")
         self.node_registry.update_activity(node_id, identity=active_id)
         result = self._attach_notification_alert(result)
+        # Phase 1A: attach this turn to the active session for diagnostics
+        # / future learning. The turn_index is the index in scout's turns
+        # deque (best-effort — scout owns the canonical list).
+        try:
+            turn_idx = len(getattr(self.scout, "turns", []) or []) - 1
+            if turn_idx >= 0:
+                self.chat_sessions.add_turn(node_id, turn_idx)
+        except Exception:
+            pass
         return self._enrich(result, node_id)
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
@@ -929,12 +969,30 @@ class VaultRuntime:
             self.blackboard.set_pending_decision(value)
         else:
             self.blackboard.pending = value
+        # Shadow-mirror to chat_session.awaiting so the session record
+        # carries the same prompt the user is being asked. Errors here
+        # never propagate — chat_sessions is observational in 1A.
+        try:
+            nid = node_id or (value.get("_node_id") if isinstance(value, dict) else None) or self._current_node_id
+            if nid:
+                self.chat_sessions.set_awaiting(nid, value)
+        except Exception:
+            pass
 
     def _clear_pending(self) -> None:
         if hasattr(self.blackboard, "clear_pending_decision"):
             self.blackboard.clear_pending_decision()
         else:
             self.blackboard.pending = None
+        # Mirror to the active session — clearing pending typically means
+        # the confirmation resolved. Phase 1B will pass a richer outcome
+        # dict; for 1A we just note that the awaiting prompt resolved.
+        try:
+            nid = self._current_node_id
+            if nid:
+                self.chat_sessions.set_awaiting(nid, None)
+        except Exception:
+            pass
 
     def _get_pending(self, node_id: str | None = None) -> dict | None:
         """Read pending decision scoped to a node. Returns None if the

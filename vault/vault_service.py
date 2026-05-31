@@ -289,6 +289,14 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 self._send(200, self.runtime.health())
                 return
 
+            if path == "/chat/sessions":
+                # Phase 1A diagnostic — inspect the active + parked
+                # chat sessions for a node. ?node_id=kiosk (default).
+                qs = parse_qs(urlparse(self.path).query)
+                node_id = (qs.get("node_id") or ["kiosk"])[0]
+                self._send(200, self.runtime.chat_sessions.snapshot(node_id))
+                return
+
             if path == "/vault/face":
                 self._send_html(200, _VAULT_FACE_HTML)
                 return
