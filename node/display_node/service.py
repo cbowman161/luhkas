@@ -77,7 +77,18 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
   #brand{top:5vh;left:50%;transform:translateX(-50%);font-size:clamp(13px,1.4vw,20px);letter-spacing:0.55em;font-weight:600;opacity:0.62}
   #state{top:9.5vh;left:50%;transform:translateX(-50%);font-size:clamp(10px,1.05vw,15px);letter-spacing:0.4em;opacity:0.55}
   #cap-user{position:fixed;bottom:15vh;left:5vw;right:5vw;text-align:center;font-size:clamp(13px,1.4vw,20px);opacity:0.45;letter-spacing:0.08em;min-height:1.4em}
-  #cap-assistant{position:fixed;bottom:6vh;left:5vw;right:5vw;text-align:center;font-size:clamp(22px,3vw,48px);font-weight:600;line-height:1.1;min-height:1.4em;letter-spacing:0.03em;text-shadow:0 0 22px currentColor;color:currentColor}
+  #cap-assistant{position:fixed;bottom:6vh;left:5vw;right:5vw;text-align:center;font-size:clamp(22px,3vw,48px);font-weight:600;line-height:1.1;min-height:1.4em;letter-spacing:0.03em;text-shadow:0 0 22px currentColor;color:currentColor;transition:bottom 0.3s ease,font-size 0.3s ease,padding 0.3s ease,background 0.3s ease}
+  /* Mute mode: the bottom of the screen becomes a high-contrast caption
+     panel so the user can read what would have been spoken. The face
+     animation stays, but we anchor + expand the assistant caption,
+     show a MUTED badge, and pulse a thin border so it's obvious the
+     output channel changed. */
+  body.muted #cap-assistant{bottom:0;left:0;right:0;padding:3vh 6vw 4vh;background:rgba(0,0,0,0.78);border-top:2px solid currentColor;font-size:clamp(28px,3.5vw,56px);opacity:1;min-height:18vh;display:flex;align-items:center;justify-content:center;text-shadow:0 0 30px currentColor,0 2px 4px #000}
+  body.muted #cap-user{bottom:21vh;opacity:0.65}
+  #mute-badge{position:fixed;top:5vh;right:5vw;font-size:clamp(11px,1.1vw,16px);letter-spacing:0.4em;font-weight:600;padding:0.4em 0.9em;border:1px solid currentColor;border-radius:0.3em;opacity:0;transition:opacity 0.3s ease;pointer-events:none;z-index:6}
+  body.muted #mute-badge{opacity:0.85}
+  @keyframes mute-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 14px 2px currentColor}}
+  body.muted #mute-badge{animation:mute-pulse 2.4s ease-in-out infinite}
   #scan{position:fixed;left:0;right:0;height:160px;pointer-events:none;background:linear-gradient(to bottom,transparent,currentColor 50%,transparent);opacity:0.05;mix-blend-mode:screen;animation:scan 9s linear infinite;color:inherit;z-index:6}
   @keyframes scan{from{top:-160px}to{top:100vh}}
   body::after{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at center,transparent 45%,#000 100%);opacity:0.7;z-index:5}
@@ -89,6 +100,7 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
 <div id="scan"></div>
 <div class="hud" id="brand">L  U  H  K  A  S</div>
 <div class="hud" id="state">connecting</div>
+<div class="hud" id="mute-badge">M U T E D</div>
 <div id="cap-user"></div>
 <div id="cap-assistant"></div>
 <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
@@ -327,6 +339,8 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
       document.getElementById('state').textContent = s;
       document.getElementById('cap-user').textContent = d.latest_user || '';
       document.getElementById('cap-assistant').textContent = d.latest_assistant || '';
+      // Toggle the bottom caption panel when audio output is muted.
+      document.body.classList.toggle('muted', !!d.output_muted);
       if (d.eye_target && typeof d.eye_target.x_norm === 'number' && typeof d.eye_target.y_norm === 'number') {
         eyeTarget = d.eye_target;
         target = d.eye_target;
@@ -441,6 +455,14 @@ def _record_event(event: dict) -> None:
         update_state({"latest_assistant": {"text": text, "source": event.get("source"), "timestamp": event["timestamp"]}})
     elif etype == "status":
         update_state({"display": {"last_status": event, "last_status_at": event["timestamp"]}})
+    elif etype == "mute_changed":
+        # Output mute pushed by audio_node when the hardware button is
+        # pressed (or /mute is POSTed). Mirror into shared presence_state
+        # so the snapshot endpoint can surface it to the rendering JS,
+        # and also stash in local _status for fallback when presence
+        # state is stale.
+        muted = bool(event.get("muted"))
+        update_state({"audio": {"output_muted": muted, "output_muted_at": event["timestamp"]}})
     with _state_lock:
         _history.append(event)
         _status["last_event_at"] = event["timestamp"]
@@ -450,6 +472,9 @@ def _record_event(event: dict) -> None:
                     _status[key] = event[key]
             if "muted" in event:
                 _status["muted"] = bool(event["muted"])
+        elif etype == "mute_changed":
+            _status["output_muted"] = bool(event.get("muted"))
+            _status["output_muted_at"] = event["timestamp"]
 
 
 def _state_snapshot() -> dict:
@@ -712,6 +737,15 @@ def _presence_face_state() -> dict:
         "presence_state": presence,
         "node_state": _node_runtime_state(),
         "vault_state": vault_state,
+        # Top-level convenience field for the rendering JS. Sourced from
+        # the most authoritative signal available: presence_state (set by
+        # audio_node directly), then audio /health, then last
+        # mute_changed event we received.
+        "output_muted": bool(
+            (presence.get("audio") or {}).get("output_muted")
+            or ((audio_state.get("tts") or {}).get("output_muted"))
+            or status.get("output_muted")
+        ),
     }
 
 

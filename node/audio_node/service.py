@@ -104,6 +104,13 @@ _tts_speaking = threading.Event()
 # don't play after the corrective fallback.
 _tts_gen_lock = threading.Lock()
 _tts_generation = 0
+
+# Output-mute toggle (driven by the soundcard hardware button on GPIO 23 via
+# POST /mute). When True, _start_tts becomes a no-op and any in-flight
+# speech is cancelled. UI events ("assistant_message") still fire so the
+# display can render captions in place of audio.
+_output_muted_lock = threading.Lock()
+_output_muted = False
 _tts_text_lock = threading.Lock()
 _tts_current_text = ""
 _tts_last_started_at = 0.0
@@ -319,6 +326,7 @@ def _stream_presence_to_tts(
     speech_buffer = ""
     final_text = ""
     spoken_anything = False
+    saw_terminal = False
     try:
         for raw_line in upstream:
             if not raw_line:
@@ -343,6 +351,7 @@ def _stream_presence_to_tts(
                         )
                     spoken_anything = True
             elif etype == "done":
+                saw_terminal = True
                 final_text = str(event.get("text") or "")
                 tail = speech_buffer.strip()
                 # Two cases:
@@ -365,6 +374,7 @@ def _stream_presence_to_tts(
                     speech_buffer = ""
                 break
             elif etype == "error":
+                saw_terminal = True
                 log.warning("vault stream error: %s", event.get("error"))
                 break
             # "start" / "working" / unknown types ignored — they're not
@@ -773,7 +783,34 @@ def _speak(tts, text: str, my_gen: int | None = None) -> None:
             })
 
 
+def _is_output_muted() -> bool:
+    with _output_muted_lock:
+        return _output_muted
+
+
+def _set_output_muted(muted: bool, tts) -> bool:
+    """Set the output-mute state. Returns the new state.
+
+    Toggling ON cancels in-flight + queued speech so the user gets an
+    immediate "stops talking" response when they press the button.
+    Toggling OFF doesn't replay anything; new speech proceeds normally.
+    """
+    global _output_muted
+    muted = bool(muted)
+    with _output_muted_lock:
+        _output_muted = muted
+    if muted and tts is not None:
+        _cancel_queued_tts(tts)
+    update_state({"audio": {"output_muted": muted, "output_muted_at": time.time()}})
+    return muted
+
+
 def _start_tts(tts, text: str) -> None:
+    # Output mute: still emit the assistant text via caller's UI event
+    # path, but skip the actual TTS dispatch. Display_node renders these
+    # as a bottom-overlay caption when muted.
+    if _is_output_muted():
+        return
     my_gen = _current_tts_generation()
     thread = threading.Thread(
         target=_speak, args=(tts, text), kwargs={"my_gen": my_gen},
@@ -810,10 +847,33 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_tts(body)
         elif path == "/listen":
             self._handle_listen(body)
+        elif path == "/mute":
+            self._handle_mute(body)
         elif path == "/interrupt":
             self._handle_interrupt()
         else:
             self.send_error(404)
+
+    def _handle_mute(self, body: dict) -> None:
+        """Toggle (or explicitly set) audio output mute.
+
+        body shape:
+          {"muted": true}    -> mute output
+          {"muted": false}   -> unmute output
+          {}                 -> toggle current state
+
+        Side effects: cancels any in-flight TTS; emits a "mute_changed"
+        UI event so the display can switch into caption mode.
+        """
+        if "muted" in body:
+            new_state = _set_output_muted(bool(body["muted"]), self.tts)
+        else:
+            new_state = _set_output_muted(not _is_output_muted(), self.tts)
+        _notify_ui_event(
+            self.event_url,
+            {"type": "mute_changed", "muted": new_state, "source": "audio_node"},
+        )
+        self._json({"ok": True, "muted": new_state})
 
     def _handle_tts(self, body: dict) -> None:
         """Route arbitrary text through the same TTS dispatch path the
@@ -887,6 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                 "engine": tts_name,
                 "available": bool(getattr(self.tts, "available", False)),
                 "speaking": _tts_speaking.is_set(),
+                "output_muted": _is_output_muted(),
                 "self_echo_filter": True,
                 "interrupt_enabled": False,
                 "init_error": getattr(self.tts, "_init_error", None),
