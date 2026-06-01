@@ -59,6 +59,16 @@ ZIM_PATH = os.environ.get("VAULT_INGEST_ZIM_PATH", "")
 STATE_FILE = os.environ.get("VAULT_INGEST_STATE_FILE", "")
 EMBEDDER = os.environ.get("VAULT_INGEST_EMBEDDER", "native")
 BATCH = os.environ.get("VAULT_INGEST_BATCH", "64")
+# Throughput tunables surfaced from ingest_wiki args. Defaults match the
+# ingest_wiki defaults so behavior is unchanged unless overridden.
+# - concurrency: parallel embed workers. >1 lets one batch's embed run
+#   while another batch flushes to LanceDB. Useful when DB-write latency
+#   matters; redundant if the embed itself is the bottleneck.
+# - prefetch_queue: max parsed articles buffered between parser and
+#   embed/write loop. queue=24/24 in logs means raise this to give the
+#   producer more headroom while the writer drains.
+CONCURRENCY = os.environ.get("VAULT_INGEST_CONCURRENCY", "")
+PREFETCH_QUEUE = os.environ.get("VAULT_INGEST_PREFETCH_QUEUE", "")
 WORKDIR = os.environ.get("VAULT_INGEST_WORKDIR", str(Path(__file__).resolve().parents[1]))
 GRACEFUL_STOP_TIMEOUT = float(os.environ.get("VAULT_INGEST_STOP_TIMEOUT", "45"))
 
@@ -144,7 +154,7 @@ def build_ingest_argv() -> list[str]:
     if not STATE_FILE:
         log.error("VAULT_INGEST_STATE_FILE is required")
         sys.exit(2)
-    return [
+    argv = [
         sys.executable, "-u", "-m", "world.ingest_wiki",
         ZIM_PATH,
         "--embedder", EMBEDDER,
@@ -152,6 +162,11 @@ def build_ingest_argv() -> list[str]:
         "--state-file", STATE_FILE,
         "--resume-from-state",
     ]
+    if CONCURRENCY:
+        argv += ["--concurrency", str(CONCURRENCY)]
+    if PREFETCH_QUEUE:
+        argv += ["--prefetch-queue", str(PREFETCH_QUEUE)]
+    return argv
 
 
 def state_is_complete() -> bool:
