@@ -1,0 +1,27 @@
+[Unit]
+Description=LUHKAS world ingest supervisor (load-aware auto-pause)
+# Vault must be up for the supervisor to read /health.
+After=vault-runtime.service network-online.target
+Wants=vault-runtime.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/luhkas/vault
+ExecStart=/usr/bin/python3 -u -m world.ingest_supervisor
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+Environment=PYTHONUNBUFFERED=1
+Environment=VAULT_INGEST_ZIM_PATH=%h/world_data/zim/wikipedia_en_all_nopic_2026-03.zim
+Environment=VAULT_INGEST_STATE_FILE=%h/world_data/logs/ingest_wiki.state.json
+# Polling cadence and idleness thresholds. The supervisor reads
+# vault's /health for ``seconds_since_user_activity`` each tick.
+#   - busy if last user message arrived within USER_ACTIVITY_WINDOW
+#   - starts ingest once idle for MIN_IDLE_SECONDS (no streaks; the value
+#     reported by vault is the real idle duration)
+Environment=VAULT_INGEST_POLL_INTERVAL=30
+Environment=VAULT_INGEST_MIN_IDLE_SECONDS=120
+Environment=VAULT_INGEST_USER_ACTIVITY_WINDOW=120
+
+[Install]
+WantedBy=default.target
