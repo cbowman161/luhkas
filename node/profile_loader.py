@@ -34,18 +34,21 @@ _MODULE_SERVICES = {
 # a single module needs both a hardware-proxy service and a higher-level
 # logic service. rover_node maps to robot-api (UART proxy) AND rover
 # (wheel-drive logic that polls vision /meta + dispatches via robot-api).
-# audio_node maps to audio (mic+TTS+presence) AND audio-button (GPIO 23
-# hardware mute toggle on the RaspAudio MIC Ultra 3 HAT).
 _MODULE_EXTRA_SERVICES = {
     "rover_node": ["rover"],
-    "audio_node": ["audio-button"],
 }
 
-# Module → extra systemd unit (no network port). Chromium kiosk, gamepad
-# client, etc. Added to ``extra_units`` automatically.
+# Module → extra systemd unit (no network port). Chromium kiosk etc.
+# Added to ``extra_units`` automatically.
+#
+# rover_node previously declared a separate `controller` unit running
+# tools/controller_drive.py. That was redundant — vision_service already
+# wires in-process GamepadRuntime from rover_node/gamepad.py with the
+# same /dev/input/js0 device. Two readers on the same evdev fight; the
+# standalone controller is removed so a single owner (vision) handles
+# manual gamepad input.
 _MODULE_EXTRA_UNITS = {
     "display_node": "browser",
-    "rover_node": "controller",
 }
 
 # Every node runs the presence proxy. Other "always on" services would go

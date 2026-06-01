@@ -44,7 +44,7 @@ if [ ! -x "${AUDIO_VENV}/bin/python" ]; then
 fi
 
 sudo -u "$NODE_USER" -H "${AUDIO_VENV}/bin/python" -m pip install --upgrade pip wheel
-sudo -u "$NODE_USER" -H "${AUDIO_VENV}/bin/python" -m pip install --upgrade vosk piper-tts
+sudo -u "$NODE_USER" -H "${AUDIO_VENV}/bin/python" -m pip install --upgrade vosk piper-tts gpiod
 
 if [ -n "$PIPER_VOICE_URL" ] && [ ! -f "$PIPER_VOICE_DEST" ]; then
   echo "[audio_node/install] downloading Piper voice to ${PIPER_VOICE_DEST}"

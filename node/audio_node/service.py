@@ -1013,6 +1013,87 @@ class Handler(BaseHTTPRequestHandler):
         log.debug(fmt, *args)
 
 
+def _start_button_watcher(tts) -> threading.Thread | None:
+    """In-process GPIO button watcher for the soundcard hardware mute button.
+
+    Watches a configurable GPIO line on /dev/gpiochip0 for falling edges
+    (button press; active-low with pull-up bias) and toggles output mute
+    via _set_output_muted(). Runs as a daemon thread so the service
+    exits cleanly on SIGTERM.
+
+    Env:
+      AUDIO_BUTTON_ENABLE        toggle (default 1)
+      AUDIO_BUTTON_GPIO          GPIO line offset (default 23 — middle
+                                 button on RaspAudio MIC Ultra 3)
+      AUDIO_BUTTON_CHIP          chip path (default /dev/gpiochip0)
+      AUDIO_BUTTON_DEBOUNCE_MS   suppress consecutive presses within
+                                 this many ms (default 250)
+
+    Returns the started thread, or None if disabled / gpiod unavailable.
+    Previously lived as a separate audio-button.service; folded back
+    into audio_node so each *_node module owns a single systemd unit.
+    """
+    if os.environ.get("AUDIO_BUTTON_ENABLE", "1").lower() in ("0", "false", "no", ""):
+        log.info("button watcher: disabled via AUDIO_BUTTON_ENABLE=0")
+        return None
+    try:
+        import gpiod
+        from gpiod.line import Bias, Direction, Edge
+    except ImportError as exc:
+        log.warning("button watcher: gpiod unavailable (%s); skipping", exc)
+        return None
+
+    gpio = int(os.environ.get("AUDIO_BUTTON_GPIO", "23"))
+    chip_path = os.environ.get("AUDIO_BUTTON_CHIP", "/dev/gpiochip0")
+    debounce_ns = int(os.environ.get("AUDIO_BUTTON_DEBOUNCE_MS", "250")) * 1_000_000
+
+    def _run() -> None:
+        try:
+            request = gpiod.request_lines(
+                chip_path,
+                consumer="audio_node_button",
+                config={
+                    gpio: gpiod.LineSettings(
+                        direction=Direction.INPUT,
+                        bias=Bias.PULL_UP,
+                        edge_detection=Edge.FALLING,
+                    ),
+                },
+            )
+        except Exception as exc:
+            log.warning("button watcher: failed to request line %d on %s (%s); disabled",
+                        gpio, chip_path, exc)
+            return
+        log.info("button watcher: %s line %d (debounce %dms)",
+                 chip_path, gpio, debounce_ns // 1_000_000)
+        last_ns = 0
+        try:
+            while True:
+                if not request.wait_edge_events(timeout=1.0):
+                    continue
+                for ev in request.read_edge_events():
+                    if ev.timestamp_ns - last_ns < debounce_ns:
+                        continue
+                    last_ns = ev.timestamp_ns
+                    new_state = _set_output_muted(not _is_output_muted(), tts)
+                    log.info("button press → output_muted=%s", new_state)
+                    # Mirror the same UI event the /mute HTTP handler
+                    # would emit so the display picks up the new state.
+                    _notify_ui_event(
+                        Handler.event_url,
+                        {"type": "mute_changed", "muted": new_state, "source": "audio_node_button"},
+                    )
+        finally:
+            try:
+                request.release()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_run, daemon=True, name="audio-button")
+    thread.start()
+    return thread
+
+
 def main() -> None:
     host = os.environ.get("AUDIO_HOST", "0.0.0.0")
     port = int(os.environ.get("AUDIO_PORT", "5004"))
@@ -1050,6 +1131,11 @@ def main() -> None:
     Handler.event_url = event_url
 
     Handler.stream_url = stream_url
+
+    # GPIO mute button watcher — runs in-process as a daemon thread so
+    # we don't need a separate audio-button.service. Disable via
+    # AUDIO_BUTTON_ENABLE=0 if running on hardware without the HAT.
+    _start_button_watcher(tts)
     log.info(
         "listening on http://%s:%s (presence=%s, stream=%s)",
         host, port, presence_url,
