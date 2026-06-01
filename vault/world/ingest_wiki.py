@@ -768,9 +768,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: zim not found: {args.zim_path}", file=sys.stderr)
         return 2
 
+    # Resolve the resume cursor FIRST — before overwriting the state
+    # file with the starter stub. Previously the stub wrote
+    # last_committed_index=-1 on every start and then the resume code
+    # below would re-read that fresh -1, treating every run as a
+    # restart from index 0. That's why a ~700k-cursor scan would
+    # re-scan the same 700k articles on every supervisor relaunch.
+    start = args.start
+    resume_cursor = -1
+    if args.resume_from_state and args.state_file and os.path.exists(args.state_file):
+        try:
+            with open(args.state_file) as fh:
+                prior = json.load(fh)
+            resume_cursor = int(prior.get("last_committed_index", -1))
+            if resume_cursor >= 0:
+                start = resume_cursor + 1
+                print(
+                    f"[ingest_wiki] resuming from state cursor={resume_cursor} -> "
+                    f"start={start}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[ingest_wiki] state file unreadable, ignoring: {exc}", flush=True)
+
     # Pre-load state stub so chat status queries during model-load (~15s
     # for native bge-m3) report progress correctly even before the first
     # batch flush. Stub gets overwritten on the first real flush.
+    # IMPORTANT: preserve last_committed_index from the resume read so
+    # any concurrent reader (or a crash before the first flush) doesn't
+    # see -1 and conclude no progress was made.
     if args.state_file:
         _atomic_write_state(args.state_file, {
             "phase": "starting",
@@ -779,7 +805,8 @@ def main(argv: list[str] | None = None) -> int:
             "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "articles_seen": 0,
             "chunks_written": 0,
-            "last_committed_index": -1,
+            "start_index": start,
+            "last_committed_index": resume_cursor,
             "completed": False,
         })
 
@@ -794,21 +821,6 @@ def main(argv: list[str] | None = None) -> int:
         embedder = get_model("embed")
         print("[ingest_wiki] ollama embedder", flush=True)
     store = WorldKnowledgeStore(text_embedder=embedder)
-    start = args.start
-    if args.resume_from_state and args.state_file and os.path.exists(args.state_file):
-        try:
-            with open(args.state_file) as fh:
-                prior = json.load(fh)
-            cursor = int(prior.get("last_committed_index", -1))
-            if cursor >= 0:
-                start = cursor + 1
-                print(
-                    f"[ingest_wiki] resuming from state cursor={cursor} -> "
-                    f"start={start}",
-                    flush=True,
-                )
-        except Exception as exc:
-            print(f"[ingest_wiki] state file unreadable, ignoring: {exc}", flush=True)
     stats = ingest_zim(
         args.zim_path,
         store,
