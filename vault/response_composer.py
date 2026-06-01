@@ -56,14 +56,26 @@ class ResponseComposer:
             )
             if stream_fn is not None:
                 parts: list[str] = []
-                for chunk in stream_fn(
-                    prompt,
-                    options=self._options(options),
-                    timeout=timeout,
-                    think=False,
-                ):
-                    parts.append(chunk)
-                    sink.emit("delta", chunk)
+                try:
+                    for chunk in stream_fn(
+                        prompt,
+                        options=self._options(options),
+                        timeout=timeout,
+                        think=False,
+                    ):
+                        parts.append(chunk)
+                        sink.emit("delta", chunk)
+                except Exception as stream_exc:
+                    # The audio_node has already heard whatever streamed
+                    # up to the error — can't take it back. Log with
+                    # context (the outer try would catch this too but
+                    # with less specific framing) and let what we have
+                    # be returned. Empty parts -> outer fallback path.
+                    print(
+                        f"[response_composer] stream interrupted after "
+                        f"{len(parts)} tokens: {stream_exc}",
+                        flush=True,
+                    )
                 return "".join(parts).strip() or self.fallback(fallback, "empty model response")
             # Sync path: full validation as before.
             text = self.model.generate(

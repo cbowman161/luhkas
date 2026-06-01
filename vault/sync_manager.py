@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -33,6 +34,12 @@ _SSH_OPTS = [
     "-o", "ConnectTimeout=10",
 ]
 
+# Module-level mutable state. All mutations / reads should go through
+# the _STATE_LOCK so concurrent callers (autosync timer, manual admin
+# trigger, /sync HTTP endpoint, etc.) don't race. The whole module is
+# called from at most a handful of places per minute so the lock cost
+# is negligible.
+_STATE_LOCK = threading.Lock()
 _last_result: dict = {}
 _last_sync_at: float = 0.0
 _auto_synced: set[str] = set()  # nodes pushed this session; reset on vault restart

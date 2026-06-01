@@ -102,7 +102,6 @@ RUN_COMMANDS = {
 
 
 def _command_text(text: str) -> str:
-    import re
     return re.sub(r"[^\w\s]", "", str(text or "").lower()).strip()
 
 
@@ -474,11 +473,10 @@ class VaultRuntime:
         # aggregator can decay confidence on whatever it "learned".
         # Done BEFORE session bookkeeping so we mark the OUTGOING
         # session, not the new one we're about to open.
-        try:
-            if _is_correction_of_previous(message):
-                self.chat_sessions.flag_last_wrong(node_id, message)
-        except Exception:
-            pass
+        if _is_correction_of_previous(message):
+            self._safe_chat_sessions(
+                "flag_last_wrong", self.chat_sessions.flag_last_wrong, node_id, message,
+            )
         # Phase 1A: decide whether this message extends the active
         # session (the user is answering a pending question) or starts a
         # new one. Observational only — does not affect dispatch.
@@ -502,8 +500,8 @@ class VaultRuntime:
             # Lazy idle sweep — keeps stale sessions from lingering
             # without needing a background thread.
             self.chat_sessions.sweep_idle()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions bookkeeping failed: {exc}", flush=True)
         # User-is-here signal: bump activity FIRST so the registry's
         # currently_active_node_ids() check sees this node as active,
         # then drain any deferred alerts onto this node's queue, then
@@ -586,12 +584,10 @@ class VaultRuntime:
                     "learned": [],
                 })
         # Clear any prior short-circuit marker on scout before calling.
+        # hasattr is sufficient; redundant try/except was masking real errors.
         for attr in ("_stash_vision_short_circuit_marker", "_stash_memory_conflict_marker"):
             if hasattr(self.scout, attr):
-                try:
-                    delattr(self.scout, attr)
-                except Exception:
-                    pass
+                delattr(self.scout, attr)
         result = self.scout.handle_message(
             message,
             source=node_id,
@@ -609,10 +605,8 @@ class VaultRuntime:
                 "summary": marker.get("vision_summary"),
                 "node_id": node_id,
             })
-            try:
+            if hasattr(self.scout, "_stash_vision_short_circuit_marker"):
                 delattr(self.scout, "_stash_vision_short_circuit_marker")
-            except Exception:
-                pass
         # If scout detected a memory conflict (new fact contradicts stored one),
         # install pending state so the next turn's yes/no replaces or keeps.
         mem_marker = getattr(self.scout, "_stash_memory_conflict_marker", None)
@@ -623,10 +617,8 @@ class VaultRuntime:
                 "conflict": mem_marker,
                 "node_id": node_id,
             })
-            try:
+            if hasattr(self.scout, "_stash_memory_conflict_marker"):
                 delattr(self.scout, "_stash_memory_conflict_marker")
-            except Exception:
-                pass
         # Scout bridge stores the reply text in "response" and the input in "message"
         reply_text = result.get("response") or ""
         result["message"] = reply_text
@@ -641,8 +633,8 @@ class VaultRuntime:
             turn_idx = len(getattr(self.scout, "turns", []) or []) - 1
             if turn_idx >= 0:
                 self.chat_sessions.add_turn(node_id, turn_idx)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.add_turn failed: {exc}", flush=True)
         # Promotion-engine capture: record what the router picked for
         # this phrase. Becomes a silent_route candidate in the session's
         # outcome.learned at close time; the learning_promoter (future)
@@ -667,8 +659,8 @@ class VaultRuntime:
                 and len(msg_low) >= 3
             ):
                 self.chat_sessions.record_route(node_id, phrase=message, route=route_name)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.record_route failed: {exc}", flush=True)
         return self._enrich(result, node_id)
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
@@ -1051,6 +1043,19 @@ class VaultRuntime:
 
     PENDING_TTL_SECONDS = 300  # 5 minutes — abandoned confirmations auto-expire
 
+    def _safe_chat_sessions(self, label: str, fn, *args, **kwargs):
+        """Wrap chat_sessions calls in one error-logging boundary.
+
+        chat_sessions is observational; if it fails we don't want to break
+        the main flow — but we also don't want to silently lose visibility
+        into what broke. Logs to stderr (journalctl picks it up).
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.{label} failed: {exc}", flush=True)
+            return None
+
     def _set_pending(self, value: dict | None, node_id: str | None = None) -> None:
         if isinstance(value, dict):
             # Tag with owner + TTL so abandoned confirmations can't trap
@@ -1069,8 +1074,8 @@ class VaultRuntime:
             nid = node_id or (value.get("_node_id") if isinstance(value, dict) else None) or self._current_node_id
             if nid:
                 self.chat_sessions.set_awaiting(nid, value)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.set_awaiting (set) failed: {exc}", flush=True)
 
     def _clear_pending(self) -> None:
         if hasattr(self.blackboard, "clear_pending_decision"):
@@ -1084,8 +1089,8 @@ class VaultRuntime:
             nid = self._current_node_id
             if nid:
                 self.chat_sessions.set_awaiting(nid, None)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.set_awaiting (clear) failed: {exc}", flush=True)
 
     # ---- Phase 1B: session as source of truth -------------------------
 
@@ -1114,8 +1119,8 @@ class VaultRuntime:
         try:
             if node_id:
                 self.chat_sessions.close(node_id, outcome=outcome)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[vault_runtime] chat_sessions.close failed: {exc}", flush=True)
 
     def _get_pending(self, node_id: str | None = None) -> dict | None:
         """Read pending decision scoped to a node. Returns None if the
@@ -1705,74 +1710,6 @@ class VaultRuntime:
                 "response_composed": True,
             })
 
-        # Legacy synchronous path (kept for fallback inspection; not used)
-        if False and _is_affirmative(message):
-            original = pending.get("original_message") or ""
-            proposal = pending.get("proposal") or {}
-            result = engine.learn_and_execute(
-                original,
-                proposal,
-                confirmed_by=str(message or "user_confirmation"),
-            )
-            if not result.get("ok") and result.get("missing_binary"):
-                missing = result.get("missing_binary")
-                pkg = result.get("suggested_package")
-                if pkg:
-                    self._set_pending({
-                        "type": "learned_install_confirmation",
-                        "original_message": original,
-                        "proposal": proposal,
-                        "node_id": node_id,
-                        "missing_binary": missing,
-                        "package": pkg,
-                    })
-                    return self._remember_active({
-                        "mode": "direct",
-                        "message": (
-                            f"I need the '{missing}' tool to do that, but it's not "
-                            f"installed. I can install it via apt — that would run "
-                            f"`sudo apt-get install -y {pkg}`. OK to install?"
-                        ),
-                        "data": {"missing_binary": missing, "suggested_package": pkg},
-                        "active_task_id": self.active_task_id,
-                        "deterministic": True,
-                        "deterministic_source": "learned_install_confirmation",
-                        "compose": False,
-                        "response_composed": True,
-                    })
-                self._clear_pending()
-                return self._remember_active({
-                    "mode": "direct",
-                    "message": (
-                        f"I need the '{missing}' tool to do that, but it's not installed "
-                        "and I'm not sure which apt package provides it. Install it manually "
-                        "and I can try again."
-                    ),
-                    "data": {"missing_binary": missing},
-                    "active_task_id": self.active_task_id,
-                    "deterministic": True,
-                    "deterministic_source": "learned_capability_missing_tool",
-                    "compose": False,
-                    "response_composed": True,
-                })
-            self._clear_pending()
-            capability = result.get("capability") or proposal
-            summary = engine.summarize_result(original, capability, result)
-            if result.get("saved"):
-                summary = f"Learned command saved. {summary}"
-            return self._remember_active({
-                "mode": "direct",
-                "message": summary,
-                "data": {
-                    "learned_capability": capability,
-                    "execution_result": result,
-                },
-                "active_task_id": self.active_task_id,
-                "deterministic": True,
-                "deterministic_source": f"learned_capability:{capability.get('name') or capability.get('intent')}",
-                "compose": False,
-                "response_composed": True,
-            })
         # Non-affirmative response: ask the LLM whether the user is correcting
         # the pending proposal, denying it, or moving on. No hardcoded patterns
         # — the LLM has full context of what was proposed and what the user

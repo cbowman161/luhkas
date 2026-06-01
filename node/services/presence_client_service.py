@@ -23,7 +23,14 @@ from profile_loader import load_profile as _load_profile_resolved
 try:
     from luhkas_node.local_commands import capabilities as _local_capabilities
     from luhkas_node.local_commands import selftest as _local_selftest
-except Exception:
+except Exception as _exc:
+    # Log so operators know why /selftest etc. show degraded data
+    # instead of getting a cryptic AttributeError at first call.
+    print(
+        f"[scout_presence] luhkas_node.local_commands unavailable ({_exc}); "
+        "local capabilities + selftest will be disabled.",
+        flush=True,
+    )
     _local_capabilities = None
     _local_selftest = None
 
