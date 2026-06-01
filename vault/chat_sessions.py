@@ -27,6 +27,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -68,9 +69,16 @@ class ChatSession:
     # "learned": list[dict]} — sketches what the session accomplished.
     outcome: dict | None = None
     # Heuristic topic key for "back to that" matching. Phase 1A leaves
-    # this null; Phase 1C will populate from route classification.
+    # this null; future work may populate from route classification.
     topic: str | None = None
     topic_summary: str | None = None
+    # Promotion-engine capture: each {phrase, route, ts} the dispatcher
+    # took during this session. At close time, if outcome is otherwise
+    # unset, these get folded into outcome.learned as silent_route
+    # entries — the raw signal the learning_promoter (future) will use
+    # to count silent successes and promote to deterministic_router
+    # after N corroborating uses.
+    routes_taken: list[dict] = field(default_factory=list)
 
     def to_jsonable(self) -> dict:
         return asdict(self)
@@ -100,7 +108,13 @@ class ChatSessionManager:
             except Exception as exc:
                 log.warning("could not create %s; disabling: %s", self.data_dir, exc)
                 self.enabled = False
-        # node_id -> {"active": ChatSession|None, "parked": list[ChatSession], "lock": Lock}
+        # node_id -> {"active": ChatSession|None, "parked": list[ChatSession],
+        #             "recently_closed": deque[ChatSession], "lock": Lock}
+        # recently_closed lets the correction handler attach
+        # "user_corrected" markers to sessions that have already resolved
+        # (e.g., user said "yes" to confirm, system did the thing, NOW
+        # user says "no that was wrong" — without recently_closed we'd
+        # have nothing in memory to flag).
         self._nodes: dict[str, dict] = {}
         self._global_lock = threading.Lock()
         self._recovered: set[str] = set()
@@ -111,7 +125,12 @@ class ChatSessionManager:
         with self._global_lock:
             state = self._nodes.get(node_id)
             if state is None:
-                state = {"active": None, "parked": [], "lock": threading.Lock()}
+                state = {
+                    "active": None,
+                    "parked": [],
+                    "recently_closed": deque(maxlen=5),
+                    "lock": threading.Lock(),
+                }
                 self._nodes[node_id] = state
         # Lazily recover from disk on first access.
         if node_id not in self._recovered:
@@ -196,11 +215,10 @@ class ChatSessionManager:
         with state["lock"]:
             prev = state["active"]
             if prev is not None:
-                # Idle-close vs explicit park decision (Phase 1C will
-                # refine this). For 1A: if previous was awaiting, park
-                # it (the user moved on without answering); otherwise
-                # close it as open-ended.
                 if prev.state == "awaiting":
+                    # User moved on without answering — park (preserves
+                    # the awaiting payload for diagnostic / future
+                    # resume work).
                     prev.state = "parked"
                     state["parked"].insert(0, prev)
                     state["parked"] = state["parked"][:PARKED_PER_NODE_MAX]
@@ -208,7 +226,23 @@ class ChatSessionManager:
                     prev.state = "closed"
                     prev.closed_at = now
                     if prev.outcome is None:
-                        prev.outcome = {"action": "open_ended", "result": {}, "learned": []}
+                        # Auto-synthesize outcome from routes_taken.
+                        # Every silent-routed turn becomes a candidate
+                        # for promotion to deterministic; the engine
+                        # threshold-counts these to decide.
+                        learned = [
+                            {"kind": "silent_route",
+                             "phrase": r.get("phrase"),
+                             "route": r.get("route"),
+                             "ts": r.get("ts")}
+                            for r in prev.routes_taken
+                            if r.get("phrase") and r.get("route")
+                        ]
+                        action = "silent_routed" if learned else "open_ended"
+                        prev.outcome = {"action": action, "result": {}, "learned": learned}
+                    # Keep a handle to the just-closed session so
+                    # flag_last_wrong (delayed corrections) can find it.
+                    state["recently_closed"].append(prev)
                 prev.updated_at = now
                 self._persist(prev)
             session = ChatSession(
@@ -266,15 +300,47 @@ class ChatSessionManager:
             session.updated_at = time.time()
             self._persist(session)
 
-    def flag_last_wrong(self, node_id: str, correction_text: str) -> ChatSession | None:
-        """Mark the most recent active-or-closed session as having
-        produced a response the user just corrected. Writes a
-        "user_corrected" outcome (or merges into an existing outcome's
-        ``learned`` list) so the eventual learning aggregator can decay
-        confidence on whatever that session "learned" — the user
-        rejected its result.
+    def record_route(self, node_id: str, phrase: str, route: str) -> None:
+        """Capture that the LLM router took ``route`` for ``phrase`` on
+        the active session. These accumulate during a session and, at
+        close time, become silent_route entries in outcome.learned.
 
-        Returns the flagged session, or None if there's nothing to flag.
+        The future learning_promoter reads these to count silent
+        successes per (normalized_phrase → route) and auto-promote to
+        deterministic_router after a threshold. Corrections on the same
+        session decrement / blacklist.
+        """
+        if not self.enabled:
+            return
+        if not phrase or not route:
+            return
+        state = self._node_state(node_id)
+        with state["lock"]:
+            sess = state["active"]
+            if sess is None:
+                return
+            sess.routes_taken.append({
+                "phrase": str(phrase)[:300],
+                "route": str(route),
+                "ts": time.time(),
+            })
+            sess.updated_at = time.time()
+            self._persist(sess)
+
+    def flag_last_wrong(self, node_id: str, correction_text: str) -> ChatSession | None:
+        """Mark the most recent active-or-recently-closed session as
+        having produced a response the user just corrected. Writes a
+        ``user_corrected`` marker into the session's outcome so the
+        learning_promoter (future Layer 3) can decay confidence on
+        whatever that session "learned" — the user rejected its result.
+
+        Checks ``active`` first, then walks ``recently_closed`` (newest
+        first). The closed-session lookup is essential for the
+        "confirmed-then-corrected" pattern: user says "yes" to confirm
+        (which CLOSES the session), then "no that was wrong" arrives
+        in the next turn against an already-resolved session.
+
+        Returns the flagged session, or None if nothing to flag.
         """
         if not self.enabled:
             return None
@@ -283,12 +349,11 @@ class ChatSessionManager:
         with state["lock"]:
             target = state["active"]
             if target is None:
-                # Try the most recently closed session by reading the
-                # tail of the JSONL (the active sessions we hold in
-                # memory are gone after close — they're only on disk).
-                # Don't bother for Phase B MVP; if no active session
-                # exists, just no-op. The active-session path is the
-                # common case.
+                # Phase B fix: walk recently_closed (newest first) so
+                # delayed corrections after a resolution still attach.
+                if state["recently_closed"]:
+                    target = state["recently_closed"][-1]
+            if target is None:
                 return None
             existing = target.outcome or {"action": "open_ended", "result": {}, "learned": []}
             corrections = existing.get("corrections") or []
@@ -318,7 +383,23 @@ class ChatSessionManager:
             session.updated_at = now
             session.awaiting = None
             if outcome is not None:
+                # If caller supplied a typed outcome but routes were
+                # also captured during this session, fold the
+                # silent_route records in so they're not lost.
                 session.outcome = outcome
+                if session.routes_taken:
+                    learned = session.outcome.get("learned") or []
+                    for r in session.routes_taken:
+                        if r.get("phrase") and r.get("route"):
+                            learned.append({
+                                "kind": "silent_route",
+                                "phrase": r["phrase"],
+                                "route": r["route"],
+                                "ts": r.get("ts"),
+                            })
+                    session.outcome["learned"] = learned
+            # Push to recently_closed so delayed corrections can find it.
+            state["recently_closed"].append(session)
             self._persist(session)
             state["active"] = None
             return session

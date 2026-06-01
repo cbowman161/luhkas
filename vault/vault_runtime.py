@@ -643,6 +643,32 @@ class VaultRuntime:
                 self.chat_sessions.add_turn(node_id, turn_idx)
         except Exception:
             pass
+        # Promotion-engine capture: record what the router picked for
+        # this phrase. Becomes a silent_route candidate in the session's
+        # outcome.learned at close time; the learning_promoter (future)
+        # will threshold-count these and auto-promote high-confidence
+        # (phrase → route) pairs to the deterministic_router. Skip the
+        # routes where the phrase isn't meaningful learning material:
+        # bare confirmations ("yes"), wakeword, and routing errors.
+        try:
+            route_info = result.get("route") or {}
+            route_name = route_info.get("route")
+            skip = {"wakeword", "routing_error"}
+            msg_low = (message or "").strip().lower()
+            if (
+                route_name
+                and route_name not in skip
+                and not _is_affirmative(msg_low)
+                and not _is_denial(msg_low)
+                # Don't capture corrections as silent-route candidates —
+                # they're noise that would teach the system to associate
+                # "no that was wrong" with whatever route handled it.
+                and not _is_correction_of_previous(message)
+                and len(msg_low) >= 3
+            ):
+                self.chat_sessions.record_route(node_id, phrase=message, route=route_name)
+        except Exception:
+            pass
         return self._enrich(result, node_id)
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
