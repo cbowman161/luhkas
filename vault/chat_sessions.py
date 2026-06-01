@@ -450,6 +450,105 @@ class ChatSessionManager:
                     closed += 1
         return closed
 
+    def aggregate_silent_routes(
+        self,
+        node_id: str,
+        *,
+        lookback_days: float = 14.0,
+        min_hits: int = 1,
+    ) -> list[dict]:
+        """Walk the JSONL and aggregate (normalized_phrase, route) silent_route
+        records into promotion-candidate rows.
+
+        This is the read-only complement of the (future) learning_promoter.
+        Surfaces the live distribution of "what phrase the LLM router
+        picked for what route" so you can eyeball which pairs are
+        approaching threshold and whether any have been corrected.
+
+        Each row:
+          {
+            "phrase":        "what is the capital of france",
+            "phrase_norm":   "what is the capital of france",
+            "route":         "general_question",
+            "hits":          3,
+            "first_seen":    <ts>,
+            "last_seen":     <ts>,
+            "corrections":   1,   # sessions that contained this pair AND were corrected
+            "sample_session_ids": ["abc12345", ...],
+          }
+
+        Sorted by (hits - corrections) desc — i.e., "most-confirmed
+        candidates" first. min_hits filters out long-tail noise.
+        """
+        if not self.enabled:
+            return []
+        path = self.data_dir / f"{node_id}.jsonl"
+        if not path.exists():
+            return []
+        cutoff = time.time() - (lookback_days * 86400)
+        # Last-write-wins per session_id, then aggregate.
+        sessions: dict[str, dict] = {}
+        try:
+            with path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        sess = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sid = sess.get("id")
+                    if not sid:
+                        continue
+                    if sess.get("updated_at", 0) < cutoff:
+                        continue
+                    sessions[sid] = sess
+        except Exception as exc:
+            log.warning("aggregate read %s failed: %s", path, exc)
+            return []
+        # Bucket by (normalized_phrase, route).
+        candidates: dict[tuple, dict] = {}
+        for sid, sess in sessions.items():
+            out = sess.get("outcome") or {}
+            corrections = out.get("corrections") or []
+            corrected = bool(corrections)
+            for L in (out.get("learned") or []):
+                if L.get("kind") != "silent_route":
+                    continue
+                phrase = L.get("phrase") or ""
+                route = L.get("route") or ""
+                if not phrase or not route:
+                    continue
+                norm = " ".join(phrase.lower().split())  # cheap normalization
+                key = (norm, route)
+                bucket = candidates.get(key)
+                if bucket is None:
+                    bucket = {
+                        "phrase": phrase,
+                        "phrase_norm": norm,
+                        "route": route,
+                        "hits": 0,
+                        "first_seen": L.get("ts") or sess.get("created_at"),
+                        "last_seen": L.get("ts") or sess.get("updated_at"),
+                        "corrections": 0,
+                        "sample_session_ids": [],
+                    }
+                    candidates[key] = bucket
+                bucket["hits"] += 1
+                ts = L.get("ts") or sess.get("updated_at") or 0
+                if ts and (bucket["first_seen"] is None or ts < bucket["first_seen"]):
+                    bucket["first_seen"] = ts
+                if ts and (bucket["last_seen"] is None or ts > bucket["last_seen"]):
+                    bucket["last_seen"] = ts
+                if corrected:
+                    bucket["corrections"] += 1
+                if len(bucket["sample_session_ids"]) < 3:
+                    bucket["sample_session_ids"].append(sid[:8])
+        rows = [b for b in candidates.values() if b["hits"] >= min_hits]
+        rows.sort(key=lambda b: (b["hits"] - b["corrections"], b["hits"]), reverse=True)
+        return rows
+
     def snapshot(self, node_id: str) -> dict:
         """Diagnostic — return current state for /chat/sessions endpoint
         or debug logging."""

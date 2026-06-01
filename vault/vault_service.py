@@ -297,6 +297,41 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                 self._send(200, self.runtime.chat_sessions.snapshot(node_id))
                 return
 
+            if path == "/chat/learning/candidates":
+                # Read-only view of the silent_route promotion candidates
+                # being collected from real usage. Each row is a
+                # (normalized_phrase, route) pair with hit count and
+                # correction count — the data the future
+                # learning_promoter will threshold-promote into the
+                # deterministic_router.
+                #
+                # Params:
+                #   node_id=kiosk        (default)
+                #   min_hits=1           (filter long-tail)
+                #   lookback_days=14     (window)
+                qs = parse_qs(urlparse(self.path).query)
+                node_id = (qs.get("node_id") or ["kiosk"])[0]
+                try:
+                    min_hits = int((qs.get("min_hits") or ["1"])[0])
+                except ValueError:
+                    min_hits = 1
+                try:
+                    lookback_days = float((qs.get("lookback_days") or ["14"])[0])
+                except ValueError:
+                    lookback_days = 14.0
+                rows = self.runtime.chat_sessions.aggregate_silent_routes(
+                    node_id, lookback_days=lookback_days, min_hits=min_hits,
+                )
+                self._send(200, {
+                    "ok": True,
+                    "node_id": node_id,
+                    "min_hits": min_hits,
+                    "lookback_days": lookback_days,
+                    "count": len(rows),
+                    "candidates": rows,
+                })
+                return
+
             if path == "/vault/face":
                 self._send_html(200, _VAULT_FACE_HTML)
                 return
