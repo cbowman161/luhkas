@@ -29,5 +29,36 @@
       "route": "general_question"
     },
     "self_route": null
+  },
+  "thats not right": {
+    "confidence": 0.85,
+    "confirmed_at": 1780267833.1982079,
+    "confirmed_by": "user_confirmation",
+    "decided_route": "analyze_vision",
+    "examples": [
+      {
+        "confidence": 0.85,
+        "confirmed_at": 1780267833.1982079,
+        "confirmed_by": "user_confirmation",
+        "decided_route": "analyze_vision",
+        "input": "thats not right",
+        "normalized_input": "thats not right",
+        "reason": "asks about live camera scene",
+        "self_route": null
+      }
+    ],
+    "hits": 0,
+    "input": "thats not right",
+    "normalized_input": "thats not right",
+    "reason": "asks about live camera scene",
+    "route": {
+      "attempts": 1,
+      "confidence": 0.85,
+      "keywords": {},
+      "ok": true,
+      "reason": "asks about live camera scene",
+      "route": "analyze_vision"
+    },
+    "self_route": null
   }
 }

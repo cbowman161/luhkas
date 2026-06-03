@@ -39,9 +39,9 @@ TimeoutStartSec=600
 TimeoutStopSec=60
 Environment=PYTHONUNBUFFERED=1
 Environment=CODE_MONKEY_URL=http://127.0.0.1:8765
-Environment=VAULT_IMMEDIATE_KEEP_ALIVE=24h
+Environment=VAULT_IMMEDIATE_KEEP_ALIVE=30m
 Environment=VAULT_BACKGROUND_KEEP_ALIVE=5m
-Environment=VAULT_WARM_MODEL_ROLES=router,chat,vision
+Environment=VAULT_WARM_MODEL_ROLES=router,chat
 
 [Install]
 WantedBy=default.target

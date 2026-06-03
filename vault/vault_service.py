@@ -1,14 +1,24 @@
 import argparse
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-from streaming import StreamSink, reset_stream_sink, set_stream_sink
-from vault_runtime import VaultRuntime
+# Set up logging BEFORE importing modules that grab loggers. Same shape
+# the world_compact/ingest_supervisor scripts use so vault.* warnings
+# land in the systemd journal with consistent formatting.
+logging.basicConfig(
+    level=os.environ.get("VAULT_LOG_LEVEL", "INFO"),
+    format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+from streaming import StreamSink, reset_stream_sink, set_stream_sink  # noqa: E402
+from vault_runtime import VaultRuntime  # noqa: E402
 
 
 # Shared-secret auth for the presence endpoints. Opt-in: when
@@ -636,6 +646,55 @@ class VaultRequestHandler(BaseHTTPRequestHandler):
                     self._send(200, result_box[0])
                 else:
                     self._send(504, {"ok": False, "error": "sync timed out"})
+                return
+
+            if path == "/admin/warm_models":
+                # Pre-warm the configured set of chat-loop models so the
+                # next user interaction doesn't pay a cold load. Called
+                # by the ingest supervisor after pausing the ingest
+                # (bge-m3 native unloaded → VRAM freed for Ollama
+                # models) and on ZIM-completion, but is also a safe
+                # manual lever from a chat: "warm the models".
+                #
+                # Sync, but bounded — each model warm is a 2-token
+                # generate with a 120s timeout, so the worst case for
+                # 3 roles is ~360s. Vault keeps serving other requests
+                # because this handler runs on a worker thread.
+                #
+                # Skipped while a classroom session is active — the
+                # classroom controller has deliberately evicted
+                # router/chat to make VRAM headroom for the teacher
+                # model, and re-warming them now would un-do that and
+                # likely OOM the teacher.
+                if getattr(self.runtime, "classroom", None) and \
+                        getattr(self.runtime.classroom, "_models_benched", False):
+                    self._send(200, {
+                        "ok": True,
+                        "results": [],
+                        "skipped": "classroom_active",
+                    })
+                    return
+                import threading as _t
+                from models import warm_models as _warm
+                result_box: list[dict] = []
+
+                def _run():
+                    try:
+                        result_box.append({"ok": True, "results": _warm()})
+                    except Exception as exc:
+                        result_box.append({"ok": False, "error": str(exc)})
+
+                t = _t.Thread(target=_run, daemon=True)
+                t.start()
+                t.join(timeout=180)
+                if result_box:
+                    # Cache the new manifest on the runtime so /health
+                    # reflects the refresh.
+                    if isinstance(result_box[0].get("results"), list):
+                        self.runtime.model_warmup = result_box[0]["results"]
+                    self._send(200, result_box[0])
+                else:
+                    self._send(504, {"ok": False, "error": "warm timed out"})
                 return
 
             if path == "/guard/alert":

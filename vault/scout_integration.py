@@ -1282,6 +1282,27 @@ class ScoutVaultBridge:
             "detections": [],
         }
 
+    def camera_state_for_node(self, node_id: str | None):
+        camera_url = self._camera_url_for_node(node_id)
+        return self._get_json(f"{camera_url}/meta") or {
+            "ok": False,
+            "error": "camera_meta_unavailable",
+            "node_id": node_id or "scout",
+            "object_memory": [],
+            "detections": [],
+        }
+
+    def _camera_url_for_node(self, node_id: str | None) -> str:
+        node = str(node_id or "").strip() or "scout"
+        if self.node_registry is not None:
+            try:
+                url = self.node_registry.node_url(node, "vision")
+            except Exception:
+                url = None
+            if url:
+                return str(url).rstrip("/")
+        return self.scout_url
+
     def get_session(self, node_id: str) -> _NodeSession:
         """Return (or create) the session for a node_id."""
         with self._session_lock:
@@ -1421,7 +1442,7 @@ class ScoutVaultBridge:
             self.turns = self.turns[-30:]
             return {"ok": True, **turn}
 
-        state = self.scout_state()
+        state = self.camera_state_for_node(node_id)
         self._adopt_identity_from_state(state, node_id=node_id)
 
         if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
@@ -1933,7 +1954,7 @@ class ScoutVaultBridge:
                     }
                     self._stash_vision_short_circuit_marker = extra
                     return f"{summary} Would you like me to analyze the scene?"
-                result = self.analyze_scene(message, state)
+                result = self.analyze_scene(message, state, node_id=node_id)
                 actions.append({"name": "analyze_vision", "ok": bool(result.get("ok")), "result": result})
                 response = result.get("answer") or result.get("summary")
                 if not response:
@@ -3056,10 +3077,7 @@ STRICT WORD RULES:
         text = _normalize_command_text(message)
         source_node = _source_node_id(source, presence_context)
         if _asks_broad_status_report(text):
-            operational_facts = _operational_status_facts(
-                state,
-                source_node=source_node,
-            )
+            operational_facts = self._operational_status_facts(state, source_node=source_node)
             return _operational_status_statement(operational_facts)
 
         identity_context = self.response_identity_context(state)
@@ -4943,6 +4961,38 @@ If answering ACCURATELY would require seeing the live camera scene (e.g. questio
             },
         }
 
+    def _operational_status_facts(self, state: dict, source_node: str | None = None) -> dict:
+        registry_nodes = {}
+        registry = getattr(self, "node_registry", None)
+        if registry is not None and hasattr(registry, "registered_nodes"):
+            try:
+                registry_nodes = registry.registered_nodes() or {}
+            except Exception:
+                registry_nodes = {}
+
+        return {
+            "source_node": source_node,
+            "nodes": {
+                "vault": self._vault_operational_status(),
+                "kiosk": self._registered_node_operational_status("kiosk", registry_nodes),
+                "scout": self._registered_node_operational_status("scout", registry_nodes),
+            },
+        }
+
+    def _vault_operational_status(self) -> dict:
+        health = _quick_health_get("http://127.0.0.1:7000/health", parse_json=True) or {}
+        return _node_health_operational_status(health)
+
+    def _registered_node_operational_status(self, node_id: str, registry_nodes: dict) -> dict:
+        reg = registry_nodes.get(node_id) if isinstance(registry_nodes, dict) else {}
+        if not isinstance(reg, dict):
+            reg = {}
+        ip = _registered_node_ip(reg)
+        if not ip:
+            return {"ok": False, "services": {}, "services_down": [], "reachable": False}
+        health = _quick_health_get(f"http://{ip}:5002/health", parse_json=True) or {}
+        return _node_health_operational_status(health)
+
     def scout_node_capabilities(self):
         return self._get_json(f"{self.scout_url}/capabilities") or {
             "ok": False,
@@ -5200,9 +5250,10 @@ If answering ACCURATELY would require seeing the live camera scene (e.g. questio
         self._append_memory(identity, event)
         return {"ok": True, "identity": identity, "event": event, "summary": self.person_summary(identity)["summary"]}
 
-    def analyze_scene(self, question: str, state: dict | None = None):
+    def analyze_scene(self, question: str, state: dict | None = None, node_id: str | None = None):
         state = state or {}
-        snapshot = self._get_bytes(f"{self.scout_url}/snapshot")
+        camera_url = self._camera_url_for_node(node_id)
+        snapshot = self._get_bytes(f"{camera_url}/snapshot")
         if snapshot is None:
             return {"ok": False, "error": "snapshot_unavailable"}
         image_b64 = base64.b64encode(snapshot).decode("ascii")
@@ -6253,70 +6304,138 @@ def _status_report_statement(mood_statement: str, scout_facts: dict | None = Non
     )
 
 
-def _operational_status_facts(
-    state: dict,
-    models: dict | None = None,
-    hardware: dict | None = None,
-    source_node: str | None = None,
-) -> dict:
-    scout = _scout_status_facts(state)
-    tracker = state.get("tracker") if isinstance(state.get("tracker"), dict) else {}
-    vault_memory = state.get("vault_memory") if isinstance(state.get("vault_memory"), dict) else {}
-    running_services = ["Vault runtime"]
-    if _source_is_scout(source_node):
-        running_services.append("Scout presence")
-    if state.get("ok"):
-        running_services.append("Scout vision")
+def _operational_status_statement(facts: dict) -> str:
+    nodes = facts.get("nodes") if isinstance(facts, dict) else {}
+    nodes = nodes if isinstance(nodes, dict) else {}
+    all_nodes_ok = True
+    parts = []
+    for node_id, label in (("vault", "Vault"), ("kiosk", "Kiosk"), ("scout", "Scout")):
+        node = nodes.get(node_id) if isinstance(nodes.get(node_id), dict) else {}
+        if not node.get("reachable", True):
+            all_nodes_ok = False
+            parts.append(f"{label}: health endpoint is down.")
+            continue
+        services_down = node.get("services_down") if isinstance(node.get("services_down"), list) else []
+        services_down = [_service_label(name) for name in services_down if str(name)]
+        if not services_down and node.get("ok"):
+            continue
+        elif services_down:
+            all_nodes_ok = False
+            if len(services_down) == 1:
+                parts.append(f"{label}: {services_down[0]} service is down.")
+            else:
+                parts.append(f"{label}: {_join_words(services_down)} services are down.")
+        else:
+            all_nodes_ok = False
+            parts.append(f"{label}: status unavailable.")
+    if all_nodes_ok:
+        parts = ["All services running across all node."]
+    ingestion = _rag_ingestion_runtime_status()
+    if ingestion.get("running"):
+        eta = ingestion.get("eta") or "estimating"
+        parts.append(f"RAG ingestion is running. Time to complete: {eta}.")
+    return " ".join(parts)
+
+
+def _rag_ingestion_runtime_status() -> dict:
+    try:
+        from world import ingest_admin
+    except Exception:
+        return {"running": False}
+    try:
+        running, _pid = ingest_admin._process_running()
+    except Exception:
+        running = False
+    try:
+        state = ingest_admin._read_state()
+    except Exception:
+        state = None
+    if not running and not _rag_ingestion_state_is_fresh(ingest_admin, state):
+        return {"running": False}
+    eta = "estimating"
+    try:
+        if isinstance(state, dict):
+            seen = state.get("articles_seen") or 0
+            new = state.get("articles_new") or 0
+            replaced = state.get("articles_replaced") or 0
+            cursor = state.get("last_committed_index") or 0
+            elapsed = state.get("elapsed_s") or 0
+            if not elapsed and state.get("started_at"):
+                elapsed = time.time() - float(state["started_at"])
+            ingested = new + replaced
+            ingest_rate = (ingested / elapsed) if elapsed > 0 else 0
+            if ingest_rate >= 0.1:
+                entries_left = max(0, ingest_admin.ZIM_TOTAL_ENTRIES_FALLBACK - cursor)
+                real_articles_left = entries_left * ingest_admin.ZIM_REAL_ARTICLE_FRACTION
+                eta = f"~{ingest_admin._humanize_seconds(real_articles_left / ingest_rate)}"
+            elif seen:
+                eta = "available once past resume zone"
+    except Exception:
+        eta = "estimating"
+    return {"running": True, "eta": eta}
+
+
+def _rag_ingestion_state_is_fresh(ingest_admin, state: dict | None) -> bool:
+    if not isinstance(state, dict) or state.get("completed"):
+        return False
+    try:
+        mtime = ingest_admin.STATE_FILE.stat().st_mtime
+    except Exception:
+        return False
+    return (time.time() - mtime) <= 180
+
+
+def _join_words(words: list[str]) -> str:
+    words = [str(word) for word in words if str(word)]
+    if len(words) <= 1:
+        return "".join(words)
+    if len(words) == 2:
+        return " and ".join(words)
+    return ", ".join(words[:-1]) + f", and {words[-1]}"
+
+
+def _node_health_operational_status(health: dict) -> dict:
+    if not isinstance(health, dict) or not health:
+        return {"ok": False, "services_down": [], "reachable": False}
+    own_services = health.get("own_services") if isinstance(health.get("own_services"), dict) else {}
+    services_down = health.get("services_down")
+    if not isinstance(services_down, list):
+        services_down = own_services.get("down") if isinstance(own_services.get("down"), list) else []
     return {
-        "source_node": source_node,
-        "running_services": running_services,
-        "scout": {
-            "state": scout,
-            "tracker": {
-                "bytetracker_enabled": tracker.get("bytetracker_enabled"),
-                "active_objects": tracker.get("active_objects"),
-                "memory_objects": tracker.get("memory_objects"),
-            },
-            "options": {
-                "pose_enabled": state.get("pose_enabled"),
-                "face_detection_enabled": state.get("face_detection_enabled"),
-                "face_recognition_enabled": state.get("face_recognition_enabled"),
-                "person_memory_enabled": state.get("person_memory_enabled"),
-                "collision_avoidance_enabled": state.get("collision_avoidance_enabled"),
-                "camera_light_auto_enabled": state.get("camera_light_auto_enabled"),
-                "vault_memory_enabled": vault_memory.get("enabled"),
-                "vault_memory_synced": vault_memory.get("last_face_sync_ok"),
-            },
-        },
+        "ok": bool(health.get("ok")) and not services_down,
+        "services_down": services_down,
+        "reachable": True,
     }
 
 
-def _operational_status_statement(facts: dict) -> str:
-    scout = facts.get("scout") or {}
-    scout_state = scout.get("state") or {}
-    tracker = scout.get("tracker") or {}
-    options = scout.get("options") or {}
-    running_services = [str(item) for item in (facts.get("running_services") or []) if str(item)]
-    behavior = str(scout_state.get("behavior_state") or "unknown").lower()
-    detections = scout_state.get("visible_detection_count")
-    option_states = [
-        f"wheel motion {'on' if scout_state.get('wheel_enabled') else 'off'}",
-        f"tracking {'on' if scout_state.get('tracking_enabled') else 'off'}",
-        f"follow {'on' if scout_state.get('follow_enabled') else 'off'}",
-        f"face recognition {'on' if options.get('face_recognition_enabled') else 'off'}",
-        f"collision avoidance {'on' if options.get('collision_avoidance_enabled') else 'off'}",
-        f"vault memory {'on' if options.get('vault_memory_enabled') else 'off'}",
-    ]
-    tracker_phrase = ""
-    if tracker.get("active_objects") is not None:
-        tracker_phrase = f", tracker {tracker.get('active_objects')} active"
-    detection_phrase = f", {detections} detections" if detections is not None else ""
-    services_phrase = ", ".join(running_services or ["no services confirmed"])
-    return (
-        f"Services up: {services_phrase}. "
-        f"Scout is {behavior}{detection_phrase}{tracker_phrase}. "
-        f"Options: {', '.join(option_states)}."
-    )
+def _service_label(name: str) -> str:
+    label = str(name or "").strip()
+    for suffix in (".service", ".timer"):
+        if label.endswith(suffix):
+            label = label[: -len(suffix)]
+    for prefix in ("vault-", "kiosk-", "scout-", "luhkas-"):
+        if label.startswith(prefix):
+            label = label[len(prefix):]
+            break
+    return label.replace("-", " ").strip() or str(name)
+
+
+def _registered_node_ip(reg: dict) -> str:
+    network = reg.get("network") if isinstance(reg.get("network"), dict) else {}
+    return str(network.get("tailscale_ip") or reg.get("ip") or "").strip()
+
+
+def _quick_health_get(url: str, *, parse_json: bool = False) -> dict | None:
+    try:
+        response = requests.get(url, timeout=1.5, stream=not parse_json)
+        if response.status_code != 200:
+            return None
+        if not parse_json:
+            response.close()
+            return {"ok": True}
+        return response.json()
+    except Exception:
+        return None
 
 
 def _self_route(self_route: str, reason: str) -> dict:
@@ -7100,11 +7219,6 @@ def _has_excessive_foreign_chars(text: str) -> bool:
         return False
     non_ascii_letters = [ch for ch in letters if ord(ch) > 127]
     return (len(non_ascii_letters) / max(1, len(letters))) > 0.25
-
-
-# Backward-compatible alias for a typo seen in a deployed runtime.
-def hasexcessiveforeignchars(text: str) -> bool:
-    return _has_excessive_foreign_chars(text)
 
 
 def _addresses_or_asserts_user_identity(text: str, term: str, response_type: str):

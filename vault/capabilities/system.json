@@ -92,5 +92,79 @@
       "hello",
       "help me think through this"
     ]
+  },
+  {
+    "name": "classroom_start",
+    "description": "Start a one-on-one classroom session on a subject. Builds a lesson plan grounded in the world knowledge base and teaches it step by step.",
+    "subsystem": "classroom",
+    "action": "start",
+    "mode": "direct",
+    "examples": [
+      "teach me python decorators",
+      "start a class on photosynthesis",
+      "start a classroom on the krebs cycle",
+      "I want to learn intro chemistry",
+      "begin a lesson on the french revolution",
+      "give me a lesson on graph algorithms",
+      "start tutoring me on linear algebra",
+      "let's do a class on rust ownership"
+    ]
+  },
+  {
+    "name": "classroom_open",
+    "description": "Open a classroom and ask the user what they'd like to learn. Use this when the user names no subject up front — the system replies with 'What do you want to learn?' and the next user message becomes the subject.",
+    "subsystem": "classroom",
+    "action": "open",
+    "mode": "direct",
+    "examples": [
+      "start a classroom",
+      "start classroom",
+      "open a classroom",
+      "begin a classroom",
+      "start a class",
+      "start class",
+      "open a class",
+      "begin a class",
+      "start a lesson",
+      "begin a lesson",
+      "open a lesson",
+      "lets start a classroom",
+      "let's start a classroom",
+      "lets do a classroom",
+      "let's do a classroom",
+      "I want to start a classroom",
+      "i want to start a class",
+      "classroom please",
+      "lesson time"
+    ]
+  },
+  {
+    "name": "classroom_resume",
+    "description": "Resume the most recent paused classroom session at the saved progress point.",
+    "subsystem": "classroom",
+    "action": "resume",
+    "mode": "direct",
+    "examples": [
+      "continue the lesson",
+      "back to class",
+      "resume the classroom",
+      "pick up where we left off in class",
+      "back to that lesson"
+    ]
+  },
+  {
+    "name": "classroom_end",
+    "description": "End the active classroom session and save progress.",
+    "subsystem": "classroom",
+    "action": "end",
+    "mode": "direct",
+    "examples": [
+      "end class",
+      "end the lesson",
+      "stop the lesson",
+      "exit classroom",
+      "close class",
+      "im done with class"
+    ]
   }
 ]

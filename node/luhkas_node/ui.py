@@ -360,8 +360,8 @@ function poll(){{
     setText('face-asking', iq.active_index ? (iq.active_index + ' of ' + iq.unknown_face_count) : '-');
     if(d.identity_prompt && d.identity_prompt.id && d.identity_prompt.id !== lastIdentityPromptId){{
       lastIdentityPromptId = d.identity_prompt.id;
-      var promptText = d.identity_prompt.prompt || 'Who are you?';
-      appendMsg('bot', promptText);
+      var promptText = (d.identity_prompt.prompt || '').trim();
+      if(promptText) appendMsg('bot', promptText);
     }}
 
     var dets = d.detections || [];

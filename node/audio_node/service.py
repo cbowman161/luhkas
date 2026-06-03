@@ -354,6 +354,8 @@ def _stream_presence_to_tts(
                 saw_terminal = True
                 final_text = str(event.get("text") or "")
                 tail = speech_buffer.strip()
+                if not final_text and tail:
+                    final_text = tail
                 # Two cases:
                 #   1. We streamed deltas (LLM path): flush whatever's left
                 #      in the buffer (the trailing partial sentence/word
@@ -372,6 +374,9 @@ def _stream_presence_to_tts(
                         )
                     spoken_anything = True
                     speech_buffer = ""
+                if final_text and _is_output_muted():
+                    update_state({"latest_assistant": {"text": final_text, "source": "presence", "timestamp": time.time()}})
+                    _notify_ui_event(event_url, {"type": "assistant_message", "text": final_text, "source": "presence"})
                 break
             elif etype == "error":
                 saw_terminal = True
@@ -400,6 +405,7 @@ _WAKEWORD_ENABLED = os.environ.get('AUDIO_WAKEWORD_ENABLED', '1').lower() not in
 _WAKEWORD_REQUIRE = os.environ.get("AUDIO_REQUIRE_WAKEWORD", "1").lower() not in ("0", "false", "no", "")
 _WAKEWORD_THRESHOLD = float(os.environ.get('AUDIO_WAKEWORD_THRESHOLD', '0.3'))
 _WAKEWORD_LISTEN_SECONDS = float(os.environ.get('AUDIO_WAKEWORD_LISTEN_SECONDS', '8.0'))
+_MUTED_LISTEN_SECONDS = float(os.environ.get("AUDIO_MUTED_LISTEN_SECONDS", "30.0"))
 _WAKEWORD_MODEL_PATH = os.environ.get('AUDIO_WAKEWORD_MODEL', '')
 _wakeword_model = None
 _wakeword_buffer = bytearray()
@@ -465,10 +471,15 @@ def _is_listening_now() -> bool:
         return time.time() < _listening_until
 
 
-def _extend_listening() -> None:
+def _extend_listening(seconds: float | None = None) -> None:
     global _listening_until
+    window = _WAKEWORD_LISTEN_SECONDS if seconds is None else float(seconds)
     with _wakeword_lock:
-        _listening_until = max(_listening_until, time.time() + _WAKEWORD_LISTEN_SECONDS)
+        _listening_until = max(_listening_until, time.time() + window)
+
+
+def _wake_listen_seconds() -> float:
+    return _MUTED_LISTEN_SECONDS if _is_output_muted() else _WAKEWORD_LISTEN_SECONDS
 
 
 def _normalized_phrase(text: str) -> str:
@@ -633,7 +644,7 @@ def _make_transcript_handler(presence_url: str, source: str, node_id: str, tts, 
                 return
             log.info("wakeword transcript opened listen window: %s", text)
         if _WAKEWORD_REQUIRE or _wakeword_model is not None or heard_wakeword:
-            _extend_listening()
+            _extend_listening(_wake_listen_seconds())
         wakeword_only = _is_audio_wakeword_only(text)
         if wakeword_only:
             if _tts_speaking.is_set() and _is_likely_self_speech(text):
@@ -643,6 +654,11 @@ def _make_transcript_handler(presence_url: str, source: str, node_id: str, tts, 
                 log.info("ignored wakeword during TTS: %s", text)
                 return
             response = wakeword_response()
+            if _is_output_muted():
+                response = {
+                    "message": "Listening. I will answer on screen.",
+                    "tts": "Listening. I will answer on screen.",
+                }
             spoken = response.get("tts") or response.get("message") or ""
             with _transcripts_lock:
                 _transcripts.append({"text": text, "timestamp": time.time(), "wakeword": True})
@@ -922,6 +938,15 @@ class Handler(BaseHTTPRequestHandler):
         muted = bool(body.get("muted"))
         if self.capture is None:
             self._json({"ok": False, "error": "capture_unavailable"}, status=503)
+            return
+        if muted and os.environ.get("LUHKAS_NODE_ID", "").strip().lower() == "kiosk":
+            self.capture.unmute()
+            self._json({
+                "ok": False,
+                "error": "kiosk_mic_mute_disabled",
+                "muted": False,
+                "message": "The kiosk microphone cannot be muted. Use /mute for audio output.",
+            }, status=409)
             return
         if muted:
             self.capture.mute()

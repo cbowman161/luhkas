@@ -96,6 +96,8 @@ def _publish_display_event(event: dict) -> None:
 def _speak_response(response: dict, already_spoken: bool = False) -> None:
     if already_spoken or os.environ.get("LUHKAS_UI_TTS", "1") == "0":
         return
+    if _audio_output_muted():
+        return
     text = str(response.get("tts") or response.get("message") or "").strip()
     if text and AUDIO_URL:
         threading.Thread(
@@ -104,6 +106,18 @@ def _speak_response(response: dict, already_spoken: bool = False) -> None:
             kwargs={"timeout": 60.0},
             daemon=True,
         ).start()
+
+
+def _audio_output_muted() -> bool:
+    if not AUDIO_URL:
+        return False
+    try:
+        with urlopen(AUDIO_URL + "/health", timeout=1.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return False
+    tts = data.get("tts") if isinstance(data, dict) else {}
+    return bool(isinstance(tts, dict) and tts.get("output_muted"))
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -43,6 +43,16 @@ SessionState = Literal["open", "awaiting", "parked", "closed"]
 PARKED_PER_NODE_MAX = int(os.environ.get("VAULT_CHAT_SESSIONS_PARKED_MAX", "10"))
 PARKED_TTL_SECONDS = float(os.environ.get("VAULT_CHAT_SESSIONS_PARKED_TTL", "86400"))  # 24h
 INACTIVITY_CLOSE_SECONDS = float(os.environ.get("VAULT_CHAT_SESSIONS_IDLE_CLOSE", "600"))  # 10 min
+# Classroom sessions auto-park (not close) after this much idle so the
+# user can pick the lesson back up with "continue the lesson". Shorter
+# than the default close timeout because a classroom session is heavy
+# (mode prompt, retrieval, etc.) and a 5-minute silence usually means
+# the user has walked away.
+CLASSROOM_IDLE_PARK_SECONDS = float(os.environ.get("VAULT_CHAT_SESSIONS_CLASSROOM_IDLE_PARK", "300"))
+# Throttle sweep_idle so the hot presence path doesn't walk every node
+# on every turn. 30s gives a freshly-idled session at most that long to
+# wait beyond the configured timeout before being closed/parked.
+SWEEP_IDLE_MIN_INTERVAL_SECONDS = float(os.environ.get("VAULT_CHAT_SESSIONS_SWEEP_INTERVAL", "30"))
 ENABLED = os.environ.get("VAULT_CHAT_SESSIONS_ENABLE", "1").lower() not in ("0", "false", "no", "")
 
 
@@ -72,6 +82,16 @@ class ChatSession:
     # this null; future work may populate from route classification.
     topic: str | None = None
     topic_summary: str | None = None
+    # Mode for the conversation. "default" is the normal planner-driven
+    # path; "classroom" routes every turn through ClassroomController so
+    # the assistant stays on-subject and tracks lesson progress. Mode
+    # changes are written through set_mode() so the JSONL stays a faithful
+    # log of session evolution.
+    mode: str = "default"
+    # Mode-specific scratch dict. For classroom: {lesson_id, module_idx,
+    # step_idx, last_check}. Free-form so future modes can use it without
+    # schema churn.
+    mode_state: dict | None = None
     # Promotion-engine capture: each {phrase, route, ts} the dispatcher
     # took during this session. At close time, if outcome is otherwise
     # unset, these get folded into outcome.learned as silent_route
@@ -118,6 +138,16 @@ class ChatSessionManager:
         self._nodes: dict[str, dict] = {}
         self._global_lock = threading.Lock()
         self._recovered: set[str] = set()
+        # Throttle for sweep_idle so it doesn't run on every presence
+        # turn (it walks every registered node). 30 s between full
+        # sweeps is fine: idle thresholds are minutes and a freshly-
+        # idled session waits at most 30 s extra before getting closed.
+        self._last_sweep_at: float = 0.0
+        # External hooks fired when a session transitions to "parked"
+        # (either explicitly via park() or auto via sweep_idle). Used by
+        # the classroom controller to restore evicted models when an
+        # idle-park happens without a hands-on end_lesson call.
+        self._park_callbacks: list = []
 
     # ---- Lock helpers --------------------------------------------------
 
@@ -184,6 +214,21 @@ class ChatSessionManager:
         state["active"] = active
         state["parked"] = parked
 
+    # ---- Park callbacks ------------------------------------------------
+
+    def register_park_callback(self, fn) -> None:
+        """Register a ``fn(node_id, session)`` callable that fires when a
+        session transitions to parked. Errors in callbacks are logged and
+        swallowed so a bad listener can't break session bookkeeping."""
+        self._park_callbacks.append(fn)
+
+    def _fire_parked(self, node_id: str, session: "ChatSession") -> None:
+        for fn in self._park_callbacks:
+            try:
+                fn(node_id, session)
+            except Exception as exc:
+                log.warning("park callback failed: %s", exc)
+
     # ---- Persistence ---------------------------------------------------
 
     def _persist(self, session: ChatSession) -> None:
@@ -222,6 +267,7 @@ class ChatSessionManager:
                     prev.state = "parked"
                     state["parked"].insert(0, prev)
                     state["parked"] = state["parked"][:PARKED_PER_NODE_MAX]
+                    self._fire_parked(node_id, prev)
                 else:
                     prev.state = "closed"
                     prev.closed_at = now
@@ -287,6 +333,37 @@ class ChatSessionManager:
             session.state = "awaiting" if session.awaiting else "open"
             session.updated_at = time.time()
             self._persist(session)
+
+    def set_mode(self, node_id: str, mode: str, mode_state: dict | None = None) -> ChatSession | None:
+        """Stamp the active session with a mode and optional mode_state.
+        Returns the updated session, or None if there's no active session."""
+        if not self.enabled:
+            return None
+        state = self._node_state(node_id)
+        with state["lock"]:
+            session = state["active"]
+            if session is None:
+                return None
+            session.mode = mode or "default"
+            if mode_state is not None:
+                session.mode_state = dict(mode_state)
+            session.updated_at = time.time()
+            self._persist(session)
+            return session
+
+    def update_mode_state(self, node_id: str, mode_state: dict) -> ChatSession | None:
+        """Replace the active session's mode_state in place."""
+        if not self.enabled:
+            return None
+        state = self._node_state(node_id)
+        with state["lock"]:
+            session = state["active"]
+            if session is None:
+                return None
+            session.mode_state = dict(mode_state) if mode_state else None
+            session.updated_at = time.time()
+            self._persist(session)
+            return session
 
     def add_turn(self, node_id: str, turn_index: int) -> None:
         if not self.enabled:
@@ -419,18 +496,30 @@ class ChatSessionManager:
             state["parked"] = state["parked"][:PARKED_PER_NODE_MAX]
             state["active"] = None
             self._persist(session)
-            return session
+        self._fire_parked(node_id, session)
+        return session
 
     def sweep_idle(self) -> int:
-        """Close active sessions that have been idle past the inactivity
-        threshold. Call periodically (or on each request) to prevent
-        sessions from lingering forever. Returns count closed.
+        """Close (or, for classroom mode, park) active sessions that have
+        been idle past the inactivity threshold. Call periodically (or on
+        each request) to prevent sessions from lingering forever.
+
+        Classroom sessions use a shorter timeout
+        (CLASSROOM_IDLE_PARK_SECONDS, default 5 min) and are parked
+        instead of closed so the user can pick the lesson back up later
+        with "continue the lesson". Returns the count of sessions
+        transitioned out of active.
         """
         if not self.enabled:
             return 0
         now = time.time()
-        cutoff = now - INACTIVITY_CLOSE_SECONDS
-        closed = 0
+        # Cheap throttle — caller is the hot per-turn path.
+        if now - self._last_sweep_at < SWEEP_IDLE_MIN_INTERVAL_SECONDS:
+            return 0
+        self._last_sweep_at = now
+        default_cutoff = now - INACTIVITY_CLOSE_SECONDS
+        classroom_cutoff = now - CLASSROOM_IDLE_PARK_SECONDS
+        transitioned = 0
         with self._global_lock:
             node_ids = list(self._nodes.keys())
         for nid in node_ids:
@@ -439,7 +528,22 @@ class ChatSessionManager:
                 session = state["active"]
                 if session is None:
                     continue
-                if session.updated_at < cutoff:
+                if session.mode == "classroom":
+                    if session.updated_at < classroom_cutoff:
+                        session.state = "parked"
+                        session.updated_at = now
+                        state["parked"].insert(0, session)
+                        state["parked"] = state["parked"][:PARKED_PER_NODE_MAX]
+                        state["active"] = None
+                        self._persist(session)
+                        # Fire outside the lock by stashing for a post-loop
+                        # invocation — but for now firing under the lock
+                        # is fine because park callbacks are not expected
+                        # to call back into ChatSessionManager.
+                        self._fire_parked(nid, session)
+                        transitioned += 1
+                    continue
+                if session.updated_at < default_cutoff:
                     session.state = "closed"
                     session.closed_at = now
                     session.updated_at = now
@@ -447,8 +551,8 @@ class ChatSessionManager:
                         session.outcome = {"action": "idle_closed", "result": {}, "learned": []}
                     self._persist(session)
                     state["active"] = None
-                    closed += 1
-        return closed
+                    transitioned += 1
+        return transitioned
 
     def aggregate_silent_routes(
         self,

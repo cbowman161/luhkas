@@ -219,7 +219,10 @@ def execute_code(code: str):
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
-            except Exception:
+            except OSError:
+                # Best-effort cleanup. The tempfile is in /tmp so it
+                # eventually gets cleaned up by the OS; logging would
+                # spam if a parallel process already removed it.
                 pass
 
 

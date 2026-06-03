@@ -1,3 +1,6 @@
-import subprocess
-result = subprocess.run(['cat', '/proc/meminfo'], capture_output=True, text=True)
-print(result.stdout)
+import os
+def main():
+    count = len([name for name in os.listdir('/sys/class/net') if os.path.isdir(os.path.join('/sys/class/net', name))])
+    print(f'network_interface_count: {count}')
+if __name__ == '__main__':
+    main()

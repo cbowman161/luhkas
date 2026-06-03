@@ -41,7 +41,7 @@ class FaceRuntime:
         self.unknown_face_next_id: int = 1
 
     def configure_identity_prompt(self, text: str, complete_grace_seconds: float) -> None:
-        self.identity_prompt_text_value = text
+        self.identity_prompt_text_value = (text or "").strip()
         self.identity_prompt_complete_grace_seconds = complete_grace_seconds
 
     def select_identity_prompt_target(
@@ -110,7 +110,22 @@ class FaceRuntime:
         queue["active_face_group_id"] = face.face_group_id
         queue["active_index"] = active_index + 1
 
-        prompt_text = self.identity_prompt_text(len(entries), active_index + 1)
+        prompt_text = self.identity_prompt_text(len(entries), active_index + 1).strip()
+        if not prompt_text:
+            with self.identity_prompt_lock:
+                self.latest_identity_prompt = None
+            selected = replace(person)
+            selected.aim_x, selected.aim_y = face.center
+            selected.aim_source = f"face:{face.id}"
+            selected.identity = face.identity or self.recognition_config.unknown_label
+            selected.identity_confidence = face.identity_confidence
+            selected.recognition_distance = face.recognition_distance
+            selected.recognition_method = face.recognition_method
+            selected.reference_pose = face.reference_pose
+            selected.missing_reference_poses = list(face.missing_reference_poses)
+            tracker.selected_target_id = selected.id
+            tracker.selected_memory_id = selected.memory_id
+            return selected, queue
         prompt = None
         with self.identity_prompt_lock:
             previous = self.latest_identity_prompt or {}
@@ -131,7 +146,7 @@ class FaceRuntime:
                     "monotonic_ts": now,
                 }
                 self.latest_identity_prompt = prompt
-        if prompt is not None:
+        if prompt is not None and prompt.get("prompt"):
             self._chat_log_add(
                 "assistant",
                 prompt.get("prompt", self.identity_prompt_text_value),

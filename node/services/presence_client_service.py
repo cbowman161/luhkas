@@ -73,6 +73,55 @@ DEFAULT_BRAIN_URL = os.environ.get("VAULT_CHAT_URL", "http://100.70.245.116:7000
 DEFAULT_SOURCE = os.environ.get("VAULT_CHAT_SOURCE", "scout_presence")
 
 
+def _expected_systemd_units(node_id: str) -> list[str]:
+    try:
+        profile = _load_profile_resolved(node_id)
+    except Exception:
+        profile = {}
+    units: list[str] = []
+    services = profile.get("services") if isinstance(profile.get("services"), dict) else {}
+    for name in services:
+        units.append(f"{node_id}-{name}.service")
+    extra_units = profile.get("extra_units") if isinstance(profile.get("extra_units"), list) else []
+    for item in extra_units:
+        name = item.get("name") if isinstance(item, dict) else item
+        name = str(name or "").strip()
+        if name:
+            units.append(f"{node_id}-{name}.service")
+    return sorted(set(units))
+
+
+def _systemd_unit_status(unit: str) -> dict:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5,
+        )
+    except Exception as exc:
+        return {"ok": False, "active": False, "state": "unknown", "error": str(exc)}
+    state = (result.stdout or result.stderr or "").strip() or "unknown"
+    return {
+        "ok": result.returncode == 0 and state == "active",
+        "active": result.returncode == 0 and state == "active",
+        "state": state,
+    }
+
+
+def _own_services_status(node_id: str) -> dict:
+    units = _expected_systemd_units(node_id)
+    by_unit = {unit: _systemd_unit_status(unit) for unit in units}
+    down = [unit for unit, status in by_unit.items() if not status.get("ok")]
+    return {
+        "ok": bool(units) and not down,
+        "expected": units,
+        "down": down,
+        "units": by_unit,
+    }
+
+
 
 def _get_lan_ip() -> str:
     """Return the best LAN IP address for this machine."""
@@ -275,13 +324,17 @@ class PresenceProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.rstrip("/") in {"", "/", "/health"}:
             brain = self._get_json(self.config["brain_url"] + "/health", timeout=4)
+            own_services = _own_services_status(self.config.get("node_id", "scout"))
             self._send(200, {
-                "ok": True,
+                "ok": bool(own_services.get("ok")),
                 "service": "scout_presence_proxy",
+                "node_id": self.config.get("node_id", "scout"),
                 "brain_url": self.config["brain_url"],
                 "source": self.config["source"],
                 "brain_reachable": bool(brain and brain.get("ok")),
                 "brain_health": brain,
+                "own_services": own_services,
+                "services_down": own_services.get("down", []),
                 "uptime_seconds": time.time() - self.server.started_at,
             })
             return

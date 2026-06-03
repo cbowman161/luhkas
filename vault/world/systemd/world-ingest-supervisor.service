@@ -19,7 +19,7 @@ Environment=VAULT_INGEST_STATE_FILE=%h/world_data/logs/ingest_wiki.state.json
 #   - busy if last user message arrived within USER_ACTIVITY_WINDOW
 #   - starts ingest once idle for MIN_IDLE_SECONDS (no streaks; the value
 #     reported by vault is the real idle duration)
-Environment=VAULT_INGEST_POLL_INTERVAL=30
+Environment=VAULT_INGEST_POLL_INTERVAL=5
 Environment=VAULT_INGEST_MIN_IDLE_SECONDS=120
 Environment=VAULT_INGEST_USER_ACTIVITY_WINDOW=120
 

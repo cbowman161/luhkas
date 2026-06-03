@@ -1,12 +1,16 @@
 [Unit]
-Description=LUHKAS world LanceDB compaction (daily, 3:30 AM)
+Description=LUHKAS world LanceDB compaction (every 12h)
 Documentation=man:systemd.timer(5)
 
 [Timer]
-# 3:30 AM local time daily. Coincides with low user activity (ingest is
-# probably busy anyway, but optimize handles concurrent writes), well
-# before the 4 AM ZIM auto-update window if that's ever configured.
+# Every 12h: 03:30 and 15:30 local. Daily wasn't enough — at the
+# observed flush rate (~1,650 fragments/hour with BATCH=128) the
+# wiki_chunks table crossed the ~10k-fragment throughput-collapse
+# threshold within 6h of a compaction run. With BATCH=512 the rate
+# drops ~4x but we still want a safety margin, so twice-daily keeps
+# fragments well under threshold throughout the cycle.
 OnCalendar=*-*-* 03:30:00
+OnCalendar=*-*-* 15:30:00
 # If the host was off at trigger time, run as soon as possible after boot.
 Persistent=true
 RandomizedDelaySec=10min

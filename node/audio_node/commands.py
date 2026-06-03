@@ -1,8 +1,4 @@
-"""Portable deterministic commands for node-local audio control.
-
-Handles natural-language requests like "mute the mic", "unmute", "say hello"
-by calling the local audio_node service over HTTP.
-"""
+"""Portable deterministic commands for node-local audio control."""
 from __future__ import annotations
 
 import json
@@ -24,27 +20,41 @@ class AudioCommandConfig:
         return self.service_url.rstrip("/")
 
 
-_MUTE_PATTERNS = [r"\b(mute|silence) (the )?(mic|microphone|audio|input)\b", r"\bstop listening\b"]
-_UNMUTE_PATTERNS = [r"\bunmute (the )?(mic|microphone|audio|input)\b", r"\bstart listening\b"]
+_OUTPUT_MUTE_PATTERNS = [
+    r"\b(mute|silence) (the )?(speaker|speakers|output|tts|voice|audio)\b",
+    r"\b(audio|voice|speaker|speakers|tts) (mute|off)\b",
+]
+_OUTPUT_UNMUTE_PATTERNS = [
+    r"\bunmute (the )?(speaker|speakers|output|tts|voice|audio)\b",
+    r"\b(audio|voice|speaker|speakers|tts) (unmute|on)\b",
+]
+_MUTE_PATTERNS = [r"\b(mute|silence) (the )?(mic|microphone|input)\b", r"\bstop listening\b"]
+_UNMUTE_PATTERNS = [r"\bunmute (the )?(mic|microphone|input)\b", r"\bstart listening\b"]
 _SAY_PREFIX = re.compile(r"^(say|repeat|tell me)\s+", re.IGNORECASE)
 
 
 def capabilities() -> list[dict]:
     cfg = AudioCommandConfig()
+    examples = [
+        "mute audio",
+        "unmute audio",
+        "say hello world",
+    ]
+    if cfg.node_id != "kiosk":
+        examples.extend([
+            "mute the mic",
+            "stop listening",
+            "unmute the microphone",
+        ])
     return [
         {
             "name": "control_audio",
-            "description": "Mute/unmute mic, speak a phrase, or query audio status.",
+            "description": "Mute/unmute audio output, speak a phrase, or query audio status.",
             "scope": cfg.scope,
             "dispatch_type": cfg.dispatch_type,
             "owner_node": cfg.node_id,
             "target_node": cfg.node_id,
-            "examples": [
-                "mute the mic",
-                "stop listening",
-                "unmute the microphone",
-                "say hello world",
-            ],
+            "examples": examples,
         }
     ]
 
@@ -55,7 +65,13 @@ def handle(user_input: str, config: AudioCommandConfig | None = None) -> dict | 
     if not text:
         return None
     low = text.lower()
+    if any(re.search(p, low) for p in _OUTPUT_MUTE_PATTERNS):
+        return _wrap("mute_output", _post(cfg, "/mute", {"muted": True}), "Audio muted. I'll switch to text.", "I could not mute audio.")
+    if any(re.search(p, low) for p in _OUTPUT_UNMUTE_PATTERNS):
+        return _wrap("unmute_output", _post(cfg, "/mute", {"muted": False}), "Audio unmuted.", "I could not unmute audio.")
     if any(re.search(p, low) for p in _MUTE_PATTERNS):
+        if cfg.node_id == "kiosk":
+            return _wrap("mic_mute_blocked", {"ok": True, "muted": False}, "The kiosk microphone stays live. Use mute audio to switch responses to text.", "")
         return _wrap("mute_mic", _post(cfg, "/listen", {"muted": True}), "Microphone muted.", "I could not mute the microphone.")
     if any(re.search(p, low) for p in _UNMUTE_PATTERNS):
         return _wrap("unmute_mic", _post(cfg, "/listen", {"muted": False}), "Microphone is listening.", "I could not unmute the microphone.")

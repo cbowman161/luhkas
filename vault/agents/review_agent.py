@@ -144,16 +144,4 @@ class ReviewAgent:
         return self.model.generate(prompt, options={"temperature": 0.15, "num_predict": 2000}, think=False)
 
 
-def _extract_json(text: str) -> str:
-    text = text.strip()
-    if "```" in text:
-        for block in text.split("```")[1::2]:
-            block = block.strip()
-            if block.startswith("json"):
-                block = block[4:].strip()
-            if block.startswith("{"):
-                return block
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        return text[start:end + 1]
-    return text
+from agents._json_utils import extract_json as _extract_json  # noqa: E402

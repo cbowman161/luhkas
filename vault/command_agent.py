@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import re
 from pathlib import Path
+
+log = logging.getLogger("vault.command_agent")
 
 
 class CommandAgent:
@@ -60,8 +63,8 @@ class CommandAgent:
                         "description": cmd.get("description", ""),
                         "has_vars": "{" in trigger,
                     })
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("failed to load capability %s: %s", cap_dir.name, exc)
 
     def _import_api(self, capability_name: str, api_path: Path):
         try:
@@ -70,7 +73,9 @@ class CommandAgent:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             return module
-        except Exception:
+        except Exception as exc:
+            log.warning("failed to import api for %s (%s): %s",
+                        capability_name, api_path, exc)
             return None
 
     # ------------------------------------------------------------------

@@ -299,7 +299,44 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
 
   // ---- State + animation -------------------------------------------------
   let state = 'OFFLINE', speaking = false, listening = false, hearing = false, target = null, eyeTarget = null;
+  // Wikipedia ingest visual cue. When the vault's /health says
+  // ingestion.running, the outer dodecahedron tints yellow and spins
+  // faster; the vertex dots follow the outer wire colour (a tight
+  // visual coupling — they read as 'data anchors' on the same
+  // structure, so they shouldn't drift to a different colour).
+  let ingesting = false;
+  const INGEST_YELLOW = 0xf5d000;
+  const INGEST_SPIN_BOOST = 2.6;
   let vaultActive = false, nodeCpuPercent = 0;
+  // CPU temperature drives the middle icosahedron's wire colour.
+  // Thresholds tuned for a Pi 5 with active cooler:
+  //   ≤35 °C : deep blue   (very cool — fresh boot)
+  //    55 °C : cyan        (idle warm — matches static idle)
+  //    70 °C : amber       (hot — sustained load)
+  //   ≥80 °C : red         (throttling territory — Pi 5 throttles at 80)
+  // Linear lerp between stops so transitions are smooth, not stepped.
+  let nodeCpuTempC = null;
+  const TEMP_STOPS = [
+    {t: 35, hex: 0x2080ff},  // very cool — deep blue
+    {t: 55, hex: 0x00d4ff},  // idle warm — cyan
+    {t: 70, hex: 0xffb020},  // hot — amber
+    {t: 80, hex: 0xff3030},  // throttling — red (clamps for >80)
+  ];
+  function _tempToHex(tempC) {
+    if (tempC === null || tempC === undefined || isNaN(tempC)) return null;
+    if (tempC <= TEMP_STOPS[0].t) return TEMP_STOPS[0].hex;
+    if (tempC >= TEMP_STOPS[TEMP_STOPS.length - 1].t) return TEMP_STOPS[TEMP_STOPS.length - 1].hex;
+    for (let i = 0; i < TEMP_STOPS.length - 1; i++) {
+      const a = TEMP_STOPS[i], b = TEMP_STOPS[i + 1];
+      if (tempC >= a.t && tempC <= b.t) {
+        const f = (tempC - a.t) / (b.t - a.t);
+        const ca = new THREE.Color(a.hex);
+        const cb = new THREE.Color(b.hex);
+        return ca.lerp(cb, f).getHex();
+      }
+    }
+    return TEMP_STOPS[1].hex;
+  }
   function setColor(hex) {
     coreMat.color.setHex(hex);
     coreEyeMat.color.setHex(hex);
@@ -333,8 +370,27 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
       vaultActive = !!(d.vault_state && d.vault_state.cognitive_active);
       const vaultUnreachable = !!(d.vault_state && d.vault_state.unreachable);
       const vaultBusy = !!(d.vault_state && (d.vault_state.cognitive_active || d.vault_state.background_active));
-      wireMat.color.setHex(vaultUnreachable ? 0xff2020 : (vaultBusy ? 0x00ff66 : STATIC_CYAN));
+      ingesting = !!(d.vault_state && d.vault_state.ingesting);
+      // Priority: unreachable (red) > busy (green) > ingesting
+      // (yellow) > idle (cyan). Unreachable wins because a frozen
+      // ingest flag from a stale cache shouldn't mask a vault outage.
+      const outerHex = vaultUnreachable
+        ? 0xff2020
+        : (vaultBusy ? 0x00ff66 : (ingesting ? INGEST_YELLOW : STATIC_CYAN));
+      wireMat.color.setHex(outerHex);
+      // Dots are visually anchored to the outer shell — always
+      // match its colour, never drift.
+      dotMat.color.setHex(outerHex);
       nodeCpuPercent = Number((d.node_state && d.node_state.cpu_percent) || 0);
+      // Middle icosahedron tracks the node CPU temperature. If the
+      // node hasn't reported a temp yet, leave it at the previous
+      // colour (don't snap to default).
+      const rawTemp = d.node_state && d.node_state.cpu_temp_c;
+      if (typeof rawTemp === 'number' && !isNaN(rawTemp)) {
+        nodeCpuTempC = rawTemp;
+        const midHex = _tempToHex(nodeCpuTempC);
+        if (midHex !== null) innerMat.color.setHex(midHex);
+      }
       setColor(COLORS[s] || COLORS.OFFLINE);
       document.getElementById('state').textContent = s;
       document.getElementById('cap-user').textContent = d.latest_user || '';
@@ -357,6 +413,8 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
     } catch (e) {
       setColor(COLORS.OFFLINE);
       wireMat.color.setHex(0xff2020);
+      dotMat.color.setHex(0xff2020);
+      innerMat.color.setHex(0xff2020);
       document.getElementById('state').textContent = 'OFFLINE';
     }
   }
@@ -378,11 +436,22 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
     // Per-layer rotation rate scales with state arousal
     const arousal = state === 'AVOIDING' ? 3.0 : state === 'SEARCHING' ? 1.8 : state === 'FOLLOWING' ? 1.3 : 1.0;
     const vaultBoost = vaultActive ? 3.2 : 1.0;
-    const cpuBoost = 1.0 + Math.max(0, Math.min(1, (nodeCpuPercent - 45) / 55)) * 3.4;
-    outer.rotation.y += 0.0028 * arousal * vaultBoost;
-    outer.rotation.x += 0.0018 * arousal;
-    mid.rotation.y -= 0.0052 * arousal * cpuBoost;
-    mid.rotation.z += 0.0038 * arousal;
+    // Ingest spins the outer ring faster (background work indicator).
+    // Multiplies with vaultBoost so a vault-busy + ingesting combo
+    // doesn't just clamp — the user sees both signals stack.
+    const ingestSpinBoost = ingesting ? INGEST_SPIN_BOOST : 1.0;
+    outer.rotation.y += 0.0028 * arousal * vaultBoost * ingestSpinBoost;
+    outer.rotation.x += 0.0018 * arousal * ingestSpinBoost;
+    // Middle layer dedicated to node-CPU representation:
+    //   - colour is set by temperature in poll() (innerMat)
+    //   - rotation speed scales linearly with CPU% across the full
+    //     0–100 range. 0% gives a baseline drift (so it never looks
+    //     frozen); 100% spins ~6x faster. The arousal multiplier on
+    //     other layers is intentionally NOT applied here — this layer
+    //     represents the local node, not the system's emotional state.
+    const cpuSpinScale = 1.0 + Math.max(0, Math.min(100, nodeCpuPercent)) / 100 * 5.0;
+    mid.rotation.y -= 0.0052 * cpuSpinScale;
+    mid.rotation.z += 0.0038 * cpuSpinScale;
     const coreAimActive = hearing || state === 'FOLLOWING';
     if (coreAimActive) {
       const coreTrack = eyeTarget || target || {x_norm: 0, y_norm: 0};
@@ -584,7 +653,44 @@ def _node_runtime_state() -> dict:
         payload["loadavg"] = [round(load1, 2), round(load5, 2), round(load15, 2)]
     except Exception:
         pass
+    # CPU temperature for the middle-shell colour. Pi 5 exposes
+    # thermal_zone0 as the SoC die. Value is millidegrees C. We try
+    # every zone and return the hottest one — covers RPi, x86 boxes,
+    # whatever — never raises, missing sysfs is just `None`.
+    payload["cpu_temp_c"] = _read_cpu_temp_c()
     return payload
+
+
+_THERMAL_BASE = Path("/sys/class/thermal")
+
+
+def _read_cpu_temp_c() -> float | None:
+    """Hottest /sys/class/thermal/thermal_zone*/temp reading in °C,
+    or None if sysfs is unavailable. Cheap (a few text reads) so safe
+    to call every snapshot."""
+    if not _THERMAL_BASE.is_dir():
+        return None
+    hottest: float | None = None
+    try:
+        for zone in _THERMAL_BASE.iterdir():
+            tpath = zone / "temp"
+            if not tpath.exists():
+                continue
+            try:
+                raw = int(tpath.read_text().strip())
+            except (ValueError, OSError):
+                continue
+            # Linux convention is millidegrees C. A few rare drivers
+            # report tenths of degrees; gate on a plausible range
+            # (-50…200 °C in milli) and fall back to /1000 only.
+            celsius = raw / 1000.0
+            if hottest is None or celsius > hottest:
+                hottest = celsius
+    except OSError:
+        return None
+    if hottest is None:
+        return None
+    return round(hottest, 1)
 
 
 def _vault_turn_is_cognitive(turn: dict) -> bool:
@@ -645,6 +751,28 @@ def _vault_runtime_state() -> dict:
                 _vault_activity_until = now + float(os.environ.get("DISPLAY_VAULT_ACTIVITY_HOLD_SECONDS", "8"))
         cognitive_active = background_active or now < _vault_activity_until
         remaining = max(0.0, _vault_activity_until - now)
+    # Wikipedia ingest liveness — drives the yellow "ingesting" tint
+    # + faster outer-ring spin on the kiosk display. False when health
+    # is missing/stale rather than absent (we don't want unreachable
+    # to *look like* ingestion).
+    #
+    # Predictive override: the supervisor polls every ~5s, so there's
+    # a brief window between a vault LLM dispatch and the supervisor's
+    # actual SIGTERM where the ingest child is still alive but about
+    # to die. During that window vault is using the GPU; treating the
+    # ingest as paused makes the display match the *intended* state
+    # instead of the literal-process state. We treat any Ollama
+    # activity within the supervisor's busy-window (matches default
+    # VAULT_INGEST_USER_ACTIVITY_WINDOW=120s) as "paused".
+    ingesting = False
+    if isinstance(health, dict) and not unreachable:
+        ingestion = health.get("ingestion")
+        if isinstance(ingestion, dict):
+            ingesting = bool(ingestion.get("running"))
+        if ingesting:
+            since_ollama = health.get("seconds_since_ollama_activity")
+            if isinstance(since_ollama, (int, float)) and since_ollama < 120:
+                ingesting = False
     return {
         "ok": bool(health and health.get("ok")) and not unreachable,
         "url": _VAULT_URL,
@@ -653,6 +781,7 @@ def _vault_runtime_state() -> dict:
         "cognitive_remaining_seconds": round(remaining, 1),
         "background_active": background_active,
         "latest_turn_cognitive": cognitive_turn,
+        "ingesting": ingesting,
     }
 
 

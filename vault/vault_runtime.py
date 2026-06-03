@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import threading
 import time
 
+log = logging.getLogger("vault.runtime")
+
 from blackboard import Blackboard
 from background_manager import BackgroundManager
 from capability_registry import CapabilityRegistry
 from chat_sessions import ChatSessionManager
+from classroom import ClassroomController
 from command_agent import CommandAgent
 from config import DATA_DIR, INSTALLED_CAPABILITIES_DIR
 from event_log import EventLog
@@ -47,6 +51,46 @@ _UPDATES_COMMANDS = {
     "get updates",
     "check updates",
 }
+
+
+_VAULT_EXPECTED_UNITS = [
+    "vault-runtime.service",
+    "code-monkey.service",
+    "world-ingest-supervisor.service",
+    "vault-autosync.timer",
+    "luhkas-world-watchdog.timer",
+    "world-compact.timer",
+]
+
+
+def _systemd_unit_status(unit: str) -> dict:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1.5,
+        )
+    except Exception as exc:
+        return {"ok": False, "active": False, "state": "unknown", "error": str(exc)}
+    state = (result.stdout or result.stderr or "").strip() or "unknown"
+    return {
+        "ok": result.returncode == 0 and state == "active",
+        "active": result.returncode == 0 and state == "active",
+        "state": state,
+    }
+
+
+def _vault_own_services_status() -> dict:
+    units = {unit: _systemd_unit_status(unit) for unit in _VAULT_EXPECTED_UNITS}
+    down = [unit for unit, status in units.items() if not status.get("ok")]
+    return {
+        "ok": not down,
+        "expected": list(_VAULT_EXPECTED_UNITS),
+        "down": down,
+        "units": units,
+    }
 
 _JOBS_COMMANDS = {
     "jobs",
@@ -173,28 +217,6 @@ def _is_correction_of_previous(text: str) -> bool:
     return bool(_CORRECTION_OF_PREVIOUS_RE.search(str(text).strip()))
 
 
-def _extract_correction(text: str) -> str | None:
-    """Deprecated fast-path heuristic — only catches the most unambiguous
-    leading-"no"/"nope"/"nah" forms. Anything subtler is now decided by the
-    LLM intent classifier (LearnedCapabilityEngine.classify_pending_intent)
-    called from the handlers when this returns None.
-
-    Kept as a cheap pre-check so plain "no, hardware" responses don't pay an
-    extra LLM round-trip."""
-    import re
-    raw = str(text or "").strip()
-    lowered = raw.lower()
-    for pattern in (
-        r"^no[,.]?\s+(.+)$",
-        r"^nope[,.]?\s+(.+)$",
-        r"^nah[,.]?\s+(.+)$",
-    ):
-        match = re.match(pattern, lowered)
-        if match:
-            return match.group(1).strip()
-    return None
-
-
 class VaultRuntime:
     """Stateful main-vault orchestrator used by CLI and service frontends."""
 
@@ -234,6 +256,21 @@ class VaultRuntime:
         # for the learning aggregator (Layer 3) to consume later. Disable
         # via VAULT_CHAT_SESSIONS_ENABLE=0.
         self.chat_sessions = ChatSessionManager(DATA_DIR / "chat_sessions")
+        # Per-node pending-decision state. Previously the Blackboard
+        # held a single ``pending_decision`` slot; with two presence
+        # nodes confirming capabilities concurrently the second writer
+        # silently overwrote the first. Now vault-set pendings (every
+        # type registered in ``_PENDING_HANDLERS``) live here, keyed by
+        # node_id; the Blackboard slot is kept as a fallback for
+        # router-set pendings (code_monkey_requirements etc.) which
+        # don't know node_id today.
+        self._node_pendings: dict[str, dict] = {}
+        self._node_pendings_lock = threading.Lock()
+        # Classroom mode controller. While a session has mode=classroom,
+        # every user turn routes through this instead of the planner,
+        # and the chat path is replaced with a pedagogy-aware prompt.
+        # Lazy models — first lesson pays the load.
+        self.classroom = ClassroomController(self.chat_sessions)
         # Per-node active_task_id so multi-node sessions don't clobber each other
         self._node_task_ids: dict = {}
         # In-flight background workers — description/package → started_at unix.
@@ -274,26 +311,9 @@ class VaultRuntime:
         lowered = user_input.lower()
         command_text = _command_text(user_input)
 
-        if command_text in _UPDATES_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self._show_updates_with_progress(),
-                "code_monkey_updates",
-            ))
-
-        if command_text in _JOBS_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self.router.show_jobs(self.active_task_id),
-                "code_monkey_jobs",
-            ))
-
-        if command_text in _CODE_MONKEY_HEALTH_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self.router.show_code_monkey_health(self.active_task_id),
-                "code_monkey_health",
-            ))
-
-        if command_text in _AUDIT_CAPS_COMMANDS:
-            return self._remember_active(self._start_audit_caps(node_id))
+        cmd_response = self._try_runtime_command_dispatch(command_text, node_id)
+        if cmd_response is not None:
+            return cmd_response
 
         install_response = self._maybe_handle_install_command(user_input, node_id)
         if install_response is not None:
@@ -336,30 +356,9 @@ class VaultRuntime:
 
         pending = self._get_pending(node_id)
 
-        if isinstance(pending, dict) and pending.get("type") == "learned_capability_confirmation":
-            learned_flow = self._handle_learned_capability_confirmation(user_input, node_id)
-            if learned_flow is not None:
-                return learned_flow
-
-        if isinstance(pending, dict) and pending.get("type") == "learned_execution_review":
-            review = self._handle_learned_execution_review(user_input, node_id)
-            if review is not None:
-                return review
-
-        if isinstance(pending, dict) and pending.get("type") == "learned_install_confirmation":
-            install_flow = self._handle_learned_install_confirmation(user_input, node_id)
-            if install_flow is not None:
-                return install_flow
-
-        if isinstance(pending, dict) and pending.get("type") == "audit_merge_confirmation":
-            audit_flow = self._handle_audit_merge_confirmation(user_input, node_id)
-            if audit_flow is not None:
-                return audit_flow
-
-        if isinstance(pending, dict) and pending.get("type") == "memory_update_confirmation":
-            memory_flow = self._handle_memory_update_confirmation(user_input, node_id)
-            if memory_flow is not None:
-                return memory_flow
+        pending_result = self._try_pending_handler(user_input, node_id, pending=pending)
+        if pending_result is not None:
+            return pending_result
 
         # Requirements gathering and review sessions receive raw user text — no intent
         # classification needed since the agents handle their own conversation logic.
@@ -398,6 +397,19 @@ class VaultRuntime:
                 )
                 return self._remember_active(response)
 
+        # If the active session is in classroom mode, route the turn
+        # through the controller. It handles exit/pause phrases
+        # deterministically and otherwise calls the chat model with a
+        # pedagogy-aware prompt. Returns None if no classroom session
+        # is active, in which case we fall through to normal routing.
+        try:
+            classroom_response = self.classroom.maybe_handle_turn(user_input, node_id)
+            if classroom_response is not None:
+                classroom_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(classroom_response)
+        except Exception as exc:
+            log.warning("classroom.maybe_handle_turn failed: %s", exc)
+
         # Deterministic command routing — zero LLM cost for known capability commands.
         cmd_response = self.command_agent.handle(user_input)
         if cmd_response is not None:
@@ -409,6 +421,16 @@ class VaultRuntime:
             return learned_response
 
         plan = self.planner.decide(user_input)
+
+        # Intercept classroom subsystem before router.route, because the
+        # controller needs node_id (which router doesn't currently
+        # thread through) to operate on chat_sessions.
+        if plan.get("subsystem") == "classroom":
+            classroom_plan_response = self._dispatch_classroom_plan(
+                plan, user_input, node_id,
+            )
+            if classroom_plan_response is not None:
+                return self._remember_active(classroom_plan_response)
 
         response = self.router.route(
             plan=plan,
@@ -457,8 +479,12 @@ class VaultRuntime:
                  f"Person detected by scout\nRouted to: {', '.join(node_ids)}"],
                 timeout=5,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # The notification is the user's last-resort signal in a
+            # guard event; silent failure was hiding real misconfigs
+            # (notify-send not installed, no $DISPLAY, dbus unreachable).
+            log.warning("guard OS notify-send failed (nodes=%s): %s",
+                        node_ids, exc)
 
     def handle_presence(self, message: str, node_id: str = "scout", presence_context: dict | None = None):
         """Route a presence/chat message through the scout bridge and return an
@@ -488,6 +514,12 @@ class VaultRuntime:
                 # response will be attached as another turn via
                 # add_turn() at the end.
                 pass
+            elif active is not None and active.mode == "classroom":
+                # Classroom sessions span many turns by design — never
+                # close-and-reopen mid-lesson. The controller closes the
+                # session explicitly on end/complete; for any other turn
+                # we just extend.
+                pass
             else:
                 # Either no active session, or the previous one is no
                 # longer waiting — close/park it and start fresh.
@@ -501,7 +533,7 @@ class VaultRuntime:
             # without needing a background thread.
             self.chat_sessions.sweep_idle()
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions bookkeeping failed: {exc}", flush=True)
+            log.warning("chat_sessions bookkeeping failed: %s", exc)
         # User-is-here signal: bump activity FIRST so the registry's
         # currently_active_node_ids() check sees this node as active,
         # then drain any deferred alerts onto this node's queue, then
@@ -517,13 +549,10 @@ class VaultRuntime:
         try:
             drained = self.node_registry.flush_pending_to(node_id)
             if drained:
-                print(
-                    f"[runtime] flushed {drained} deferred alert(s) to {node_id}",
-                    flush=True,
-                )
+                log.info("flushed %d deferred alert(s) to %s", drained, node_id)
             inline = self.node_registry.pop_alerts(node_id)
         except Exception as exc:
-            print(f"[runtime] flush_pending_to({node_id}) failed: {exc}", flush=True)
+            log.warning("flush_pending_to(%s) failed: %s", node_id, exc)
             inline = []
         self._inline_alerts_tls.alerts = list(inline or [])
         if isinstance(presence_context, dict):
@@ -634,7 +663,7 @@ class VaultRuntime:
             if turn_idx >= 0:
                 self.chat_sessions.add_turn(node_id, turn_idx)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.add_turn failed: {exc}", flush=True)
+            log.warning("chat_sessions.add_turn failed: %s", exc)
         # Promotion-engine capture: record what the router picked for
         # this phrase. Becomes a silent_route candidate in the session's
         # outcome.learned at close time; the learning_promoter (future)
@@ -660,7 +689,7 @@ class VaultRuntime:
             ):
                 self.chat_sessions.record_route(node_id, phrase=message, route=route_name)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.record_route failed: {exc}", flush=True)
+            log.warning("chat_sessions.record_route failed: %s", exc)
         return self._enrich(result, node_id)
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
@@ -675,25 +704,9 @@ class VaultRuntime:
         if not text:
             return None
 
-        learned_flow = self._handle_learned_capability_confirmation(message, node_id)
-        if learned_flow is not None:
-            return learned_flow
-
-        review = self._handle_learned_execution_review(message, node_id)
-        if review is not None:
-            return review
-
-        install_flow = self._handle_learned_install_confirmation(message, node_id)
-        if install_flow is not None:
-            return install_flow
-
-        audit_flow = self._handle_audit_merge_confirmation(message, node_id)
-        if audit_flow is not None:
-            return audit_flow
-
-        memory_flow = self._handle_memory_update_confirmation(message, node_id)
-        if memory_flow is not None:
-            return memory_flow
+        pending_result = self._try_pending_handler(message, node_id)
+        if pending_result is not None:
+            return pending_result
 
         pending = self._get_pending(node_id)
         if pending and pending.get("type") in {
@@ -709,26 +722,20 @@ class VaultRuntime:
         }:
             return self.handle(message, node_id=node_id)
 
-        if text in _UPDATES_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self._show_updates_with_progress(),
-                "code_monkey_updates",
-            ))
+        # Active classroom session intercept — same as in handle(). Lets
+        # exit phrases and on-topic chat run before any other deterministic
+        # routing competes for these turns.
+        try:
+            classroom_response = self.classroom.maybe_handle_turn(message, node_id)
+            if classroom_response is not None:
+                classroom_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(classroom_response)
+        except Exception as exc:
+            log.warning("classroom.maybe_handle_turn (presence) failed: %s", exc)
 
-        if text in _JOBS_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self.router.show_jobs(self.active_task_id),
-                "code_monkey_jobs",
-            ))
-
-        if text in _CODE_MONKEY_HEALTH_COMMANDS:
-            return self._remember_active(self._runtime_command_response(
-                self.router.show_code_monkey_health(self.active_task_id),
-                "code_monkey_health",
-            ))
-
-        if text in _AUDIT_CAPS_COMMANDS:
-            return self._remember_active(self._start_audit_caps(node_id))
+        cmd_response = self._try_runtime_command_dispatch(text, node_id)
+        if cmd_response is not None:
+            return cmd_response
 
         install_response = self._maybe_handle_install_command(message, node_id)
         if install_response is not None:
@@ -745,7 +752,7 @@ class VaultRuntime:
             command_response["deterministic_source"] = "installed_capability_command"
             return self._remember_active(command_response)
 
-        capability_response = self._handle_named_capability_command(text)
+        capability_response = self._handle_named_capability_command(text, node_id=node_id)
         if capability_response is not None:
             return self._remember_active(capability_response)
 
@@ -1034,6 +1041,73 @@ class VaultRuntime:
         }
         return response
 
+    def _try_runtime_command_dispatch(self, text: str, node_id: str) -> dict | None:
+        """Four direct command-set dispatches that were bit-identical in
+        ``handle()`` and ``_handle_deterministic_presence_command``:
+        updates, jobs, code-monkey health, audit-caps. Returns the
+        response, or None when nothing matches. Lives here so the two
+        callers can never drift apart.
+        """
+        if text in _UPDATES_COMMANDS:
+            return self._remember_active(self._runtime_command_response(
+                self._show_updates_with_progress(),
+                "code_monkey_updates",
+            ))
+        if text in _JOBS_COMMANDS:
+            return self._remember_active(self._runtime_command_response(
+                self.router.show_jobs(self.active_task_id),
+                "code_monkey_jobs",
+            ))
+        if text in _CODE_MONKEY_HEALTH_COMMANDS:
+            return self._remember_active(self._runtime_command_response(
+                self.router.show_code_monkey_health(self.active_task_id),
+                "code_monkey_health",
+            ))
+        if text in _AUDIT_CAPS_COMMANDS:
+            return self._remember_active(self._start_audit_caps(node_id))
+        return None
+
+    # Maps pending-state types to their handler method name and whether
+    # the handler's result should be wrapped with _remember_active before
+    # returning. Used by _try_pending_handler so handle() and
+    # _handle_deterministic_presence_command don't need to duplicate the
+    # cascade. To add a new pending type, register it here and write the
+    # handler — both code paths pick it up automatically.
+    _PENDING_HANDLERS: dict[str, tuple[str, bool]] = {
+        "learned_capability_confirmation": ("_handle_learned_capability_confirmation", False),
+        "learned_execution_review":        ("_handle_learned_execution_review", False),
+        "learned_install_confirmation":    ("_handle_learned_install_confirmation", False),
+        "audit_merge_confirmation":        ("_handle_audit_merge_confirmation", False),
+        "memory_update_confirmation":      ("_handle_memory_update_confirmation", False),
+        "classroom_subject_prompt":        ("_handle_classroom_subject_prompt", True),
+    }
+
+    def _try_pending_handler(self, message: str, node_id: str,
+                              *, pending: dict | None = None) -> dict | None:
+        """Run the registered handler for the current pending state, if
+        any. Returns the handler's response (optionally wrapped with
+        _remember_active per the registry), or None when no pending
+        state is active OR the handler chooses to no-op.
+
+        ``pending`` is accepted as a parameter so callers that already
+        looked it up (handle()) don't pay a second _get_pending call.
+        """
+        if pending is None:
+            pending = self._get_pending(node_id)
+        if not isinstance(pending, dict):
+            return None
+        entry = self._PENDING_HANDLERS.get(pending.get("type"))
+        if entry is None:
+            return None
+        handler_name, wrap = entry
+        handler = getattr(self, handler_name, None)
+        if handler is None:
+            return None
+        result = handler(message, node_id)
+        if result is None:
+            return None
+        return self._remember_active(result) if wrap else result
+
     def _learned_engine(self) -> LearnedCapabilityEngine:
         engine = getattr(self, "learned_capabilities", None)
         if engine is None:
@@ -1053,7 +1127,7 @@ class VaultRuntime:
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.{label} failed: {exc}", flush=True)
+            log.warning("chat_sessions.%s failed: %s", label, exc)
             return None
 
     def _set_pending(self, value: dict | None, node_id: str | None = None) -> None:
@@ -1063,21 +1137,39 @@ class VaultRuntime:
             value = dict(value)
             value.setdefault("_node_id", node_id or value.get("node_id"))
             value["_expires_at"] = time.time() + self.PENDING_TTL_SECONDS
-        if hasattr(self.blackboard, "set_pending_decision"):
-            self.blackboard.set_pending_decision(value)
+        nid = node_id or (value.get("_node_id") if isinstance(value, dict) else None) or self._current_node_id
+        if nid:
+            # Per-node slot — survives concurrent confirmations from
+            # other nodes without race-overwriting.
+            with self._node_pendings_lock:
+                if value is None:
+                    self._node_pendings.pop(nid, None)
+                else:
+                    self._node_pendings[nid] = value
         else:
-            self.blackboard.pending = value
+            # Caller couldn't supply a node_id (background sweeps, CLI
+            # without context). Fall back to the legacy single slot —
+            # only safe when at most one such caller is active.
+            if hasattr(self.blackboard, "set_pending_decision"):
+                self.blackboard.set_pending_decision(value)
+            else:
+                self.blackboard.pending = value
         # Shadow-mirror to chat_session.awaiting so the session record
-        # carries the same prompt the user is being asked. Errors here
-        # never propagate — chat_sessions is observational in 1A.
+        # carries the same prompt the user is being asked.
         try:
-            nid = node_id or (value.get("_node_id") if isinstance(value, dict) else None) or self._current_node_id
             if nid:
                 self.chat_sessions.set_awaiting(nid, value)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.set_awaiting (set) failed: {exc}", flush=True)
+            log.warning("chat_sessions.set_awaiting (set) failed: %s", exc)
 
     def _clear_pending(self) -> None:
+        nid = self._current_node_id
+        if nid:
+            with self._node_pendings_lock:
+                self._node_pendings.pop(nid, None)
+        # Also clear the legacy single slot — covers the case where the
+        # pending was set by router (which has no node_id) and is now
+        # being resolved through this code path.
         if hasattr(self.blackboard, "clear_pending_decision"):
             self.blackboard.clear_pending_decision()
         else:
@@ -1086,11 +1178,10 @@ class VaultRuntime:
         # Use _resolve_pending(node_id, outcome) when the confirmation
         # actually resolved and the session should close with a record.
         try:
-            nid = self._current_node_id
             if nid:
                 self.chat_sessions.set_awaiting(nid, None)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.set_awaiting (clear) failed: {exc}", flush=True)
+            log.warning("chat_sessions.set_awaiting (clear) failed: %s", exc)
 
     # ---- Phase 1B: session as source of truth -------------------------
 
@@ -1120,16 +1211,31 @@ class VaultRuntime:
             if node_id:
                 self.chat_sessions.close(node_id, outcome=outcome)
         except Exception as exc:
-            print(f"[vault_runtime] chat_sessions.close failed: {exc}", flush=True)
+            log.warning("chat_sessions.close failed: %s", exc)
 
     def _get_pending(self, node_id: str | None = None) -> dict | None:
-        """Read pending decision scoped to a node. Returns None if the
-        pending was set by a different node OR if it has expired (in which
-        case the expired pending is cleared as a side-effect).
+        """Read pending decision scoped to a node. Checks the per-node
+        store first, then falls back to the Blackboard's single slot
+        (which holds router-set pendings — code_monkey_requirements
+        etc. — that don't currently know node_id).
 
-        Pass node_id=None to bypass node scoping (still respects TTL) -- used
-        by background sweeps that need to see the raw state."""
-        raw = self.blackboard.get_pending_decision() if hasattr(self.blackboard, "get_pending_decision") else getattr(self.blackboard, "pending", None)
+        Returns None if the pending was set by a different node OR if
+        it has expired (in which case the expired pending is cleared
+        as a side-effect).
+
+        Pass node_id=None to bypass node scoping (still respects TTL);
+        used by background sweeps that need to see the raw state.
+        """
+        raw: dict | None = None
+        if node_id is not None:
+            with self._node_pendings_lock:
+                raw = self._node_pendings.get(node_id)
+        if raw is None:
+            raw = (
+                self.blackboard.get_pending_decision()
+                if hasattr(self.blackboard, "get_pending_decision")
+                else getattr(self.blackboard, "pending", None)
+            )
         if not isinstance(raw, dict):
             return raw
         expires_at = raw.get("_expires_at")
@@ -1930,10 +2036,74 @@ class VaultRuntime:
             "response_composed": True,
         }))
 
-    def _handle_named_capability_command(self, text: str) -> dict | None:
-        for capability in self.registry.list():
-            if not _matches_named_item(text, capability):
-                continue
+    def _handle_classroom_subject_prompt(self, message: str, node_id: str) -> dict | None:
+        """Resolve a ``classroom_subject_prompt`` pending state by handing
+        the user's reply to the controller as the lesson subject. The
+        controller cancels gracefully on cancel-words, or routes to
+        ``start_lesson`` otherwise. Always clears the pending state."""
+        pending = self._get_pending(node_id)
+        if not (isinstance(pending, dict) and pending.get("type") == "classroom_subject_prompt"):
+            return None
+        identity = self.scout.active_identity if hasattr(self.scout, "active_identity") else None
+        # Clear the pending FIRST so a failed start_lesson doesn't leave
+        # the user stuck in the prompt.
+        self._resolve_pending(node_id, outcome={
+            "action": "classroom_subject_resolved",
+            "result": {"subject_text": message[:200]},
+            "learned": [],
+        })
+        try:
+            response = self.classroom.resolve_subject_prompt(message, node_id, identity=identity)
+        except Exception as exc:
+            log.warning("classroom resolve_subject_prompt failed: %s", exc)
+            return {
+                "mode": "direct",
+                "message": f"Classroom subject prompt failed: {exc}",
+                "active_task_id": self.active_task_id,
+            }
+        response.setdefault("active_task_id", self.active_task_id)
+        response.setdefault("deterministic_source", "classroom:subject_prompt_resolved")
+        return response
+
+    def _dispatch_classroom_plan(self, plan: dict, user_input: str,
+                                  node_id: str) -> dict | None:
+        """Route a planner decision whose subsystem is "classroom" to the
+        ClassroomController. Returns the chat-shaped response, or None if
+        the action isn't recognized (caller falls back to router.route)."""
+        action = plan.get("action") or ""
+        try:
+            if action == "start":
+                response = self.classroom.start_lesson(user_input, node_id)
+            elif action == "open":
+                response = self.classroom.prompt_for_subject(node_id)
+            elif action == "resume":
+                response = self.classroom.resume_lesson(node_id)
+            elif action == "end":
+                response = self.classroom.end_lesson(node_id)
+            else:
+                return None
+        except Exception as exc:
+            log.warning("classroom dispatch (%s) failed: %s", action, exc)
+            return {
+                "mode": "direct",
+                "message": f"Classroom action '{action}' failed: {exc}",
+                "active_task_id": self.active_task_id,
+            }
+        # If the controller asked for a pending state (subject_prompt
+        # flow), install it so the next user turn routes back through
+        # the classroom resolver.
+        pending = response.pop("pending", None)
+        if isinstance(pending, dict):
+            self._set_pending(pending, node_id=node_id)
+        response.setdefault("active_task_id", self.active_task_id)
+        response.setdefault("deterministic_source", f"classroom:{action}")
+        return response
+
+    def _handle_named_capability_command(self, text: str, node_id: str | None = None) -> dict | None:
+        # O(1) alias lookup via the registry's precomputed index — was
+        # an O(N × alias-count) linear scan per presence turn.
+        capability = self.registry.lookup_by_alias(text)
+        if capability is not None:
             subsystem = capability.get("subsystem")
             action = capability.get("action")
             if subsystem == "event_log":
@@ -1963,6 +2133,11 @@ class VaultRuntime:
                 )
             if subsystem == "chat_agent":
                 return None
+            if subsystem == "classroom":
+                if node_id is None:
+                    node_id = self._last_active_node_id or "cli"
+                fake_plan = {"subsystem": "classroom", "action": action}
+                return self._dispatch_classroom_plan(fake_plan, text, node_id)
             return {
                 "mode": "direct",
                 "message": f"Capability `{capability.get('name')}` is registered, but I do not have a deterministic executor for subsystem `{subsystem}`.",
@@ -2003,12 +2178,6 @@ class VaultRuntime:
             )
         return None
 
-    def handle_presence_message(self, message, source=None):
-        return self.scout.handle_message(message, source=source)
-
-    def handle_chat(self, message, source=None):
-        return self.handle_presence_message(message, source=source)
-
     def health(self):
         try:
             code_monkey = self.router.code_monkey.health()
@@ -2018,23 +2187,56 @@ class VaultRuntime:
                 "error": str(exc),
             }
 
+        own_services = _vault_own_services_status()
         last_user = float(self._last_user_activity_at or 0.0)
+
+        # Lightweight ingestion liveness for the kiosk display (visual
+        # cue: yellow outer ring + faster spin when active). Pulled
+        # from ingest_admin so detection covers both the manual runner
+        # and the always-on supervisor service. Wrapped in try/except
+        # so a libzim/state-file glitch can never break /health.
+        ingestion_running = False
+        try:
+            from world import ingest_admin
+            ingestion_running, _ = ingest_admin._process_running()
+        except Exception:
+            pass
+
+        # Time of the last Ollama dispatch (chat, embed, generate). The
+        # wiki-ingest supervisor uses this — not `last_user_activity_at`
+        # — to decide when to pause: VRAM contention only matters when
+        # an actual GPU model is running, so deterministic routes that
+        # don't invoke Ollama no longer pause ingest unnecessarily.
+        last_ollama = 0.0
+        try:
+            import models as _models
+            last_ollama = float(_models.get_last_ollama_activity_at() or 0.0)
+        except Exception:
+            pass
+
         return {
-            "ok": True,
+            "ok": bool(own_services.get("ok")) and bool(code_monkey.get("ok", True)),
             "service": "vault_runtime",
             "presence_owner": "vault_pc",
             "active_task_id": self.active_task_id,
             "models": model_manifest(),
             "model_warmup": self.model_warmup,
             "code_monkey": code_monkey,
+            "own_services": own_services,
+            "services_down": own_services.get("down", []),
             "scout": {
                 "url": self.scout.scout_url,
                 "active_identity": self.scout.active_identity,
             },
+            "ingestion": {"running": ingestion_running},
             # Used by the world-ingest supervisor (and useful for debugging
             # idle detection generally). 0 means no user message seen yet.
             "last_user_activity_at": last_user,
             "seconds_since_user_activity": (time.time() - last_user) if last_user > 0 else None,
+            # Precise GPU-contention signal: timestamp of the last Ollama
+            # call from this process. 0 means no LLM/embed activity yet.
+            "last_ollama_activity_at": last_ollama,
+            "seconds_since_ollama_activity": (time.time() - last_ollama) if last_ollama > 0 else None,
         }
 
     def _remember_active(self, response):

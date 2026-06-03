@@ -35,10 +35,79 @@ LOG_FILE = Path(os.environ.get(
     "WORLD_INGEST_LOG_FILE",
     "/home/vault/world_data/logs/ingest_wiki.log",
 ))
-# Conservative pre-filter estimate of how many ZIM entries are real
-# articles vs soft-redirects/non-html. Used only for ETA display.
-ZIM_REAL_ARTICLE_FRACTION = float(os.environ.get("WORLD_ZIM_REAL_FRACTION", "0.55"))
+# Systemd unit that supervises the ingest when run via the
+# always-on `world-ingest-supervisor.service` (as opposed to a one-off
+# `run_full_ingest.sh start`). The supervisor doesn't write SCOPE_FILE
+# or PID_FILE — the child runs inside the service's cgroup directly —
+# so liveness has to check the service itself.
+SUPERVISOR_SERVICE = os.environ.get(
+    "WORLD_INGEST_SUPERVISOR_SERVICE", "world-ingest-supervisor.service",
+)
+# Path to the ZIM the supervisor is ingesting. Used to read official
+# entry-count metadata for ETA calibration. Mirrors the default in
+# ingest_supervisor.py.
+ZIM_PATH = Path(os.environ.get(
+    "WORLD_ZIM_PATH",
+    "/home/vault/world_data/zim/wikipedia_en_all_nopic_2026-03.zim",
+))
+
+# Fraction of ZIM entries that are real prose articles (vs redirects,
+# media, css/js). Used only for ETA display.
+#
+# Default 0.43 derives from the ZIM's own `Counter` metadata for the
+# 2026-03 nopic dump:
+#   text/html entries = 8,452,796
+#   all_entry_count   = 19,551,522
+#   → 0.4323 (the other 57% is redirects + media)
+#
+# `_calibrate_from_zim()` (called on import) opens the live ZIM and
+# overrides this with the file's actual ratio, so a new dump
+# automatically self-calibrates. The env override and the literal
+# 0.43 are only used if libzim is unavailable or the ZIM path is
+# wrong.
+ZIM_REAL_ARTICLE_FRACTION = float(os.environ.get("WORLD_ZIM_REAL_FRACTION", "0.43"))
 ZIM_TOTAL_ENTRIES_FALLBACK = int(os.environ.get("WORLD_ZIM_TOTAL_ENTRIES", "19551505"))
+
+
+def _calibrate_from_zim() -> None:
+    """Read official entry counts from the live ZIM and update the
+    module-level constants. Silent no-op on any failure — the
+    hardcoded fallbacks are accurate for the 2026-03 nopic dump."""
+    global ZIM_REAL_ARTICLE_FRACTION, ZIM_TOTAL_ENTRIES_FALLBACK
+    # Env override is authoritative — skip auto-calibration if user
+    # explicitly set a value.
+    if "WORLD_ZIM_REAL_FRACTION" in os.environ:
+        return
+    if not ZIM_PATH.exists():
+        return
+    try:
+        import libzim.reader as _zr  # local import; libzim is heavy
+        z = _zr.Archive(str(ZIM_PATH))
+        total = int(z.all_entry_count)
+        # Parse `Counter` metadata: "mime1=count1;mime2=count2;..."
+        # text/html appears with a charset suffix in some dumps, so
+        # match by prefix.
+        raw = z.get_metadata("Counter").decode("utf-8", errors="replace")
+        html = 0
+        for part in raw.split(";"):
+            if "=" not in part:
+                continue
+            mime, _, n = part.rpartition("=")
+            if mime.startswith("text/html"):
+                try:
+                    html += int(n)
+                except ValueError:
+                    pass
+        if total > 0 and html > 0:
+            ZIM_TOTAL_ENTRIES_FALLBACK = total
+            ZIM_REAL_ARTICLE_FRACTION = html / total
+    except Exception:
+        # libzim missing, ZIM unreadable, metadata absent — keep
+        # whatever values were already set.
+        pass
+
+
+_calibrate_from_zim()
 
 
 # Action triggers — each is a tight regex so chat lines like
@@ -157,13 +226,83 @@ def _scope_python_pid(scope: str) -> int | None:
         return None
 
 
-def _process_running() -> tuple[bool, int | None]:
-    """Liveness check.
+def _supervisor_child_pid() -> int | None:
+    """Find the world.ingest_wiki pid inside the supervisor service's
+    cgroup. The supervisor spawns the python child directly (no shell
+    wrapper, no scope file), so we go straight to cgroup.procs."""
+    uid = os.getuid()
+    candidate = Path(
+        f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/"
+        f"app.slice/{SUPERVISOR_SERVICE}/cgroup.procs"
+    )
+    if not candidate.exists():
+        return None
+    try:
+        pids = [
+            int(line.strip())
+            for line in candidate.read_text().splitlines()
+            if line.strip().isdigit()
+        ]
+    except Exception:
+        return None
+    for pid in pids:
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if b"world.ingest_wiki" in cmdline:
+                return pid
+        except Exception:
+            continue
+    return None
 
-    Source of truth is the systemd user scope (if recorded) because the
-    pid file can lag behind reality — bash subshells exit and the actual
-    python ingest pid is only knowable after the scope settles. Falls
-    back to the pid file for non-scope launches."""
+
+def _supervisor_service_active() -> tuple[bool, int | None]:
+    """Diagnostic helper: True if SUPERVISOR_SERVICE is active. Does
+    NOT imply ingest is running — the supervisor is the always-on
+    parent and stays active while it pauses/resumes its child. Use
+    ``_supervisor_child_running()`` for true ingest liveness.
+
+    Returns (service_active, child_pid_or_None)."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", SUPERVISOR_SERVICE],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.stdout.strip() != "active":
+            return False, None
+    except Exception:
+        return False, None
+    return True, _supervisor_child_pid()
+
+
+def _supervisor_child_running() -> tuple[bool, int | None]:
+    """True iff the supervisor service is active AND its python ingest
+    child is currently alive. This is what 'ingest is running' actually
+    means — the supervisor stays up during pauses (auto-pause for GPU
+    contention, idle waits between completion + next ZIM), so service
+    state alone is misleading."""
+    active, pid = _supervisor_service_active()
+    if not active:
+        return False, None
+    if pid is None:
+        return False, None
+    return True, pid
+
+
+def _process_running() -> tuple[bool, int | None]:
+    """Liveness check, in priority order:
+
+    1. Transient scope file (one-off `run_full_ingest.sh start`).
+    2. PID file (legacy non-scope runner launches).
+    3. `world-ingest-supervisor.service` (the always-on systemd unit
+       that owns ingest in the current setup — neither SCOPE_FILE nor
+       PID_FILE is written for this path, so without this check the
+       chat UI would report 'not running' even while ingest is happily
+       writing the state file every few seconds).
+
+    Source of truth for (1) is the systemd user scope (if recorded)
+    because the pid file can lag behind reality — bash subshells exit
+    and the actual python ingest pid is only knowable after the scope
+    settles."""
     scope = None
     if SCOPE_FILE.exists():
         try:
@@ -184,18 +323,23 @@ def _process_running() -> tuple[bool, int | None]:
                 return True, pid or 0
         except Exception:
             pass
-    # Fallback: stale pid-file path for non-scope launches.
-    if not PID_FILE.exists():
-        return False, None
-    try:
-        pid = int(PID_FILE.read_text().strip())
-    except Exception:
-        return False, None
-    try:
-        os.kill(pid, 0)
-        return True, pid
-    except OSError:
-        return False, pid
+    # Stale pid-file path for non-scope direct launches.
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            try:
+                os.kill(pid, 0)
+                return True, pid
+            except OSError:
+                # PID file present but dead — fall through to the
+                # supervisor check rather than reporting the stale pid.
+                pass
+        except Exception:
+            pass
+    # Final fallback: the always-on supervisor service. We require an
+    # actual python child to exist — service active alone isn't enough
+    # because the supervisor stays up during its GPU-busy/idle pauses.
+    return _supervisor_child_running()
 
 
 def _humanize_seconds(s: float) -> str:

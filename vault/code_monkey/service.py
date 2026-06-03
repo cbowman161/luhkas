@@ -43,23 +43,6 @@ FINAL_STATES = {
     "cancelled",
 }
 
-IN_PROGRESS_STATES = {
-    "planning",
-    "building",
-    "built",
-    "testing",
-    "repairing",
-    "running",
-    "claimed",
-}
-
-RUNNABLE_STATES = {
-    "created",
-    "planned",
-    "queued",
-}
-
-
 def _json_bytes(payload: Dict[str, Any]) -> bytes:
     return json.dumps(payload, indent=2, sort_keys=False, default=str).encode("utf-8")
 

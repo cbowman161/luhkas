@@ -295,7 +295,8 @@ class NodeRegistry:
         reg = self._registered.get(node_id, {})
         network = reg.get("network") if isinstance(reg.get("network"), dict) else {}
         ip = network.get("tailscale_ip") or reg.get("ip", "")
-        port = reg.get("services", {}).get(service)
+        service_cfg = reg.get("services", {}).get(service)
+        port = service_cfg.get("port") if isinstance(service_cfg, dict) else service_cfg
         if ip and port:
             return f"http://{ip}:{port}"
         return None

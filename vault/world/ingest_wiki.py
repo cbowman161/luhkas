@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
@@ -406,18 +406,6 @@ def load_existing_article_hashes(store: WorldKnowledgeStore) -> dict[str, str]:
 
 # --- main ingest ------------------------------------------------------------
 
-def _parse_article_worker(args: tuple[str, str, int, int]) -> list[tuple[str, int, str, str]]:
-    """Top-level worker for ProcessPoolExecutor — must be picklable.
-
-    Takes (html, title, max_words, overlap), returns a list of chunk
-    tuples (section_path, chunk_idx, content, content_hash). Tuples
-    instead of dataclass instances so the inter-process pickling stays
-    cheap on the hot path."""
-    sections = parse_article_html(args[0])
-    chunks = chunk_sections(sections, args[1], max_words=args[2], overlap=args[3])
-    return [(c.section_path, c.chunk_idx, c.content, c.content_hash) for c in chunks]
-
-
 def _atomic_write_state(path: str | None, state: dict) -> None:
     if not path:
         return
@@ -444,11 +432,10 @@ def ingest_zim(
     max_words: int = 400,
     overlap: int = 50,
     concurrency: int = 1,
-    parse_workers: int = 0,  # deprecated; serial parse outperformed the pool
-    parse_inflight: int = 0,  # deprecated
     prefetch: bool = True,
     prefetch_queue_size: int = 24,
     state_path: str | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict:
     """Resume-safe ZIM ingest.
 
@@ -604,6 +591,17 @@ def ingest_zim(
 
     try:
         while True:
+            # Article-boundary stop check. The supervisor sends SIGTERM
+            # to a busy ingest worker; if the signal arrives mid-flush,
+            # Python finishes the bytecode step it was on (which means
+            # LanceDB writes complete atomically) and runs the handler
+            # right after. The handler sets stop_event; the next loop
+            # iteration here observes it and breaks BEFORE pulling
+            # another article — guaranteeing the `finally` block flushes
+            # the pending batch atomically, no orphaned chunks.
+            if stop_event is not None and stop_event.is_set():
+                print("[ingest_wiki] stop_event set — exiting main loop", flush=True)
+                break
             item = _next_item()
             if item is None:
                 break
@@ -736,10 +734,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Parallel embed workers. Ollama serves concurrent "
                         "embed requests; 4-8 typically saturates the GPU "
                         "with bge-m3. Ignored with --embedder native.")
-    p.add_argument("--parse-workers", type=int, default=6,
-                   help="(deprecated, ignored — serial parse beat the pool)")
-    p.add_argument("--parse-inflight", type=int, default=12,
-                   help="(deprecated, ignored)")
     p.add_argument("--no-prefetch", dest="prefetch", action="store_false",
                    help="Disable the threaded ZIM iterator/parser prefetch. "
                         "By default, parse runs in a background thread so "
@@ -767,6 +761,24 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.exists(args.zim_path):
         print(f"error: zim not found: {args.zim_path}", file=sys.stderr)
         return 2
+
+    # Graceful-stop handler so SIGTERM (sent by the supervisor on
+    # busy-pause) is observed at an article boundary rather than
+    # interrupting a flush mid-write — the latter can orphan chunks
+    # whose article markers never land. The handler does the minimum
+    # possible (sets the flag); the main loop reads it between articles
+    # and the ``finally`` in ingest_zim then runs a final atomic flush.
+    import signal
+    stop_event = threading.Event()
+
+    def _on_stop(signum, _frame):
+        if not stop_event.is_set():
+            print(f"[ingest_wiki] received signal {signum} — will stop "
+                  "at next article boundary", flush=True)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _on_stop)
+    signal.signal(signal.SIGINT, _on_stop)
 
     # Resolve the resume cursor FIRST — before overwriting the state
     # file with the starter stub. Previously the stub wrote
@@ -833,11 +845,10 @@ def main(argv: list[str] | None = None) -> int:
         max_words=args.max_words,
         overlap=args.overlap,
         concurrency=args.concurrency,
-        parse_workers=args.parse_workers,
-        parse_inflight=args.parse_inflight,
         prefetch=args.prefetch,
         prefetch_queue_size=args.prefetch_queue,
         state_path=args.state_file,
+        stop_event=stop_event,
     )
     print(json.dumps(stats, indent=2))
     return 0
