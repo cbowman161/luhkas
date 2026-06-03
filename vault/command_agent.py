@@ -103,9 +103,6 @@ class CommandAgent:
                         return {"cmd": cmd, "extracted": extracted, "args": {}}
                 else:
                     var_names = re.findall(r"\{([^}]+)\}", trigger)
-                    regex = re.escape(trigger)
-                    regex = re.sub(r"\\\{[^}]+\\\}", r"(.+?)", regex)
-                    regex = regex.rstrip(r"\?") + r"(.*)$"
                     # Build a pattern where all but last group are non-greedy,
                     # last captures the remainder.
                     parts = trigger.split("{")

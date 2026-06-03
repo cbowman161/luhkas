@@ -1,5 +1,6 @@
 import json
 
+from agents._json_utils import extract_json as _extract_json
 from models import get_model
 
 
@@ -138,6 +139,3 @@ class RequirementsAgent:
             return {"done": False, "question": question}
         except Exception:
             return {"done": True, "goal": fallback_goal}
-
-
-from agents._json_utils import extract_json as _extract_json  # noqa: E402

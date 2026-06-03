@@ -949,7 +949,14 @@ class ClassroomController:
         steps = module.steps or []
         if step_idx >= len(steps):
             # Shouldn't normally happen — advance to next module.
-            return self._advance_after_check(node_id, lesson, mode_state, passed=True)
+            new_state = dict(mode_state)
+            new_state["module_idx"] = int(new_state.get("module_idx", 0)) + 1
+            new_state["step_idx"] = 0
+            new_state["awaiting_check"] = False
+            if new_state["module_idx"] >= len(lesson.modules):
+                return self._finish_lesson(node_id, lesson)
+            self.chat_sessions.update_mode_state(node_id, new_state)
+            return {"mode": "direct", "message": "(advancing)", "classroom": {"event": "advance"}}
 
         current_step = steps[step_idx]
         awaiting_check = bool(mode_state.get("awaiting_check"))
@@ -1245,21 +1252,6 @@ class ClassroomController:
             ),
             "classroom": {"event": "complete", "lesson_id": lesson.id},
         })
-
-    def _advance_after_check(self, node_id: str, lesson: Lesson,
-                              mode_state: dict, passed: bool) -> dict:
-        # Defensive helper; not currently used because turn handling
-        # rolls advance into the main response. Kept for future
-        # explicit-grade flows.
-        new_state = dict(mode_state)
-        if passed:
-            new_state["module_idx"] = int(new_state.get("module_idx", 0)) + 1
-            new_state["step_idx"] = 0
-        new_state["awaiting_check"] = False
-        if new_state["module_idx"] >= len(lesson.modules):
-            return self._finish_lesson(node_id, lesson)
-        self.chat_sessions.update_mode_state(node_id, new_state)
-        return {"mode": "direct", "message": "(advancing)", "classroom": {"event": "advance"}}
 
     # ---- helpers -----------------------------------------------------
 

@@ -1150,10 +1150,7 @@ class VaultRuntime:
             # Caller couldn't supply a node_id (background sweeps, CLI
             # without context). Fall back to the legacy single slot —
             # only safe when at most one such caller is active.
-            if hasattr(self.blackboard, "set_pending_decision"):
-                self.blackboard.set_pending_decision(value)
-            else:
-                self.blackboard.pending = value
+            self.blackboard.set_pending_decision(value)
         # Shadow-mirror to chat_session.awaiting so the session record
         # carries the same prompt the user is being asked.
         try:
@@ -1234,11 +1231,7 @@ class VaultRuntime:
             with self._node_pendings_lock:
                 raw = self._node_pendings.get(node_id)
         if raw is None:
-            raw = (
-                self.blackboard.get_pending_decision()
-                if hasattr(self.blackboard, "get_pending_decision")
-                else getattr(self.blackboard, "pending", None)
-            )
+            raw = self.blackboard.get_pending_decision()
         if not isinstance(raw, dict):
             return raw
         expires_at = raw.get("_expires_at")

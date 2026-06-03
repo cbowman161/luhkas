@@ -1,5 +1,6 @@
 import json
 
+from agents._json_utils import extract_json as _extract_json
 from models import get_model
 
 
@@ -142,6 +143,3 @@ class ReviewAgent:
             + "\n\nRevised goal:"
         )
         return self.model.generate(prompt, options={"temperature": 0.15, "num_predict": 2000}, think=False)
-
-
-from agents._json_utils import extract_json as _extract_json  # noqa: E402
