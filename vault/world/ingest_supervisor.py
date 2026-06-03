@@ -100,6 +100,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("ingest_supervisor")
+_LAST_FOREIGN_WARN_AT = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +220,7 @@ def _existing_ingest_pids() -> list[int]:
     """
     try:
         r = subprocess.run(
-            ["pgrep", "-f", "world.ingest_wiki"],
+            ["pgrep", "-af", r"python.* -m world.ingest_wiki"],
             capture_output=True, text=True, timeout=3,
         )
     except Exception:
@@ -230,9 +231,23 @@ def _existing_ingest_pids() -> list[int]:
         line = line.strip()
         if not line:
             continue
+        pid_text, _, cmdline = line.partition(" ")
         try:
-            pid = int(line)
+            pid = int(pid_text)
         except ValueError:
+            continue
+        try:
+            argv = [
+                part.decode("utf-8", errors="replace")
+                for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+        except Exception:
+            argv = cmdline.split()
+        if not any(
+            arg == "-m" and idx + 1 < len(argv) and argv[idx + 1] == "world.ingest_wiki"
+            for idx, arg in enumerate(argv)
+        ):
             continue
         # Exclude self (the supervisor module string also contains
         # "world.ingest_wiki" via its argv when spawned this way),
@@ -244,16 +259,20 @@ def _existing_ingest_pids() -> list[int]:
 
 
 def start_ingest() -> subprocess.Popen | None:
+    global _LAST_FOREIGN_WARN_AT
     if state_is_complete():
         log.info("ingest already completed (per state file); not starting")
         return None
     foreign = _existing_ingest_pids()
     if foreign:
-        log.warning(
-            "skipping spawn — another ingest_wiki process is already running "
-            "(pids=%s). Stop it (or wait for it to finish) before this "
-            "supervisor will start its own.", foreign,
-        )
+        now = time.time()
+        if now - _LAST_FOREIGN_WARN_AT > 60:
+            log.warning(
+                "skipping spawn — another ingest_wiki process is already running "
+                "(pids=%s). Stop it (or wait for it to finish) before this "
+                "supervisor will start its own.", foreign,
+            )
+            _LAST_FOREIGN_WARN_AT = now
         return None
     argv = build_ingest_argv()
     log.info("starting ingest: %s", " ".join(argv))
@@ -435,13 +454,20 @@ def main() -> None:
                 continue
             elif idle_seconds >= MIN_IDLE_SECONDS:
                 idle_str = "∞" if idle_seconds == float("inf") else f"{idle_seconds:.0f}s"
-                log.info(
-                    "state=starting ingest (idle %s >= %ss; %s)",
-                    idle_str, MIN_IDLE_SECONDS, reason,
-                )
                 proc = start_ingest()
-                last_state = "running"
-                completion_warm_sent = False
+                if proc is not None:
+                    log.info(
+                        "state=starting ingest (idle %s >= %ss; %s)",
+                        idle_str, MIN_IDLE_SECONDS, reason,
+                    )
+                    last_state = "running"
+                    completion_warm_sent = False
+                elif last_state != "foreign_running":
+                    log.info(
+                        "state=foreign_running (idle %s >= %ss; %s)",
+                        idle_str, MIN_IDLE_SECONDS, reason,
+                    )
+                    last_state = "foreign_running"
             else:
                 if last_state != "idle_waiting":
                     log.info(
