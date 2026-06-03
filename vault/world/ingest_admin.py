@@ -113,7 +113,7 @@ _calibrate_from_zim()
 # Action triggers — each is a tight regex so chat lines like
 # "what is wikipedia" don't accidentally match.
 _START_RE = re.compile(
-    r"\b(?:start|begin|kick\s*off|launch|resume)\s+(?:the\s+)?"
+    r"\b(?:start|begin|kick\s*off|launch|resume|continue)\s+(?:the\s+)?"
     r"(?:wiki(?:pedia)?\s+)?(?:ingest(?:ion)?|ingestion|indexing|index)\b",
     re.IGNORECASE,
 )

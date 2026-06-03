@@ -4427,6 +4427,43 @@ English:
         # silently denying world context.
         return True
 
+    _INSTRUCTIONAL_REQUEST_RE = re.compile(
+        r"\b("
+        r"recipe|how\s+to|how\s+do\s+i|how\s+can\s+i|steps?|instructions?|"
+        r"walk\s+me\s+through|guide\s+me|make|cook|bake|prepare|build|fix|"
+        r"set\s+up|setup|install|configure"
+        r")\b",
+        re.I,
+    )
+
+    def _message_needs_stepwise_answer(self, message: str) -> bool:
+        return bool(self._INSTRUCTIONAL_REQUEST_RE.search(message or ""))
+
+    _STEPWISE_FOLLOWUP_RE = re.compile(
+        r"\b("
+        r"them|that|those|it|instead|fried|baked|air\s*fry|air\s*fryer|grill|"
+        r"spicy|mild|crisp|crispy|cheesier|less|more|without|with|no\s+\w+|"
+        r"i\s+want|make\s+it|make\s+them|can\s+you\s+make|what\s+about"
+        r")\b",
+        re.I,
+    )
+
+    def _recent_chat_was_stepwise(self, recent_chat: list[dict]) -> bool:
+        if not recent_chat:
+            return False
+        for turn in reversed(recent_chat[-3:]):
+            text = f"{turn.get('user') or ''}\n{turn.get('assistant') or ''}"
+            if self._INSTRUCTIONAL_REQUEST_RE.search(text):
+                return True
+            if re.search(r"(?:^|\s)(?:1\.|1\)|2\.|2\))\s+\S+", text):
+                return True
+        return False
+
+    def _message_continues_stepwise_answer(self, message: str, recent_chat: list[dict]) -> bool:
+        if not self._recent_chat_was_stepwise(recent_chat):
+            return False
+        return bool(self._STEPWISE_FOLLOWUP_RE.search(message or ""))
+
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
@@ -4541,6 +4578,21 @@ English:
             context["facts_just_stored"] = facts_just_stored
         if world_knowledge_prompt:
             context["world_knowledge"] = world_knowledge_prompt
+        needs_stepwise_answer = (
+            self._message_needs_stepwise_answer(message)
+            or self._message_continues_stepwise_answer(message, recent_chat)
+        )
+        if needs_stepwise_answer:
+            answer_shape_rule = (
+                "Use a compact numbered list when helpful. Give enough steps to be complete, "
+                "but keep it easy to follow. If this is a follow-up to recent_chat, "
+                "apply the user's change to the prior answer instead of starting from scratch "
+                "or echoing the user's correction."
+            )
+            generation_options = {"num_predict": 180, "temperature": 0.45, "top_p": 0.9}
+        else:
+            answer_shape_rule = "Rules: 1-2 short sentences."
+            generation_options = {"num_predict": 40, "temperature": 0.45, "top_p": 0.9}
         prompt = f"""{self_description}
 Answer the user directly and briefly.
 
@@ -4549,7 +4601,7 @@ User: {message}
 Context:
 {json.dumps(context, separators=(",", ":"), default=str)}
 
-Rules: 1-2 short sentences. No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
+{answer_shape_rule} No emojis. No generic closer. Do not invent facts or guess from prior model knowledge.
 Answer ONLY the specific thing the user asked. Do NOT volunteer unrelated stored facts. If they asked "what's my name", answer with the name and nothing else — do not append their location or snack preference.
 If facts_just_stored is non-empty, confirm you've noted them naturally (don't say "already recorded" — these are new this turn).
 If the user is asking about YOURSELF (your mood, feelings, opinions, personality, name, role — anything starting with "you" / "your"), answer from your self_description and identity above. Do NOT use the "I don't have that stored" fallback — that template is for the SPEAKER's stored facts, never for your own inner state.
@@ -4578,17 +4630,12 @@ If answering ACCURATELY would require seeing the live camera scene (e.g. questio
             # streaming-aware helper so the /presence/message/stream path
             # actually emits per-token deltas here too.
             #
-            # num_predict tightened from 140 → 40: the prompt rules already
-            # say "1-2 short sentences", but the model occasionally ignored
-            # that and ran long. 40 tokens fits 1-2 clean sentences with
-            # citation; cap saves ~400-800ms on the cases where the model
-            # would have rambled, and enforces conversational brevity.
-            # Replies that legitimately need more (e.g. "tell me three
-            # things about X") get the first item or two and stop — the
-            # user can ask "go on" for more.
+            # Keep ordinary chat terse, but allow instructional requests
+            # enough room to finish a short list. A hard 40-token cap was
+            # clipping recipes and how-to answers mid-thought.
             text = (self._generate_user_facing(
                 prompt,
-                options={"num_predict": 40, "temperature": 0.45, "top_p": 0.9},
+                options=generation_options,
                 think=False,
                 allow_empty=True,
             ) or "").strip()
