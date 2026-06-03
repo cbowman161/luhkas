@@ -15,12 +15,14 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import queue
 import re
 import sys
+from pathlib import Path
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -693,7 +695,11 @@ def ingest_zim(
 
     flush_pending()
     stats["elapsed_s"] = round(time.time() - stats["started_at"], 2)
-    stats["completed"] = True
+    # ZIM is only "completed" when we walked off the end of the iterator
+    # — NOT when the supervisor's SIGTERM caused us to exit at an
+    # article boundary. Marking completed=True on signal exit makes the
+    # supervisor go dormant and the corpus never finishes ingesting.
+    stats["completed"] = not (stop_event is not None and stop_event.is_set())
     _atomic_write_state(state_path, stats)
     # Build/refresh the ANN index on completion if the corpus is large
     # enough to benefit. Cheap if the index already exists (LanceDB
@@ -756,11 +762,66 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _acquire_singleton_lock(state_path: str | None) -> int:
+    """Acquire an exclusive flock so only one ingest_wiki can ever run
+    at a time. Returns the lockfile FD on success — keep it open for
+    the lifetime of the process; the OS releases the lock when the FD
+    closes (clean exit, signal exit, crash, SIGKILL — all fine).
+
+    Raises ``RuntimeError`` when another instance holds the lock. The
+    caller should print the message and exit non-zero so the supervisor
+    (or whoever spawned this) doesn't think the start succeeded.
+
+    Why a file lock and not a pidfile: pidfiles go stale on crash and
+    require manual cleanup; flock is automatic. Why not check the
+    supervisor's tracked child PID: chat-triggered starts and manual
+    CLI runs spawn outside the supervisor's tracking, and we just
+    burned ourselves twice on exactly that race.
+    """
+    if state_path:
+        lock_path = Path(state_path).with_suffix(".lock")
+    else:
+        lock_path = Path("/tmp/ingest_wiki.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            holder = os.read(fd, 256).decode("utf-8", "replace").strip()
+        except Exception:
+            holder = ""
+        os.close(fd)
+        raise RuntimeError(
+            f"another ingest_wiki is already running (lock {lock_path}; "
+            f"holder={holder or 'unknown'}). Refusing to start a second copy."
+        )
+    # Stamp diagnostic info — purely informational; the flock is the
+    # actual mutex.
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()} started_at={time.time():.0f}\n".encode("utf-8"))
+    except Exception:
+        pass
+    return fd
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     if not os.path.exists(args.zim_path):
         print(f"error: zim not found: {args.zim_path}", file=sys.stderr)
         return 2
+
+    # Singleton lock — see _acquire_singleton_lock. Held for the whole
+    # process lifetime; the local name keeps the fd referenced so the
+    # GC can't accidentally close it.
+    try:
+        _ingest_lock_fd = _acquire_singleton_lock(args.state_file)  # noqa: F841
+    except RuntimeError as exc:
+        print(f"[ingest_wiki] {exc}", file=sys.stderr, flush=True)
+        return 3
 
     # Graceful-stop handler so SIGTERM (sent by the supervisor on
     # busy-pause) is observed at an article boundary rather than

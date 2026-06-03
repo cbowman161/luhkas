@@ -209,9 +209,51 @@ def state_is_complete() -> bool:
         return False
 
 
+def _existing_ingest_pids() -> list[int]:
+    """pgrep system-wide for an ``world.ingest_wiki`` python process.
+    Returns the list of foreign PIDs. Used by ``start_ingest`` to avoid
+    racing with a chat-triggered or manual-CLI ingest — the ingest
+    itself also flocks, but pre-checking here means we don't burn
+    10 s/cycle on a guaranteed-to-fail spawn that prints a noisy CUDA
+    error stack to the journal.
+    """
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", "world.ingest_wiki"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    me = os.getpid()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        # Exclude self (the supervisor module string also contains
+        # "world.ingest_wiki" via its argv when spawned this way),
+        # though pgrep -f against the python module path means the
+        # supervisor's own argv shouldn't match — defensive anyway.
+        if pid != me:
+            pids.append(pid)
+    return pids
+
+
 def start_ingest() -> subprocess.Popen | None:
     if state_is_complete():
         log.info("ingest already completed (per state file); not starting")
+        return None
+    foreign = _existing_ingest_pids()
+    if foreign:
+        log.warning(
+            "skipping spawn — another ingest_wiki process is already running "
+            "(pids=%s). Stop it (or wait for it to finish) before this "
+            "supervisor will start its own.", foreign,
+        )
         return None
     argv = build_ingest_argv()
     log.info("starting ingest: %s", " ".join(argv))
