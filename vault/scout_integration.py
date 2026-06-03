@@ -4483,6 +4483,10 @@ English:
         return bool(self._STEPWISE_FOLLOWUP_RE.search(message or ""))
 
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
+        arithmetic_answer = _simple_arithmetic_answer(message)
+        if arithmetic_answer is not None:
+            return arithmetic_answer
+
         identity_name = self.identity_profile.get("name")
         identity_role = self.identity_profile.get("role")
         active_identity_context = self.active_identity if state.get("ok") else "unverified_scout_tracking_unavailable"
@@ -6616,6 +6620,74 @@ def _canonical_intent_text(message: str) -> str:
     text = str(message or "").casefold().replace("'", "")
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_ARITHMETIC_NUMBERS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+
+_ARITHMETIC_OPS = {
+    "plus": lambda a, b: a + b,
+    "add": lambda a, b: a + b,
+    "added to": lambda a, b: a + b,
+    "minus": lambda a, b: a - b,
+    "subtract": lambda a, b: a - b,
+    "less": lambda a, b: a - b,
+    "times": lambda a, b: a * b,
+    "multiplied by": lambda a, b: a * b,
+    "divided by": lambda a, b: a / b if b != 0 else None,
+    "over": lambda a, b: a / b if b != 0 else None,
+}
+
+
+def _simple_arithmetic_answer(message: str) -> str | None:
+    text = _canonical_intent_text(message)
+    text = re.sub(r"\b(answer|respond|reply)\b.*$", "", text).strip()
+    text = re.sub(r"^(what is|whats|calculate|compute|tell me)\s+", "", text).strip()
+    token = r"-?\d+(?:\.\d+)?|" + "|".join(_ARITHMETIC_NUMBERS)
+    op = "|".join(sorted((re.escape(key) for key in _ARITHMETIC_OPS), key=len, reverse=True))
+    match = re.search(rf"\b(?P<a>{token})\s+(?P<op>{op})\s+(?P<b>{token})\b", text)
+    if not match:
+        return None
+    a = _arithmetic_number(match.group("a"))
+    b = _arithmetic_number(match.group("b"))
+    if a is None or b is None:
+        return None
+    result = _ARITHMETIC_OPS[match.group("op")](a, b)
+    if result is None:
+        return "I can't divide by zero."
+    if isinstance(result, float) and result.is_integer():
+        result = int(result)
+    return str(result)
+
+
+def _arithmetic_number(value: str) -> float | None:
+    if value in _ARITHMETIC_NUMBERS:
+        return float(_ARITHMETIC_NUMBERS[value])
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _human_source_label(source: dict) -> str | None:
