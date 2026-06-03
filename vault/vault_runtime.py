@@ -1167,13 +1167,16 @@ class VaultRuntime:
         if nid:
             with self._node_pendings_lock:
                 self._node_pendings.pop(nid, None)
-        # Also clear the legacy single slot — covers the case where the
-        # pending was set by router (which has no node_id) and is now
-        # being resolved through this code path.
-        if hasattr(self.blackboard, "clear_pending_decision"):
+        # Also clear the legacy single slot only when it belongs to this node.
+        # Router-set pendings can still live there without node ownership; a
+        # node-local confirmation must not silently erase another flow.
+        blackboard_pending = self.blackboard.get_pending_decision()
+        if isinstance(blackboard_pending, dict):
+            pending_node_id = blackboard_pending.get("_node_id")
+            if (nid and pending_node_id == nid) or (not nid and not pending_node_id):
+                self.blackboard.clear_pending_decision()
+        elif not nid and blackboard_pending is not None:
             self.blackboard.clear_pending_decision()
-        else:
-            self.blackboard.pending = None
         # Just clear the awaiting prompt — does NOT close the session.
         # Use _resolve_pending(node_id, outcome) when the confirmation
         # actually resolved and the session should close with a record.
