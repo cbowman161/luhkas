@@ -4427,23 +4427,41 @@ English:
         # silently denying world context.
         return True
 
-    _INSTRUCTIONAL_REQUEST_RE = re.compile(
+    _COOKING_INSTRUCTION_RE = re.compile(
+        r"\b(recipe|cook|bake|prepare|how\s+to\s+make)\b",
+        re.I,
+    )
+    _BARE_MAKE_RE = re.compile(r"\bmake\b", re.I)
+    _ENGINEERING_INSTRUCTION_RE = re.compile(
+        r"\b(install|configure|set\s+up|setup|build|fix)\b",
+        re.I,
+    )
+    _SCOUT_ACTION_HINT_RE = re.compile(
         r"\b("
-        r"recipe|how\s+to|how\s+do\s+i|how\s+can\s+i|steps?|instructions?|"
-        r"walk\s+me\s+through|guide\s+me|make|cook|bake|prepare|build|fix|"
-        r"set\s+up|setup|install|configure"
+        r"look|move|turn|pan|tilt|point|drive|go|stop|start\s+tracking|"
+        r"follow|the\s+camera|the\s+scout|scout|robot"
         r")\b",
         re.I,
     )
 
+    def _likely_instructional(self, message: str) -> bool:
+        text = message or ""
+        if self._COOKING_INSTRUCTION_RE.search(text):
+            return True
+        if self._BARE_MAKE_RE.search(text):
+            return not self._SCOUT_ACTION_HINT_RE.search(text)
+        if self._ENGINEERING_INSTRUCTION_RE.search(text):
+            return not self._SCOUT_ACTION_HINT_RE.search(text)
+        return False
+
     def _message_needs_stepwise_answer(self, message: str) -> bool:
-        return bool(self._INSTRUCTIONAL_REQUEST_RE.search(message or ""))
+        return self._likely_instructional(message)
 
     _STEPWISE_FOLLOWUP_RE = re.compile(
         r"\b("
-        r"them|that|those|it|instead|fried|baked|air\s*fry|air\s*fryer|grill|"
-        r"spicy|mild|crisp|crispy|cheesier|less|more|without|with|no\s+\w+|"
-        r"i\s+want|make\s+it|make\s+them|can\s+you\s+make|what\s+about"
+        r"make(?:\s+\w+){0,3}|do(?:\s+\w+){0,3}|instead|what\s+about|"
+        r"can\s+you|how\s+about|or\s+use|try|change|swap|add|remove|"
+        r"more\s+\w+|less\s+\w+"
         r")\b",
         re.I,
     )
@@ -4453,7 +4471,7 @@ English:
             return False
         for turn in reversed(recent_chat[-3:]):
             text = f"{turn.get('user') or ''}\n{turn.get('assistant') or ''}"
-            if self._INSTRUCTIONAL_REQUEST_RE.search(text):
+            if self._likely_instructional(text):
                 return True
             if re.search(r"(?:^|\s)(?:1\.|1\)|2\.|2\))\s+\S+", text):
                 return True
