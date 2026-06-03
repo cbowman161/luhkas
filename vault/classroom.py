@@ -232,11 +232,11 @@ class ClassroomController:
         self._teacher_model = teacher_model
         self._reasoner_model = reasoner_model
         self.lesson_store = lesson_store or LessonStore(CLASSROOM_DIR / "lessons")
-        # Tracks whether we have evicted the default warm set in favor of
-        # the teacher model. Used to ensure restore runs exactly once per
-        # bench, regardless of which exit path fires (explicit end,
-        # finish, or idle-park).
-        self._models_benched = False
+        # Tracks which nodes currently hold classroom VRAM ownership. The
+        # first classroom node benches competing models; the last one to exit
+        # restores them.
+        self._bench_lock = threading.Lock()
+        self._benched_for_nodes: set[str] = set()
         # Hook into chat_sessions so an idle-park sweep also triggers
         # model restore. Cheap: a no-op callback when nothing is benched.
         if hasattr(chat_sessions, "register_park_callback"):
@@ -260,21 +260,23 @@ class ClassroomController:
 
     # ---- VRAM bench / restore ----------------------------------------
 
-    def _bench_competing_models(self) -> None:
+    def _bench_competing_models(self, node_id: str) -> None:
         """Evict router / chat / vision / coder so the 32B teacher model
         has the headroom. Idempotent — repeated calls are cheap no-ops
         because Ollama just confirms the model isn't loaded."""
-        if self._models_benched:
+        with self._bench_lock:
+            first_node = not self._benched_for_nodes
+            self._benched_for_nodes.add(node_id)
+        if not first_node:
             return
         for role in BENCH_ROLES:
             try:
                 evict_model(role)
             except Exception as exc:
                 log.warning("evict_model(%s) failed: %s", role, exc)
-        self._models_benched = True
-        log.info("classroom: benched %s", ", ".join(BENCH_ROLES))
+        log.info("classroom: benched %s for %s", ", ".join(BENCH_ROLES), node_id)
 
-    def _restore_competing_models(self) -> None:
+    def _restore_competing_models(self, node_id: str) -> None:
         """Re-warm router + chat after the classroom session ends so the
         next default-mode turn doesn't pay a cold-load. Also evicts the
         teacher to free its ~20 GB.
@@ -282,7 +284,12 @@ class ClassroomController:
         Best-effort and non-blocking-on-failure: if Ollama can't reach
         a model, we log and continue rather than tripping the user's
         next turn."""
-        if not self._models_benched:
+        with self._bench_lock:
+            if node_id not in self._benched_for_nodes:
+                return
+            self._benched_for_nodes.discard(node_id)
+            should_restore = not self._benched_for_nodes
+        if not should_restore:
             return
         try:
             evict_model("teacher")
@@ -293,8 +300,7 @@ class ClassroomController:
                 warm_model_role(role)
             except Exception as exc:
                 log.warning("warm_model_role(%s) failed: %s", role, exc)
-        self._models_benched = False
-        log.info("classroom: restored %s", ", ".join(RESTORE_ROLES))
+        log.info("classroom: restored %s after %s", ", ".join(RESTORE_ROLES), node_id)
 
     def _on_session_parked(self, node_id: str, session) -> None:
         """ChatSessionManager fires this when sweep_idle parks a session.
@@ -302,7 +308,7 @@ class ClassroomController:
         leaves models benched without an explicit end_lesson call."""
         if getattr(session, "mode", "default") != "classroom":
             return
-        self._restore_competing_models()
+        self._restore_competing_models(node_id)
 
     @property
     def world_store(self):
@@ -333,7 +339,7 @@ class ClassroomController:
         # Free VRAM for the 32B teacher before any model calls. Done
         # before open_session so the first lesson-planning call (which
         # uses the reasoner) doesn't have to fight router/chat for VRAM.
-        self._bench_competing_models()
+        self._bench_competing_models(node_id)
 
         # Open a fresh session in classroom mode. open_session closes/parks
         # any prior active session, which is the right behavior here:
@@ -352,7 +358,7 @@ class ClassroomController:
             log.warning("lesson planning failed for %r: %s", subject, exc)
             # Don't leave the system half-benched if start fails before
             # any teacher work happens.
-            self._restore_competing_models()
+            self._restore_competing_models(node_id)
             return self._error_response(
                 f"I couldn't build a lesson plan for '{subject}' just now. "
                 f"(Reason: {exc})"
@@ -425,7 +431,7 @@ class ClassroomController:
 
         # Bench competing models again — they may have been restored by
         # the park hook while the session was paused.
-        self._bench_competing_models()
+        self._bench_competing_models(node_id)
 
         # If the candidate is parked, re-open a fresh active session
         # carrying the same mode_state. open_session closes/parks any
@@ -564,7 +570,7 @@ class ClassroomController:
         session is closed and models are restored so the user isn't
         stuck in a stale loading state."""
         try:
-            self._bench_competing_models()
+            self._bench_competing_models(node_id)
             lesson = self._plan_lesson(subject, scope="")
             self.lesson_store.save(lesson)
             opening = self._compose_lesson_opening(lesson, {
@@ -603,7 +609,7 @@ class ClassroomController:
         if active is None or active.mode != "classroom":
             # Defensive: if a stale bench somehow survived (shouldn't),
             # restore here too.
-            self._restore_competing_models()
+            self._restore_competing_models(node_id)
             return self._direct({
                 "mode": "direct",
                 "message": "There's no classroom session active to end.",
@@ -617,7 +623,7 @@ class ClassroomController:
                        "mode_state": active.mode_state or {}},
             "learned": [],
         })
-        self._restore_competing_models()
+        self._restore_competing_models(node_id)
         return self._direct({
             "mode": "direct",
             "message": f"Class dismissed — saved your progress on {subject}. "
@@ -641,10 +647,7 @@ class ClassroomController:
         # the teacher needs to run. Eviction is cheap when the model
         # isn't loaded — Ollama just acks. Without this, teacher + chat
         # + bge-m3 can blow past 24 GB and bge-m3 fails to load mid-turn.
-        self._bench_competing_models()
-        # Re-arm the flag even if it was cleared (e.g. by a previous
-        # park-callback restore on a different node).
-        self._models_benched = True
+        self._bench_competing_models(node_id)
 
         normalized = _normalize(user_input)
         if normalized in END_PHRASES:
@@ -691,7 +694,7 @@ class ClassroomController:
                            "error": err, "subject": subject},
                 "learned": [],
             })
-            self._restore_competing_models()
+            self._restore_competing_models(node_id)
             return self._direct({
                 "mode": "direct",
                 "message": (
@@ -731,7 +734,7 @@ class ClassroomController:
                 "result": {"reason": "missing_lesson"},
                 "learned": [],
             })
-            self._restore_competing_models()
+            self._restore_competing_models(node_id)
             return self._error_response(
                 "I lost track of your lesson plan. Start a new one with "
                 "'teach me <subject>'."
@@ -1232,7 +1235,7 @@ class ClassroomController:
                        "modules": [m.title for m in lesson.modules]},
             "learned": [],
         })
-        self._restore_competing_models()
+        self._restore_competing_models(node_id)
         return self._direct({
             "mode": "direct",
             "message": (
