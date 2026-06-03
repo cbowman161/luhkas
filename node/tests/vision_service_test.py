@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+import unittest
 from dataclasses import replace
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +17,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import cv2
+try:
+    import cv2
+except ImportError as exc:
+    raise unittest.SkipTest("cv2 is not installed; calibration service test is unavailable") from exc
 import numpy as np
 
 from scout.vault_memory import BrainMemoryClient

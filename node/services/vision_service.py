@@ -793,13 +793,6 @@ def _filter_persons_by_pose(detections: list, poses: list, iou_threshold: float 
     return result
 
 
-def _latest_frame_detections() -> tuple[np.ndarray | None, list]:
-    with state_lock:
-        frame = None if latest_frame is None else latest_frame.copy()
-        detections = [replace(det) for det in latest_detections]
-    return frame, detections
-
-
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)

@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 import requests
 
-from config import DATA_DIR, FACE_REFERENCES_DIR, OLLAMA_VISION_MODEL, PEOPLE_DIR, ROOT_DIR, SCOUT_BATTERY_URL, SCOUT_ROBOT_URL, SCOUT_URL
+from config import DATA_DIR, FACE_REFERENCES_DIR, PEOPLE_DIR, ROOT_DIR, SCOUT_BATTERY_URL, SCOUT_ROBOT_URL, SCOUT_URL
 from models import get_model, model_manifest
 from mood_engine import MoodEngine
 from response_composer import ResponseComposer
@@ -6053,23 +6053,6 @@ def _self_topic_from_text(text: str) -> str | None:
     return None
 
 
-def _voice_band(value) -> str:
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return "unknown"
-    value = max(0.0, min(1.0, value))
-    if value < 0.20:
-        return "very low"
-    if value < 0.40:
-        return "low"
-    if value < 0.60:
-        return "medium"
-    if value < 0.80:
-        return "medium-high"
-    return "high"
-
-
 def _mood_statement_from_state(voice: dict, mood: dict, style: dict, verified_primary_user: bool = False) -> str:
     """Turn internal mood/style numbers into a qualitative first-person statement."""
     patience = float(mood.get("patience", 0.8) or 0.8)
@@ -6118,11 +6101,6 @@ def _mood_statement_from_state(voice: dict, mood: dict, style: dict, verified_pr
         edge_phrase = "clear-headed"
 
     return f"I feel {center}, {patience_phrase}, {social_phrase}, and {edge_phrase}."
-
-
-def _assistant_intro_statement(name: str | None = None) -> str:
-    safe_name = str(name or "Luhkas").strip() or "Luhkas"
-    return f"I'm {safe_name}: a local AI that helps think, remember, and act through the systems connected to me."
 
 
 def _assistant_identity_response_violation(text: str) -> bool:
@@ -6700,11 +6678,6 @@ def _explicitly_targets_scout(message: str) -> bool:
 
 def _targets_scout_action(message: str, source: str | None) -> bool:
     return _source_is_scout(source) or _explicitly_targets_scout(message)
-
-
-def _asks_for_clip(message: str) -> bool:
-    text = _normalize_command_text(message)
-    return _has_any(text, ("record a clip", "save a clip", "video clip", "record video", "record a video", "take a video"))
 
 
 def _looks_like_scout_action(message: str) -> bool:

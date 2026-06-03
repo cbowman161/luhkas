@@ -561,13 +561,6 @@ def _state_snapshot() -> dict:
     }
 
 
-def _fetch_local_json(url: str, timeout_s: float = 0.4) -> dict | None:
-    """Server-side fetch of a sibling service's JSON endpoint. Returns None on
-    any failure — used to enrich /presence/face/state with vision + audio
-    data so the browser only hits one origin."""
-    return _fetch_json(url, timeout_s)
-
-
 def _fetch_json(url: str, timeout_s: float = 0.4) -> dict | None:
     try:
         with urlopen(url, timeout=timeout_s) as r:

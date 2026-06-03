@@ -47,7 +47,6 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -101,29 +100,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("ingest_supervisor")
 _LAST_FOREIGN_WARN_AT = 0.0
-
-
-# ---------------------------------------------------------------------------
-# Busy signals
-# ---------------------------------------------------------------------------
-
-
-def _now_iso(ts: float) -> str:
-    try:
-        return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
-    except Exception:
-        return "?"
-
-
-def _parse_iso_z(value: str) -> float:
-    """Parse Ollama's ``expires_at`` (RFC3339 with 'Z' or +00:00) to epoch."""
-    if not value:
-        return 0.0
-    s = value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return 0.0
 
 
 def vault_idle_seconds() -> float | None:
