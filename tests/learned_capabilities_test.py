@@ -112,8 +112,21 @@ class FakeNodeRegistry:
 
 
 class FakeEventLog:
+    def __init__(self) -> None:
+        self.events = []
+
     def unread(self):
-        return []
+        return list(self.events)
+
+    def write(self, job_id, event_type, message, data=None):
+        self.events.append({
+            "id": len(self.events) + 1,
+            "job_id": job_id,
+            "event_type": event_type,
+            "message": message,
+            "data": data or {},
+            "read": False,
+        })
 
 
 class FakeRegistry:
@@ -497,6 +510,88 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         self.assertIn("disk usage", caps)
         self.assertIsNone(caps["cpu usage"].get("alias_of"))
         self.assertIsNone(caps["disk usage"].get("alias_of"))
+
+    def test_learned_growth_status_reports_store_and_failures(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        proposal = {
+            "intent": "vault_system_info",
+            "description": "Vault CPU hardware",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.84,
+            "inferred": {"topic": "cpu", "aspect": "hardware"},
+        }
+        engine.store.remember("cpu usage", {
+            **proposal,
+            "execution": {"type": "bash", "command": "echo cpu"},
+            "code_monkey_task": {"ok": False, "skipped": True},
+        })
+        engine.store.remember_pending_code_monkey(
+            "check CPU",
+            proposal,
+            {"ok": True, "task_id": "cm-task-1", "goal": "learn CPU hardware", "state": "queued"},
+        )
+        engine.store.update_pending_code_monkey("cm-task-1", {"state": "test_failed", "notified": True})
+
+        response = runtime._handle_deterministic_presence_command("learned status", "scout")
+
+        self.assertEqual(response["deterministic_source"], "learned_growth_status")
+        self.assertIn("Learned growth status", response["message"])
+        self.assertIn("failed learned attempts: 1", response["message"])
+
+    def test_fix_failed_learned_attempt_retries_stored_proposal(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        proposal = {
+            "intent": "vault_system_info",
+            "description": "Vault CPU hardware",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.84,
+            "inferred": {"topic": "cpu", "aspect": "hardware"},
+            "planner": "code_monkey_single_recipe",
+        }
+        engine.store.remember_pending_code_monkey(
+            "check CPU",
+            proposal,
+            {"ok": True, "task_id": "cm-task-1", "goal": "learn CPU hardware", "state": "queued"},
+        )
+        engine.store.update_pending_code_monkey("cm-task-1", {"state": "test_failed", "notified": True})
+
+        response = runtime._handle_deterministic_presence_command("fix failed learned attempts", "scout")
+
+        self.assertEqual(response["deterministic_source"], "learned_growth_fix")
+        self.assertIn("restarted 1", response["message"])
+        self.assertIn("check cpu", engine.store.all()["capabilities"])
+
+    def test_install_missing_learned_packages_starts_installs_from_events(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        runtime.event_log.write(
+            "learn:missing:1",
+            "learn_needs_install",
+            "missing iotop",
+            {
+                "original_message": "show iotop",
+                "description": "Vault iotop status",
+                "missing_binary": "iotop",
+                "suggested_package": "iotop",
+            },
+        )
+        started = []
+
+        def _fake_spawn_async_install(self, package: str, node_id: str):
+            started.append((package, node_id))
+            return {}
+
+        runtime._spawn_async_install = types.MethodType(_fake_spawn_async_install, runtime)
+
+        response = runtime._handle_deterministic_presence_command("install missing learned packages", "scout")
+
+        self.assertEqual(response["deterministic_source"], "learned_growth_install_missing")
+        self.assertEqual(started, [("iotop", "scout")])
+        self.assertIn("iotop", response["message"])
 
 
 if __name__ == "__main__":

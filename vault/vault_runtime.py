@@ -121,6 +121,35 @@ _AUDIT_CAPS_COMMANDS = {
     "merge duplicate caps",
 }
 
+_LEARNED_STATUS_COMMANDS = {
+    "learned status",
+    "learning status",
+    "learned growth status",
+    "learning growth status",
+    "learned commands status",
+    "show learned status",
+    "show learning status",
+}
+
+_LEARNED_FIX_COMMANDS = {
+    "fix failed learned attempt",
+    "fix failed learned attempts",
+    "fix failed learned command",
+    "fix failed learned commands",
+    "retry failed learned attempt",
+    "retry failed learned attempts",
+    "retry failed learned command",
+    "retry failed learned commands",
+}
+
+_LEARNED_INSTALL_MISSING_COMMANDS = {
+    "install missing learned packages",
+    "install missing learning packages",
+    "install learned missing packages",
+    "install missing packages for learned commands",
+    "install missing packages for learning",
+}
+
 # `install <pkg>` admin command — single-arg form. Recognized when the
 # remainder validates as an apt-style package name. Anything not matching
 # falls through to normal routing (so "install a fence in the yard" stays
@@ -995,9 +1024,11 @@ class VaultRuntime:
             data={
                 "original_message": original_message,
                 "description": description,
+                "proposal": proposal,
                 "saved": bool(result.get("saved")),
                 "missing_binary": result.get("missing_binary"),
                 "suggested_package": result.get("suggested_package"),
+                "error": result.get("error") or result.get("stderr"),
             },
         )
 
@@ -1065,7 +1096,214 @@ class VaultRuntime:
             ))
         if text in _AUDIT_CAPS_COMMANDS:
             return self._remember_active(self._start_audit_caps(node_id))
+        if text in _LEARNED_STATUS_COMMANDS:
+            return self._remember_active(self._learned_growth_status_response())
+        if text in _LEARNED_FIX_COMMANDS:
+            return self._remember_active(self._fix_failed_learned_attempts(node_id))
+        if text in _LEARNED_INSTALL_MISSING_COMMANDS:
+            return self._remember_active(self._install_missing_learned_packages(node_id))
         return None
+
+    def _learned_growth_snapshot(self) -> dict:
+        engine = self._learned_engine()
+        data = engine.store.load()
+        caps = data.get("capabilities") if isinstance(data, dict) else {}
+        pending = data.get("pending_code_monkey") if isinstance(data, dict) else {}
+        caps = caps if isinstance(caps, dict) else {}
+        pending = pending if isinstance(pending, dict) else {}
+        unread = []
+        try:
+            unread = self.event_log.unread() or []
+        except Exception:
+            unread = []
+        with self._async_job_lock:
+            active_learn = dict(self._active_learn_jobs)
+            active_install = dict(self._active_install_jobs)
+        final_failed = {"build_failed", "test_failed", "failed", "cancelled"}
+        pending_tasks = {
+            task_id: entry for task_id, entry in pending.items()
+            if isinstance(entry, dict) and not entry.get("notified")
+        }
+        failed_tasks = {
+            task_id: entry for task_id, entry in pending.items()
+            if isinstance(entry, dict) and str(entry.get("state") or "") in final_failed
+        }
+        missing_events = [
+            event for event in unread
+            if event.get("event_type") == "learn_needs_install"
+            and (event.get("data") or {}).get("suggested_package")
+        ]
+        failed_events = [
+            event for event in unread
+            if event.get("event_type") in {"learn_failed", "learn_needs_install"}
+        ]
+        root_caps = [
+            (key, cap) for key, cap in caps.items()
+            if isinstance(cap, dict) and not cap.get("alias_of")
+        ]
+        aliases = [
+            (key, cap) for key, cap in caps.items()
+            if isinstance(cap, dict) and cap.get("alias_of")
+        ]
+        root_caps.sort(key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0), reverse=True)
+        aliases.sort(key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0), reverse=True)
+        duplicate_count = 0
+        try:
+            duplicate_count = len(engine.find_duplicate_caps())
+        except Exception:
+            duplicate_count = 0
+        return {
+            "active_learn_jobs": active_learn,
+            "active_install_jobs": active_install,
+            "pending_tasks": pending_tasks,
+            "failed_tasks": failed_tasks,
+            "missing_package_events": missing_events,
+            "failed_events": failed_events,
+            "recent_learned": root_caps[:8],
+            "recent_aliases": aliases[:8],
+            "capability_count": len(caps),
+            "alias_count": len(aliases),
+            "duplicate_count": duplicate_count,
+            "unread_events": unread,
+        }
+
+    def _learned_growth_status_response(self) -> dict:
+        snapshot = self._learned_growth_snapshot()
+        lines = [
+            "Learned growth status:",
+            f"  capabilities: {snapshot['capability_count']} ({snapshot['alias_count']} aliases)",
+            f"  active learn jobs: {len(snapshot['active_learn_jobs'])}",
+            f"  active installs: {len(snapshot['active_install_jobs'])}",
+            f"  pending Code Monkey tasks: {len(snapshot['pending_tasks'])}",
+            f"  failed learned attempts: {len(snapshot['failed_tasks'])}",
+            f"  missing-package prompts: {len(snapshot['missing_package_events'])}",
+            f"  duplicate/audit candidates: {snapshot['duplicate_count']}",
+        ]
+        if snapshot["active_learn_jobs"]:
+            lines.append("\nActive learning:")
+            for desc, started in list(snapshot["active_learn_jobs"].items())[:5]:
+                lines.append(f"  - {desc} ({int(time.time() - started)}s)")
+        if snapshot["failed_tasks"]:
+            lines.append("\nFailed attempts:")
+            for task_id, entry in list(snapshot["failed_tasks"].items())[:5]:
+                lines.append(f"  - {entry.get('input') or task_id}: {entry.get('state')}")
+        if snapshot["missing_package_events"]:
+            lines.append("\nMissing packages:")
+            for event in snapshot["missing_package_events"][:5]:
+                data = event.get("data") or {}
+                lines.append(
+                    f"  - {data.get('suggested_package')} for {data.get('missing_binary')} "
+                    f"({data.get('description') or data.get('original_message')})"
+                )
+        if snapshot["recent_learned"]:
+            lines.append("\nRecently learned:")
+            for key, cap in snapshot["recent_learned"][:5]:
+                lines.append(f"  - {key}: {cap.get('description')}")
+        if snapshot["recent_aliases"]:
+            lines.append("\nRecent aliases:")
+            for key, cap in snapshot["recent_aliases"][:5]:
+                lines.append(f"  - {key} -> {cap.get('alias_of')}")
+        lines.append("\nCommands: 'fix failed learned attempts' or 'install missing learned packages'.")
+        return {
+            "mode": "direct",
+            "message": "\n".join(lines),
+            "data": snapshot,
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "learned_growth_status",
+            "compose": False,
+            "response_composed": True,
+        }
+
+    def _fix_failed_learned_attempts(self, node_id: str) -> dict:
+        snapshot = self._learned_growth_snapshot()
+        retry_items = []
+        seen_inputs = set()
+        for task_id, entry in snapshot["failed_tasks"].items():
+            if not isinstance(entry, dict):
+                continue
+            original = entry.get("input") or ""
+            proposal = entry.get("proposal") or {}
+            if original and isinstance(proposal, dict) and proposal and original not in seen_inputs:
+                retry_items.append((original, proposal, task_id))
+                seen_inputs.add(original)
+        for event in snapshot["failed_events"]:
+            data = event.get("data") or {}
+            original = data.get("original_message") or ""
+            proposal = data.get("proposal") or {}
+            if original and isinstance(proposal, dict) and proposal and original not in seen_inputs:
+                retry_items.append((original, proposal, event.get("job_id")))
+                seen_inputs.add(original)
+        if not retry_items:
+            return {
+                "mode": "direct",
+                "message": "I do not see any failed learned attempts with enough stored context to retry.",
+                "data": {"retried": 0},
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_growth_fix",
+                "compose": False,
+                "response_composed": True,
+            }
+        for original, proposal, _source in retry_items[:5]:
+            self._spawn_async_learn(
+                original_message=original,
+                proposal=proposal,
+                confirmed_by="user_requested_failed_learn_retry",
+                node_id=node_id,
+            )
+        return {
+            "mode": "direct",
+            "message": f"I restarted {min(len(retry_items), 5)} failed learned attempt(s). Say 'any updates' for progress.",
+            "data": {"retried": [item[0] for item in retry_items[:5]], "available": len(retry_items)},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "learned_growth_fix",
+            "compose": False,
+            "response_composed": True,
+        }
+
+    def _install_missing_learned_packages(self, node_id: str) -> dict:
+        snapshot = self._learned_growth_snapshot()
+        packages = []
+        for event in snapshot["missing_package_events"]:
+            pkg = str((event.get("data") or {}).get("suggested_package") or "").strip().lower()
+            if re.fullmatch(r"[a-z0-9][a-z0-9+\-.]{0,63}", pkg) and pkg not in packages:
+                packages.append(pkg)
+        if not packages:
+            return {
+                "mode": "direct",
+                "message": "I do not see any learned attempts waiting on an identifiable missing package.",
+                "data": {"installed": 0},
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_growth_install_missing",
+                "compose": False,
+                "response_composed": True,
+            }
+        started = []
+        with self._async_job_lock:
+            active = set(self._active_install_jobs)
+        for package in packages[:5]:
+            if package in active:
+                continue
+            self._spawn_async_install(package, node_id)
+            started.append(package)
+        return {
+            "mode": "direct",
+            "message": (
+                f"I started installing {', '.join(started)} for failed learned attempts. "
+                "Say 'any updates' for progress."
+                if started
+                else "Those missing packages are already being installed."
+            ),
+            "data": {"packages": packages, "started": started},
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": "learned_growth_install_missing",
+            "compose": False,
+            "response_composed": True,
+        }
 
     # Maps pending-state types to their handler method name and whether
     # the handler's result should be wrapped with _remember_active before
