@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1305,7 +1306,11 @@ class LearnedCapabilityEngine:
             return self._bash_recipe(command, recipe.get("required_facts") or [])
         if kind == "python_script":
             source = str(recipe.get("source") or "")
-            filename = str(recipe.get("filename") or normalize_text(text) or "learned_command")
+            requested = str(recipe.get("filename") or "").strip()
+            generic_names = {"learned_command", "learned_command.py", "script", "script.py", "main", "main.py"}
+            filename = requested or normalize_text(text) or "learned_command"
+            if filename.casefold() in generic_names:
+                filename = normalize_text(text) or filename
             if not filename.endswith(".py"):
                 filename += ".py"
             return self._python_recipe(filename, source, recipe.get("required_facts") or [])
@@ -1524,7 +1529,18 @@ class LearnedCapabilityEngine:
 
     def _python_recipe(self, filename: str, source: str, required_facts: list[str]) -> dict:
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
-        path = self.scripts_dir / re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._") or "learned_command.py"
+        path = self.scripts_dir / safe_name
+        if path.exists():
+            try:
+                existing = path.read_text(encoding="utf-8")
+            except Exception:
+                existing = None
+            if existing is not None and existing != source:
+                suffix = path.suffix or ".py"
+                stem = path.stem or "learned_command"
+                digest = hashlib.sha1(source.encode("utf-8", "replace")).hexdigest()[:10]
+                path = self.scripts_dir / f"{stem}_{digest}{suffix}"
         path.write_text(source, encoding="utf-8")
         return {
             "type": "python_script",

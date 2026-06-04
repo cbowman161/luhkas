@@ -511,6 +511,25 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         self.assertIsNone(caps["cpu usage"].get("alias_of"))
         self.assertIsNone(caps["disk usage"].get("alias_of"))
 
+    def test_generated_python_recipe_uses_unique_path_for_generic_filename(self) -> None:
+        engine = self.make_engine()
+        original = engine._python_recipe("learned_command.py", "print('network count')", ["network"])
+
+        generated = engine._materialize_generated_recipe(
+            "vault figlet version",
+            {
+                "type": "python_script",
+                "filename": "learned_command.py",
+                "source": "print('figlet version')",
+                "required_facts": ["figlet"],
+            },
+        )
+
+        self.assertNotEqual(original["path"], generated["path"])
+        self.assertIn("vault_figlet_version", Path(generated["path"]).name)
+        self.assertEqual(Path(original["path"]).read_text(encoding="utf-8"), "print('network count')")
+        self.assertEqual(Path(generated["path"]).read_text(encoding="utf-8"), "print('figlet version')")
+
     def test_learned_growth_status_reports_store_and_failures(self) -> None:
         engine = self.make_engine()
         runtime = fake_runtime(engine)
