@@ -111,9 +111,17 @@ class FakeNodeRegistry:
         return True
 
 
+class FakeEventLog:
+    def unread(self):
+        return []
+
+
 class FakeRegistry:
     def list(self):
         return []
+
+    def lookup_by_alias(self, normalized_text: str):
+        return None
 
 
 class FakeSkillRegistry:
@@ -137,6 +145,26 @@ class FakeRouter:
         return {"mode": "direct", "message": "coder", "active_task_id": active_task_id}
 
 
+class FakeClassroom:
+    def maybe_handle_turn(self, message: str, node_id: str):
+        return None
+
+
+class FakeChatSessions:
+    def __init__(self) -> None:
+        self.awaiting = {}
+        self.closed = []
+
+    def set_awaiting(self, node_id: str, value):
+        self.awaiting[node_id] = value
+
+    def get_active(self, node_id: str):
+        return None
+
+    def close(self, node_id: str, outcome=None):
+        self.closed.append({"node_id": node_id, "outcome": outcome})
+
+
 def fake_runtime(engine: LearnedCapabilityEngine) -> VaultRuntime:
     runtime = VaultRuntime.__new__(VaultRuntime)
     runtime.registry = FakeRegistry()
@@ -145,9 +173,14 @@ def fake_runtime(engine: LearnedCapabilityEngine) -> VaultRuntime:
     runtime.router = FakeRouter()
     runtime.command_agent = FakeCommandAgent()
     runtime.node_registry = FakeNodeRegistry()
+    runtime.event_log = FakeEventLog()
+    runtime.classroom = FakeClassroom()
+    runtime.chat_sessions = FakeChatSessions()
     runtime.active_task_id = None
     runtime._node_task_ids = {}
     runtime._current_node_id = "scout"
+    runtime._node_pendings = {}
+    runtime._node_pendings_lock = threading.RLock()
     runtime.learned_capabilities = engine
     runtime._async_job_lock = threading.Lock()
     runtime._active_learn_jobs = {}
@@ -199,9 +232,10 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         corrected = runtime._handle_deterministic_presence_command("no, RAM hardware", "scout")
 
         self.assertIn("Vault RAM hardware", corrected["message"])
-        self.assertEqual(runtime.blackboard.pending["proposal"]["intent"], "vault_learned_command")
-        self.assertEqual(runtime.blackboard.pending["proposal"]["inferred"], {"topic": "memory", "aspect": "hardware"})
-        self.assertFalse(runtime.blackboard.pending["proposal"]["queue_code_monkey"])
+        pending = runtime._get_pending("scout")
+        self.assertEqual(pending["proposal"]["intent"], "vault_learned_command")
+        self.assertEqual(pending["proposal"]["inferred"], {"topic": "memory", "aspect": "hardware"})
+        self.assertFalse(pending["proposal"]["queue_code_monkey"])
         self.assertEqual(engine.store.all()["capabilities"], {})
 
     def test_fragment_correction_inherits_pending_topic(self) -> None:
@@ -212,8 +246,9 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         corrected = runtime._handle_deterministic_presence_command("no, hardware", "scout")
 
         self.assertIn("Vault RAM hardware", corrected["message"])
-        self.assertEqual(runtime.blackboard.pending["original_message"], "What's your RAM?")
-        self.assertEqual(runtime.blackboard.pending["proposal"]["inferred"], {"topic": "memory", "aspect": "hardware"})
+        pending = runtime._get_pending("scout")
+        self.assertEqual(pending["original_message"], "What's your RAM?")
+        self.assertEqual(pending["proposal"]["inferred"], {"topic": "memory", "aspect": "hardware"})
 
         confirmed = runtime._handle_deterministic_presence_command("yes", "scout")
         saved = engine.store.all()["capabilities"]
@@ -243,9 +278,10 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         corrected = runtime._handle_deterministic_presence_command("no, hardware", "scout")
 
         self.assertIn("Vault GPU hardware", corrected["message"])
-        self.assertEqual(runtime.blackboard.pending["proposal"]["intent"], "vault_learned_command")
-        self.assertEqual(runtime.blackboard.pending["proposal"]["inferred"], {"topic": "gpu", "aspect": "hardware"})
-        self.assertFalse(runtime.blackboard.pending["proposal"]["queue_code_monkey"])
+        pending = runtime._get_pending("scout")
+        self.assertEqual(pending["proposal"]["intent"], "vault_learned_command")
+        self.assertEqual(pending["proposal"]["inferred"], {"topic": "gpu", "aspect": "hardware"})
+        self.assertFalse(pending["proposal"]["queue_code_monkey"])
 
         confirmed = runtime._handle_deterministic_presence_command("yes", "scout")
         self.assertIn("I'll work on that", confirmed["message"])
@@ -257,13 +293,13 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         first = runtime._handle_deterministic_presence_command("What's your CPU?", "scout")
         self.assertIsNotNone(first)
         self.assertIn("I think you mean", first["message"])
-        self.assertEqual(runtime.blackboard.pending["type"], "learned_capability_confirmation")
+        self.assertEqual(runtime._get_pending("scout")["type"], "learned_capability_confirmation")
 
         confirmed = runtime._handle_deterministic_presence_command("yes", "scout")
         self.assertIsNotNone(confirmed)
         self.assertEqual("learned_capability_async", confirmed["deterministic_source"])
         self.assertIn("I'll work on that", confirmed["message"])
-        self.assertIsNone(runtime.blackboard.pending)
+        self.assertIsNone(runtime._get_pending("scout"))
 
         saved = engine.store.all()["capabilities"]
         self.assertIn("whats your cpu", saved)
