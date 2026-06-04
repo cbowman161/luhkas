@@ -6,8 +6,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import FaceDetectionConfig
-from .types import Detection
+from scout.types import Detection
+
+from .face_config import FaceDetectionConfig
 
 log = logging.getLogger(__name__)
 

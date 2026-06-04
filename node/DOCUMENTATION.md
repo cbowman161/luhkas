@@ -212,7 +212,7 @@ that unknown group into the named identity's face references.
 
 CPU-side OpenCV Haar face detection is optional enrichment. It can be disabled
 for a run with `--no-face-detection` and pointed at a specific cascade with
-`SCOUT_FACE_CASCADE_PATH`. Common cascade locations are:
+`FACE_DETECTION_CASCADE_PATH`. Common cascade locations are:
 
 ```text
 /usr/share/opencv4/haarcascades/
@@ -588,26 +588,26 @@ Common environment variables:
 | `SCOUT_CAMERA_LIGHT_AUTO_ENABLED` | `1` | Enable auto low-light |
 | `SCOUT_CAMERA_LIGHT_LOW_THRESHOLD` | `55` | Auto light trigger threshold |
 | `SCOUT_CAMERA_LIGHT_AUTO_BRIGHTNESS` | `255` | Auto light maximum brightness |
-| `SCOUT_FACE_DETECTION_ENABLED` | `1` | Enable face detection enrichment |
-| `SCOUT_FACE_MIN_NEIGHBORS` | `3` | Haar cascade strictness for face candidates |
-| `SCOUT_FACE_PERSON_UPPER_RATIO` | `0.55` | Reserved person/head association tuning |
-| `SCOUT_FACE_MIN_PERSON_HEIGHT_RATIO` | `0.08` | Minimum face/person height ratio |
-| `SCOUT_FACE_MAX_PERSON_HEIGHT_RATIO` | `0.50` | Maximum face/person height ratio |
-| `SCOUT_FACE_INTRO_MIN_SEEN_FRAMES` | `2` | Grouped face observations before introduction prompts |
+| `FACE_DETECTION_ENABLED` | `1` | Enable face detection enrichment (camera_node.face_config) |
+| `FACE_DETECTION_MIN_NEIGHBORS` | `3` | Haar cascade strictness for face candidates |
+| `FACE_DETECTION_PERSON_UPPER_RATIO` | `0.55` | Reserved person/head association tuning |
+| `FACE_DETECTION_MIN_PERSON_HEIGHT_RATIO` | `0.08` | Minimum face/person height ratio |
+| `FACE_DETECTION_MAX_PERSON_HEIGHT_RATIO` | `0.50` | Maximum face/person height ratio |
+| `FACE_DETECTION_INTRO_MIN_SEEN_FRAMES` | `2` | Grouped face observations before introduction prompts |
 | `SCOUT_UNKNOWN_FACE_DIR` | `config/unknown_faces` | Short-lived local unknown face cache; vault owns persistent unknown groups |
-| `SCOUT_FACE_UNKNOWN_MATCH_THRESHOLD` | `0.32` | Histogram/IoU matching threshold for unknown groups |
-| `SCOUT_FACE_UNKNOWN_SAMPLE_INTERVAL` | `2.0` | Minimum seconds between saved unknown samples |
-| `SCOUT_FACE_UNKNOWN_MAX_SAMPLES` | `24` | Max samples per unknown group |
-| `SCOUT_FACE_UNKNOWN_PERSIST_SECONDS` | `8.0` | Keep unsampled unknown groups briefly after disappearance |
-| `SCOUT_FACE_RECOGNITION_ENABLED` | `1` | Enable known-person recognition |
-| `SCOUT_KNOWN_FACES_DIR` | `config/faces` | Local face reference directory |
-| `SCOUT_FACE_RECOGNITION_INTERVAL_FRAMES` | `2` | Face recognition interval |
-| `SCOUT_FACE_LBPH_THRESHOLD` | `72` | LBPH recognition threshold |
-| `SCOUT_FACE_REFERENCE_POSES` | `frontal,left,right,up,down,close,far` | Reference pose buckets |
-| `SCOUT_FACE_REFERENCE_SAMPLES_PER_POSE` | `3` | Target samples per reference pose |
-| `SCOUT_FACE_AUTO_REFERENCE_CAPTURE` | `1` | Auto-capture missing pose refs |
-| `SCOUT_FACE_AUTO_REFERENCE_MIN_CONFIDENCE` | `0.35` | Auto-capture confidence threshold |
-| `SCOUT_FACE_AUTO_REFERENCE_COOLDOWN` | `20` | Auto-capture cooldown seconds |
+| `FACE_DETECTION_UNKNOWN_MATCH_THRESHOLD` | `0.32` | Histogram/IoU matching threshold for unknown groups |
+| `FACE_DETECTION_UNKNOWN_SAMPLE_INTERVAL` | `2.0` | Minimum seconds between saved unknown samples |
+| `FACE_DETECTION_UNKNOWN_MAX_SAMPLES` | `24` | Max samples per unknown group |
+| `FACE_DETECTION_UNKNOWN_PERSIST_SECONDS` | `8.0` | Keep unsampled unknown groups briefly after disappearance |
+| `FACE_RECOGNITION_ENABLED` | `1` | Enable known-person recognition |
+| `FACE_KNOWN_FACES_DIR` | `config/faces` | Local face reference directory |
+| `FACE_RECOGNITION_INTERVAL_FRAMES` | `2` | Face recognition interval |
+| `FACE_RECOGNITION_MIN_CONFIDENCE` | `0.0` | Unified 0-1 minimum confidence to accept a recognition (replaces former separate LBPH/histogram raw-scale thresholds; backend-internal scaling constants live in `camera_node/face_config.py`) |
+| `FACE_RECOGNITION_REFERENCE_POSES` | `frontal,left,right,up,down,close,far` | Reference pose buckets |
+| `FACE_RECOGNITION_REFERENCE_SAMPLES_PER_POSE` | `3` | Target samples per reference pose |
+| `FACE_RECOGNITION_AUTO_REFERENCE_CAPTURE` | `1` | Auto-capture missing pose refs |
+| `FACE_RECOGNITION_AUTO_REFERENCE_MIN_CONFIDENCE` | `0.35` | Eager training-data-capture gate (intentionally distinct from `FACE_RECOGNITION_MIN_CONFIDENCE`) |
+| `FACE_RECOGNITION_AUTO_REFERENCE_COOLDOWN` | `20` | Auto-capture cooldown seconds |
 | `SCOUT_IDENTITY_PROMPT_TEXT` | `Who are you?` | Unknown-face introduction prompt |
 | `SCOUT_IDENTITY_PROMPT_REPEAT_SECONDS` | `45` | Repeat interval for the active unknown face prompt |
 | `SCOUT_IDENTITY_PROMPT_COMPLETE_GRACE_SECONDS` | `20` | Time to suppress a just-learned face id while the queue advances |
@@ -667,13 +667,14 @@ the vault; the vault prefers `tailscale_ip` when building service URLs.
 | `scout/behavior.py` | IDLE/FOLLOWING/SEARCHING/GUARDING/AVOIDING/MANUAL FSM |
 | `scout/collision.py` | Frame-space collision blocking |
 | `scout/pose.py` | Pose model integration and pose-based aim |
-| `scout/face_detection.py` | OpenCV Haar face detection |
+| `camera_node/face_detection.py` | OpenCV Haar face detection |
 | `luhkas_node/` | Generic node registration, pre-vault router, package command composition |
 | `camera_node/` | Reusable camera, media, vision, face, and guard ownership package |
 | `pantilt_node/` | Reusable pan/tilt, tracking, search sweep, and target-centering package |
 | `rover_node/` | Reusable wheel/follow/gamepad rover package; assumes `camera_node` |
 | `light_node/` | Reusable generic light command package |
-| `scout/face_recognition.py` | LBPH/histogram recognition and reference capture |
+| `camera_node/face_recognition.py` | LBPH/histogram recognition and reference capture |
+| `camera_node/face_config.py` | `FaceDetectionConfig` / `FaceRecognitionConfig` dataclasses (`FACE_*` env vars) |
 | `scout/vault_memory.py` | Brain face/person memory client |
 | `scout/person_memory.py` | Local JSON/JSONL person memory store |
 | `scout/robot_client.py` | HTTP client for `robot_api` |

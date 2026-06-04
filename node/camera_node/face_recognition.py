@@ -9,11 +9,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import FaceDetectionConfig, FaceRecognitionConfig
+from scout.person_memory import _safe_identity
+from scout.types import Detection
+from scout.vision import is_face_label
+
+from .face_config import (
+    FaceDetectionConfig,
+    FaceRecognitionConfig,
+    _LBPH_DISTANCE_SCALE,
+    _HISTOGRAM_SCORE_FLOOR,
+)
 from .face_detection import FaceDetector
-from .person_memory import _safe_identity
-from .types import Detection
-from .vision import is_face_label
 
 log = logging.getLogger(__name__)
 
@@ -348,12 +354,19 @@ class FaceRecognizer:
         return auto_count < self.config.max_auto_reference_samples_per_identity
 
     def _predict(self, face: np.ndarray) -> tuple[str, float, float]:
+        # Each backend produces a unified 0-1 confidence using internal
+        # algorithm-specific raw cutoffs (_LBPH_DISTANCE_SCALE, _HISTOGRAM_SCORE_FLOOR).
+        # The public knob self.config.min_confidence gates rejection in that
+        # unified space, so tuning recognition strictness is a single number
+        # regardless of which backend is active.
         if self.method == "lbph" and self._recognizer is not None:
             label_id, distance = self._recognizer.predict(face)
             name = self._labels_by_id.get(int(label_id), self.config.unknown_label)
-            if distance > self.config.lbph_threshold:
+            if distance > _LBPH_DISTANCE_SCALE:
                 return self.config.unknown_label, 0.0, float(distance)
-            confidence = 1.0 - min(float(distance) / max(self.config.lbph_threshold, 1.0), 1.0)
+            confidence = 1.0 - min(float(distance) / max(_LBPH_DISTANCE_SCALE, 1.0), 1.0)
+            if confidence < self.config.min_confidence:
+                return self.config.unknown_label, 0.0, float(distance)
             return name, confidence, float(distance)
 
         histogram = _face_histogram(face)
@@ -365,9 +378,11 @@ class FaceRecognizer:
                 best_name = name
                 best_score = score
 
-        if best_score < self.config.histogram_threshold:
+        if best_score < _HISTOGRAM_SCORE_FLOOR:
             return self.config.unknown_label, 0.0, best_score
-        confidence = min(max((best_score - self.config.histogram_threshold) / (1.0 - self.config.histogram_threshold), 0.0), 1.0)
+        confidence = min(max((best_score - _HISTOGRAM_SCORE_FLOOR) / (1.0 - _HISTOGRAM_SCORE_FLOOR), 0.0), 1.0)
+        if confidence < self.config.min_confidence:
+            return self.config.unknown_label, 0.0, best_score
         return best_name, confidence, best_score
 
 

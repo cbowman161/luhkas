@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -13,6 +14,13 @@ from background_manager import BackgroundManager
 from capability_registry import CapabilityRegistry
 from chat_sessions import ChatSessionManager
 from classroom import ClassroomController
+from identity_actions import IdentityActionsController
+from onboarding import OnboardingController
+from onboarding_adapters import (
+    NodeRegistryTTS,
+    VaultFaceObserver,
+    VaultProfileStore,
+)
 from command_agent import CommandAgent
 from config import DATA_DIR, INSTALLED_CAPABILITIES_DIR
 from event_log import EventLog
@@ -24,7 +32,7 @@ from node_health_monitor import NodeHealthMonitor
 from node_registry import NodeRegistry
 from planner import Planner
 from router import Router
-from scout_integration import ScoutVaultBridge, _sanitize_generated_response
+from scout_integration import ScoutVaultBridge, _sanitize_generated_response, _extract_introduction_name
 from skill_registry import SkillRegistry
 from tts_formatter import format_for_tts
 
@@ -300,6 +308,43 @@ class VaultRuntime:
         # and the chat path is replaced with a pedagogy-aware prompt.
         # Lazy models — first lesson pays the load.
         self.classroom = ClassroomController(self.chat_sessions)
+        # Onboarding mode controller. While a session has mode=onboarding,
+        # every user turn routes through this instead of the planner.
+        # Engages when the system has no primary user — the runtime
+        # actively pursues forming a primary identity by guiding any
+        # detected person through name capture, multi-angle face
+        # training, designation, and basic preferences.
+        self.onboarding = OnboardingController(
+            self.chat_sessions,
+            face_observer=VaultFaceObserver(self.scout),
+            tts=NodeRegistryTTS(self.node_registry),
+            profile_store=VaultProfileStore(self.scout),
+            name_extractor=_extract_introduction_name,
+        )
+        # Identity actions controller — handles privileged verbal
+        # intents (transfer primary user / unset primary user). Shares
+        # the same FaceObserver/ProfileStore/TTSChannel adapters as
+        # onboarding; gates on face-verified primary user identity at
+        # IDENTITY_ACTION_MIN_CONFIDENCE.
+        self.identity_actions = IdentityActionsController(
+            face_observer=self.onboarding.face_observer,
+            profile_store=self.onboarding.profile_store,
+            tts=self.onboarding.tts,
+            on_unset=self._on_identity_unset,
+        )
+        # Boot-time mode check. ``awaiting_primary_user`` is True until a
+        # primary user is designated; while True, handle() actively
+        # initiates onboarding on the first face it sees per node.
+        self._awaiting_primary_user: bool = self._check_awaiting_primary_user()
+        if getattr(self, "_awaiting_primary_user", False):
+            log.info("vault: no primary user yet — awaiting_primary_user mode active")
+        # Background ticker — drives onboarding pose-capture forward
+        # while the user is silent (the only signal during a pose hold
+        # is the camera frame; nothing else triggers state advancement)
+        # and proactively greets when a face appears at any node while
+        # awaiting a primary user. Cheap when no work to do.
+        self._onboarding_ticker_stop = threading.Event()
+        self._start_onboarding_ticker()
         # Per-node active_task_id so multi-node sessions don't clobber each other
         self._node_task_ids: dict = {}
         # In-flight background workers — description/package → started_at unix.
@@ -320,6 +365,99 @@ class VaultRuntime:
 
     def _touch_user_activity(self) -> None:
         self._last_user_activity_at = time.time()
+
+    def _check_awaiting_primary_user(self) -> bool:
+        """True iff scout.identity_profile has no primary_user designated.
+        Read at boot and refreshed by ``_refresh_awaiting_primary_user``
+        after a successful onboarding designation or an explicit unset."""
+        try:
+            profile = self.scout.identity_profile if self.scout else {}
+        except Exception:
+            return True
+        primary = (profile or {}).get("primary_user")
+        return not (primary and str(primary).strip())
+
+    def _refresh_awaiting_primary_user(self) -> None:
+        """Called from the onboarding completion / transfer / unset
+        paths so the next ``handle()`` sees the up-to-date mode."""
+        self._awaiting_primary_user = self._check_awaiting_primary_user()
+
+    def _on_identity_unset(self) -> None:
+        """Callback fired by IdentityActionsController after a
+        successful unset. Flips awaiting_primary_user back on so the
+        background ticker resumes proactive face-detection greeting."""
+        self._refresh_awaiting_primary_user()
+        if self._awaiting_primary_user:
+            log.info("vault: primary user unset — awaiting_primary_user re-activated")
+
+    def _start_onboarding_ticker(self) -> None:
+        """Spin up a daemon thread that fires at ``VAULT_ONBOARDING_TICK_INTERVAL``
+        seconds (default 0.5s). Each pass does two things per node:
+
+          1. If a session is in onboarding mode and a pose-capture
+             step, call ``onboarding.tick(node_id)``. That's what
+             drives the state machine forward while the user is
+             silent — the only signal during a pose hold is the
+             camera frame, and nothing else ticks the controller.
+          2. If ``awaiting_primary_user`` and no session is active
+             at this node, call ``onboarding.maybe_initiate(node_id)``.
+             That's the proactive greeting — fires when a face appears
+             at a node we haven't onboarded at yet.
+
+        Both calls are idempotent + cheap (return None instantly when
+        the precondition isn't met), so a "nothing to do" pass costs
+        only the registered-nodes iteration."""
+        interval_env = os.environ.get("VAULT_ONBOARDING_TICK_INTERVAL", "0.5")
+        try:
+            self._onboarding_ticker_interval = max(0.1, float(interval_env))
+        except (TypeError, ValueError):
+            self._onboarding_ticker_interval = 0.5
+        thread = threading.Thread(
+            target=self._onboarding_ticker_loop,
+            name="onboarding-ticker",
+            daemon=True,
+        )
+        thread.start()
+        self._onboarding_ticker_thread = thread
+
+    def _onboarding_ticker_loop(self) -> None:
+        """Block-waits on the stop event so shutdown is prompt. Each
+        wake fires one tick pass; exceptions are logged and swallowed
+        so a transient adapter failure can't kill the loop."""
+        while not self._onboarding_ticker_stop.wait(self._onboarding_ticker_interval):
+            try:
+                self._onboarding_tick_pass()
+            except Exception as exc:
+                log.warning("onboarding ticker pass failed: %s", exc)
+
+    def _onboarding_tick_pass(self) -> None:
+        # Fast path: if no primary-user pursuit AND no active onboarding
+        # session at any registered node, there's nothing to do. tick()
+        # is cheap (one dict-lookup per node) so we still loop, but we
+        # skip the HTTP-touching initiate path entirely when awaiting=False.
+        try:
+            registered = self.node_registry.registered_nodes()
+        except Exception:
+            return
+        awaiting = self._awaiting_primary_user
+        for node_id in registered:
+            try:
+                self.onboarding.tick(node_id)
+            except Exception as exc:
+                log.warning("onboarding.tick(%s) failed: %s", node_id, exc)
+            if not awaiting:
+                continue
+            active = self.chat_sessions.get_active(node_id)
+            if active is not None and active.mode == "onboarding":
+                continue
+            try:
+                onboarding = getattr(self, "onboarding", None)
+                initiated = onboarding.maybe_initiate(node_id) if onboarding else None
+                if initiated is not None:
+                    log.info("onboarding: proactively initiated at %s", node_id)
+                    self._refresh_awaiting_primary_user()
+            except Exception as exc:
+                log.warning("onboarding.maybe_initiate(%s) failed: %s", node_id, exc)
 
     def handle(self, user_input, node_id: str = "cli"):
         user_input = (user_input or "").strip()
@@ -425,6 +563,52 @@ class VaultRuntime:
                     active_task_id=self.active_task_id,
                 )
                 return self._remember_active(response)
+
+        # If the active session is in onboarding mode, route the turn
+        # through the controller (advances state machine, handles
+        # pose-capture nudges, parks on timeout). Onboarding precedes
+        # classroom in dispatch order because it owns the entire
+        # awaiting-primary-user phase — no classroom session should be
+        # active before a primary user exists.
+        try:
+            onboarding = getattr(self, "onboarding", None)
+            onboarding_response = onboarding.maybe_handle_turn(user_input, node_id) if onboarding else None
+            if onboarding_response is not None:
+                if onboarding_response.get("onboarding", {}).get("event") == "completed":
+                    self._refresh_awaiting_primary_user()
+                onboarding_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(onboarding_response)
+        except Exception as exc:
+            log.warning("onboarding.maybe_handle_turn failed: %s", exc)
+
+        # In awaiting_primary_user mode, the first face the runtime sees
+        # at a node should trigger system-initiated onboarding before
+        # the user's input gets routed normally. ``maybe_initiate`` is
+        # idempotent — returns None if onboarding is already running or
+        # if no face is visible — so this is cheap on every turn.
+        if getattr(self, "_awaiting_primary_user", False):
+            try:
+                onboarding = getattr(self, "onboarding", None)
+                initiated = onboarding.maybe_initiate(node_id) if onboarding else None
+                if initiated is not None:
+                    initiated.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(initiated)
+            except Exception as exc:
+                log.warning("onboarding.maybe_initiate failed: %s", exc)
+
+        # Privileged identity actions — "transfer primary user to X" /
+        # "unset primary user". Gated on visually verifying the speaker
+        # is the current primary user at IDENTITY_ACTION_MIN_CONFIDENCE.
+        # Returns None when the input doesn't match a privileged-intent
+        # phrase, so non-matching turns fall through cleanly.
+        try:
+            identity_actions = getattr(self, "identity_actions", None)
+            action_response = identity_actions.try_handle(user_input, node_id) if identity_actions else None
+            if action_response is not None:
+                action_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(action_response)
+        except Exception as exc:
+            log.warning("identity_actions.try_handle failed: %s", exc)
 
         # If the active session is in classroom mode, route the turn
         # through the controller. It handles exit/pause phrases
@@ -750,6 +934,41 @@ class VaultRuntime:
             "code_monkey_review",
         }:
             return self.handle(message, node_id=node_id)
+
+        # Active onboarding session intercept — same as in handle().
+        # Owns awaiting-primary-user turns end-to-end; precedes classroom.
+        try:
+            onboarding = getattr(self, "onboarding", None)
+            onboarding_response = onboarding.maybe_handle_turn(message, node_id) if onboarding else None
+            if onboarding_response is not None:
+                if onboarding_response.get("onboarding", {}).get("event") == "completed":
+                    self._refresh_awaiting_primary_user()
+                onboarding_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(onboarding_response)
+        except Exception as exc:
+            log.warning("onboarding.maybe_handle_turn (presence) failed: %s", exc)
+
+        # Awaiting-primary-user mode: greet any visible face proactively
+        # before the user's input gets routed normally.
+        if getattr(self, "_awaiting_primary_user", False):
+            try:
+                onboarding = getattr(self, "onboarding", None)
+                initiated = onboarding.maybe_initiate(node_id) if onboarding else None
+                if initiated is not None:
+                    initiated.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(initiated)
+            except Exception as exc:
+                log.warning("onboarding.maybe_initiate (presence) failed: %s", exc)
+
+        # Privileged identity actions — same dispatch as handle().
+        try:
+            identity_actions = getattr(self, "identity_actions", None)
+            action_response = identity_actions.try_handle(message, node_id) if identity_actions else None
+            if action_response is not None:
+                action_response.setdefault("active_task_id", self.active_task_id)
+                return self._remember_active(action_response)
+        except Exception as exc:
+            log.warning("identity_actions.try_handle (presence) failed: %s", exc)
 
         # Active classroom session intercept — same as in handle(). Lets
         # exit phrases and on-topic chat run before any other deterministic

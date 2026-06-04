@@ -38,46 +38,6 @@ class VisionConfig:
 
 
 @dataclass
-class FaceDetectionConfig:
-    enabled: bool = os.environ.get("SCOUT_FACE_DETECTION_ENABLED", "1") != "0"
-    cascade_path: str | None = os.environ.get("SCOUT_FACE_CASCADE_PATH") or None
-    interval_frames: int = int(os.environ.get("SCOUT_FACE_INTERVAL_FRAMES", "2"))
-    class_id: int = int(os.environ.get("SCOUT_FACE_CLASS_ID", "10000"))
-    confidence: float = float(os.environ.get("SCOUT_FACE_CONFIDENCE", "0.85"))
-    scale_factor: float = float(os.environ.get("SCOUT_FACE_SCALE_FACTOR", "1.05"))
-    min_neighbors: int = int(os.environ.get("SCOUT_FACE_MIN_NEIGHBORS", "3"))
-    min_size_px: int = int(os.environ.get("SCOUT_FACE_MIN_SIZE_PX", "32"))
-    max_faces: int = int(os.environ.get("SCOUT_FACE_MAX_FACES", "3"))
-    person_upper_ratio: float = float(os.environ.get("SCOUT_FACE_PERSON_UPPER_RATIO", "0.55"))
-    min_person_height_ratio: float = float(os.environ.get("SCOUT_FACE_MIN_PERSON_HEIGHT_RATIO", "0.08"))
-    max_person_height_ratio: float = float(os.environ.get("SCOUT_FACE_MAX_PERSON_HEIGHT_RATIO", "0.50"))
-    intro_min_seen_frames: int = int(os.environ.get("SCOUT_FACE_INTRO_MIN_SEEN_FRAMES", "2"))
-    unknown_match_threshold: float = float(os.environ.get("SCOUT_FACE_UNKNOWN_MATCH_THRESHOLD", "0.32"))
-    unknown_sample_interval_seconds: float = float(os.environ.get("SCOUT_FACE_UNKNOWN_SAMPLE_INTERVAL", "2.0"))
-    unknown_max_samples: int = int(os.environ.get("SCOUT_FACE_UNKNOWN_MAX_SAMPLES", "24"))
-    unknown_persist_seconds: float = float(os.environ.get("SCOUT_FACE_UNKNOWN_PERSIST_SECONDS", "8.0"))
-
-
-@dataclass
-class FaceRecognitionConfig:
-    enabled: bool = os.environ.get("SCOUT_FACE_RECOGNITION_ENABLED", "1") != "0"
-    known_faces_dir: str = os.environ.get("SCOUT_KNOWN_FACES_DIR", "config/faces")
-    interval_frames: int = int(os.environ.get("SCOUT_FACE_RECOGNITION_INTERVAL_FRAMES", "2"))
-    image_size_px: int = int(os.environ.get("SCOUT_FACE_RECOGNITION_IMAGE_SIZE", "128"))
-    lbph_threshold: float = float(os.environ.get("SCOUT_FACE_LBPH_THRESHOLD", "72"))
-    histogram_threshold: float = float(os.environ.get("SCOUT_FACE_HISTOGRAM_THRESHOLD", "0.62"))
-    crop_training_faces: bool = os.environ.get("SCOUT_FACE_CROP_TRAINING", "1") != "0"
-    unknown_label: str = os.environ.get("SCOUT_FACE_UNKNOWN_LABEL", "unknown")
-    min_training_images_per_person: int = int(os.environ.get("SCOUT_FACE_MIN_TRAINING_IMAGES", "2"))
-    reference_pose_buckets: str = os.environ.get("SCOUT_FACE_REFERENCE_POSES", "frontal,left,right,up,down,close,far")
-    reference_samples_per_pose: int = int(os.environ.get("SCOUT_FACE_REFERENCE_SAMPLES_PER_POSE", "3"))
-    auto_reference_capture_enabled: bool = os.environ.get("SCOUT_FACE_AUTO_REFERENCE_CAPTURE", "1") != "0"
-    auto_reference_min_confidence: float = float(os.environ.get("SCOUT_FACE_AUTO_REFERENCE_MIN_CONFIDENCE", "0.35"))
-    auto_reference_cooldown_seconds: float = float(os.environ.get("SCOUT_FACE_AUTO_REFERENCE_COOLDOWN", "20"))
-    max_auto_reference_samples_per_identity: int = int(os.environ.get("SCOUT_FACE_MAX_AUTO_REFERENCE_SAMPLES", "80"))
-
-
-@dataclass
 class VaultMemoryConfig:
     enabled: bool = os.environ.get("SCOUT_VAULT_MEMORY_ENABLED", "0") != "0"
     url: str = os.environ.get("SCOUT_VAULT_MEMORY_URL", "")

@@ -25,9 +25,10 @@ import numpy as np
 
 from scout.vault_memory import BrainMemoryClient
 from scout.collision import CollisionGuard
-from scout.config import VaultMemoryConfig, CollisionConfig, FaceDetectionConfig, FaceRecognitionConfig, GuardConfig, MotionConfig, PersonMemoryConfig, SearchConfig, TrackingConfig, VisionConfig
-from scout.face_detection import FaceDetector
-from scout.face_recognition import FaceRecognizer
+from scout.config import VaultMemoryConfig, CollisionConfig, GuardConfig, MotionConfig, PersonMemoryConfig, SearchConfig, TrackingConfig, VisionConfig
+from camera_node.face_config import FaceDetectionConfig, FaceRecognitionConfig
+from camera_node.face_detection import FaceDetector
+from camera_node.face_recognition import FaceRecognizer
 from scout.motion import PanTiltController
 from scout.person_memory import PersonMemoryStore
 from scout.pose import PoseEstimator, apply_pose_aim, draw_poses
