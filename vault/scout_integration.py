@@ -199,11 +199,14 @@ def _conversation_user_turns(presence_context: dict | None, current_message: str
         if entry.get("role") == "user" and str(entry.get("text") or "").strip()
     ]
     if not turns:
-        turns = [
-            str(entry.get("user") or "").strip()
-            for entry in conversation.get("recent_contexts") or []
-            if str(entry.get("user") or "").strip()
-        ]
+        turns = []
+        for entry in conversation.get("recent_contexts") or []:
+            user = str(entry.get("user") or "").strip()
+            assistant = str(entry.get("assistant") or "").strip()
+            if user:
+                turns.append(user)
+            if assistant:
+                turns.append(assistant)
     current = str(current_message or "").strip()
     if current and turns and turns[-1] == current:
         turns = turns[:-1]
@@ -232,7 +235,10 @@ def _extract_context_fact(text: str) -> tuple[str, str, str | None] | None:
         r"\bremember\s+for\s+this\s+chat\s+that\s+(?:the\s+)?(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
         r"\bremember\s+that\s+my\s+(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
         r"\bmy\s+(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
+        r"\byour\s+(?P<key>[a-zA-Z0-9_. -]+?)\s+(?:is|equals|was)\s+(?P<value>[^.?!]+)",
         r"\bi\s+(?P<key>like|prefer)\s+(?P<value>[^.?!]+)",
+        r"\byou\s+said\s+you\s+(?P<key>like|prefer)\s+(?P<value>[^.?!]+)",
+        r"\byou\s+(?P<key>like|prefer)\s+(?P<value>[^.?!]+)",
         r"\bremember\s+(?P<person>Chris)\s+(?P<key>likes|prefers|uses|has)\s+(?P<value>[^.?!]+)",
     )
     for pattern in patterns:
@@ -397,15 +403,16 @@ def _recent_conversation_answer(message: str, presence_context: dict | None) -> 
         return "I don't have earlier chat context for that in this session."
 
     if (
-        re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|phrase|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
-        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker\s+word|test\s+phrase|test\s+word|marker|phrase|word)\b", text)
+        re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|code\s+word|phrase|token|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
+        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker\s+word|test\s+phrase|test\s+word|code\s+word|marker|phrase|token|word)\b", text)
     ):
+        requested_label = _requested_context_phrase_label(text)
         for turn in reversed(user_turns):
             phrase = _extract_context_phrase(turn)
-            if phrase:
+            if phrase and (requested_label is None or phrase[0] == requested_label):
                 label, value = phrase
                 return f"The {label} was {value}."
-        return "I don't see a marker word or test phrase in the recent chat context."
+        return "I don't see that marker word or test phrase in the recent chat context."
 
     if re.search(r"\bwhat\s+(?:.*\s+)?code\s+did\s+i\s+(give|tell)\s+you\b", text):
         fact = _matching_context_fact(user_turns, r"\bcode\b")
@@ -478,6 +485,23 @@ def _recent_conversation_answer(message: str, presence_context: dict | None) -> 
             return "We talked about " + "; ".join(topics[-5:]) + "."
         return "We have mostly been testing routing and memory in this chat."
 
+    return None
+
+
+def _requested_context_phrase_label(text: str) -> str | None:
+    labels = (
+        "marker word",
+        "test phrase",
+        "test word",
+        "code word",
+        "marker",
+        "phrase",
+        "token",
+        "word",
+    )
+    for label in labels:
+        if re.search(rf"\b{re.escape(label)}\b", text):
+            return label
     return None
 
 
@@ -6067,8 +6091,8 @@ def _is_conversation_context_setup(text: str) -> bool:
 def _asks_recent_conversation(text: str) -> bool:
     return bool(
         re.search(r"\b(what|which)\s+did\s+i\s+just\s+(say|ask|tell|give)\b", text)
-        or re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|phrase|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
-        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|marker\s+word|test\s+phrase|test\s+word|word|phrase|thing|request)\b", text)
+        or re.search(r"\bwhat\s+(marker\s+word|test\s+phrase|test\s+word|code\s+word|phrase|token|word)\s+did\s+i\s+just\s+(say|give|tell)\b", text)
+        or re.search(r"\bwhat\s+was\s+(the\s+)?(marker|marker\s+word|test\s+phrase|test\s+word|code\s+word|word|phrase|token|thing|request)\b", text)
         or re.search(r"\bwhat\s+did\s+i\s+(ask|say|tell)\s+immediately\s+before\s+this\b", text)
         or re.search(r"\b(what|which)\s+(was|were)\s+my\s+(last|previous)\s+(message|question|request)\b", text)
         or re.search(r"\bwhat\s+is\s+my\s+favorite\s+color\b", text)

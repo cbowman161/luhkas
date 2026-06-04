@@ -61,6 +61,7 @@ def load_function(name: str):
                     "_presence_uses_previous_turn",
                     "_conversation_user_turns",
                     "_extract_context_phrase",
+                    "_requested_context_phrase_label",
                     "_extract_context_fact",
                     "_matching_context_fact",
                     "_asks_recent_conversation",
@@ -173,7 +174,7 @@ class PresenceContextTest(unittest.TestCase):
         self.assertFalse(presence_uses_previous_turn(presence))
         self.assertNotIn("chat_context", result)
         self.assertEqual(result["recent_contexts"][0]["assistant"], "8")
-        self.assertEqual(conversation_user_turns(presence, "What is nine minus four?"), ["What is seven plus one?"])
+        self.assertEqual(conversation_user_turns(presence, "What is nine minus four?"), ["What is seven plus one?", "8"])
 
     def test_recent_conversation_phrases_are_not_vision_requests(self) -> None:
         asks_recent_conversation = load_function("_asks_recent_conversation")
@@ -211,6 +212,70 @@ class PresenceContextTest(unittest.TestCase):
         self.assertEqual(
             recent_conversation_answer("What test phrase did I just say?", presence),
             "The test phrase was blue comet.",
+        )
+
+    def test_recent_conversation_answer_uses_assistant_side_of_context_stack(self) -> None:
+        recent_conversation_answer = load_function("_recent_conversation_answer")
+        presence = {
+            "conversation_flow": {"mode": "followup", "uses_previous_turn": True},
+            "recent_contexts": [
+                {
+                    "index": 1,
+                    "user": "What test phrase did I just say?",
+                    "assistant": "The test phrase was heliotrope canyon.",
+                },
+                {"index": 2, "user": "status", "assistant": "No unread updates."},
+                {"index": 3, "user": "What is nine minus four?", "assistant": "5"},
+            ],
+        }
+
+        self.assertEqual(
+            recent_conversation_answer("What test phrase did I just say?", presence),
+            "The test phrase was heliotrope canyon.",
+        )
+
+    def test_recent_conversation_answer_uses_assistant_side_fact_summaries(self) -> None:
+        recent_conversation_answer = load_function("_recent_conversation_answer")
+        presence = {
+            "conversation_flow": {"mode": "followup", "uses_previous_turn": True},
+            "recent_contexts": [
+                {"index": 1, "user": "What is my favorite color?", "assistant": "Your favorite color is viridian."},
+                {"index": 2, "user": "What kind of art did I say I like?", "assistant": "You said you like stark architecture best."},
+                {"index": 3, "user": "What is nine minus four?", "assistant": "5"},
+            ],
+        }
+
+        self.assertEqual(
+            recent_conversation_answer("What is my favorite color?", presence),
+            "Your favorite color is viridian.",
+        )
+        self.assertEqual(
+            recent_conversation_answer("What kind of art did I say I like?", presence),
+            "You said you like stark architecture best.",
+        )
+
+    def test_recent_conversation_answer_matches_requested_phrase_label(self) -> None:
+        recent_conversation_answer = load_function("_recent_conversation_answer")
+        presence = {
+            "conversation_flow": {"mode": "followup", "uses_previous_turn": True},
+            "recent_contexts": [
+                {"index": 1, "user": "The test phrase is heliotrope canyon.", "assistant": "Got it. The test phrase is heliotrope canyon."},
+                {"index": 2, "user": "The marker word is viridian lantern.", "assistant": "Got it. The marker word is viridian lantern."},
+                {"index": 3, "user": "The token is stark architecture.", "assistant": "Got it. The token is stark architecture."},
+            ],
+        }
+
+        self.assertEqual(
+            recent_conversation_answer("What was the test phrase?", presence),
+            "The test phrase was heliotrope canyon.",
+        )
+        self.assertEqual(
+            recent_conversation_answer("What was the marker word?", presence),
+            "The marker word was viridian lantern.",
+        )
+        self.assertEqual(
+            recent_conversation_answer("What was the token?", presence),
+            "The token was stark architecture.",
         )
 
     def test_recent_conversation_answer_uses_user_preference_context(self) -> None:
