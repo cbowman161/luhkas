@@ -72,6 +72,12 @@ class StoreAuditor:
             alias_of = cap.get("alias_of")
             if alias_of and alias_of not in keys:
                 self.add("error", "alias target missing", {"key": key, "alias_of": alias_of})
+            elif alias_of:
+                root, cycle = self.resolve_alias_root(key, caps)
+                if cycle:
+                    self.add("error", "alias cycle detected", {"key": key, "cycle": cycle})
+                elif root != alias_of:
+                    self.add("error", "alias points to another alias", {"key": key, "alias_of": alias_of, "root": root})
             execution = cap.get("execution")
             if not isinstance(execution, dict):
                 self.add("error", "execution missing", {"key": key})
@@ -129,6 +135,22 @@ class StoreAuditor:
                 )
             if not entry.get("input"):
                 self.add("warn", "pending entry missing input", {"task_id": task_id})
+
+    def resolve_alias_root(self, key: str, caps: dict[str, Any]) -> tuple[str | None, list[str] | None]:
+        seen = []
+        current = key
+        while True:
+            if current in seen:
+                cycle = seen[seen.index(current):] + [current]
+                return None, cycle
+            seen.append(current)
+            cap = caps.get(current)
+            if not isinstance(cap, dict):
+                return current, None
+            alias_of = cap.get("alias_of")
+            if not alias_of:
+                return current, None
+            current = alias_of
 
     def audit_duplicates(self) -> None:
         engine = LearnedCapabilityEngine(LearnedCapabilityStore(self.store_path), code_monkey_client=None, model=None)
