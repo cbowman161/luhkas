@@ -244,6 +244,7 @@ class LearnedCapabilitiesBattery:
             ("denial does not persist", self.denial_does_not_persist),
             ("concept alias reuse", self.concept_alias_reuse),
             ("execution review reroutes correction", self.execution_review_reroutes_correction),
+            ("new learned command bypasses review", self.new_learned_command_bypasses_review),
             ("python recipe materialization", self.python_recipe_materialization),
             ("dangerous generated recipe rejected", self.dangerous_generated_recipe_rejected),
             ("store persistence and pending updates", self.store_persistence_and_pending_updates),
@@ -351,6 +352,39 @@ class LearnedCapabilitiesBattery:
             return {"corrected_key": "show me processor load", "description": caps["show me processor load"]["description"]}
         finally:
             tmp.cleanup()
+
+    def new_learned_command_bypasses_review(self) -> dict:
+        tmp, engine = self.make_engine()
+        try:
+            runtime = fake_runtime(engine)
+            engine.store.remember("cpu usage", self.seed_cap("vault_cpu_usage", "Vault CPU usage", "cpu", "usage"))
+            engine.store.remember("disk usage", self.seed_cap("vault_disk_usage", "Vault disk usage", "disk", "usage"))
+            first = self.require(runtime._handle_deterministic_presence_command("cpu usage", "scout"))
+            self.contains(first["message"], "Learned command.")
+            self.eq(runtime._get_pending("scout")["type"], "learned_execution_review")
+            second = self.require(runtime._handle_deterministic_presence_command("disk usage", "scout"))
+            self.contains(second["message"], "Learned command.")
+            self.eq(second["deterministic_source"], "learned_capability:vault_disk_usage")
+            caps = engine.store.all()["capabilities"]
+            self.require(caps.get("cpu usage"), "cpu usage cap missing")
+            self.require(caps.get("disk usage"), "disk usage cap missing")
+            self.eq(caps["cpu usage"].get("alias_of"), None)
+            self.eq(caps["disk usage"].get("alias_of"), None)
+            return {"first": first["deterministic_source"], "second": second["deterministic_source"]}
+        finally:
+            tmp.cleanup()
+
+    def seed_cap(self, intent: str, description: str, topic: str, aspect: str) -> dict:
+        return {
+            "intent": intent,
+            "description": description,
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.9,
+            "inferred": {"topic": topic, "aspect": aspect},
+            "execution": {"type": "bash", "command": f"echo {topic} {aspect}", "required_facts": [topic, aspect]},
+            "code_monkey_task": {"ok": False, "skipped": True},
+        }
 
     def python_recipe_materialization(self) -> dict:
         tmp, engine = self.make_engine()

@@ -1648,6 +1648,10 @@ class VaultRuntime:
         if not isinstance(pending, dict) or pending.get("type") != "learned_execution_review":
             return None
 
+        if self._should_bypass_learned_execution_review(message):
+            self._clear_pending()
+            return None
+
         # LLM-driven intent classification — no hardcoded "is this a
         # correction" patterns. Fast-paths still handle plain yes/no.
         intent_info = self._resolve_pending_intent(
@@ -1755,6 +1759,34 @@ class VaultRuntime:
             "compose": False,
             "response_composed": True,
         })
+
+    def _should_bypass_learned_execution_review(self, message: str) -> bool:
+        """Return True when a review-window turn is itself a learned command.
+
+        Learned-cap executions open a one-turn correction window. Without this
+        guard, a user who asks another learned command immediately after the
+        first can accidentally have the second phrase interpreted as a
+        correction of the first, causing alias churn in the store.
+        """
+        if _is_affirmative(message) or _is_denial(message):
+            return False
+        text = _command_text(message)
+        if (
+            _is_correction_of_previous(message)
+            or text.startswith("actually ")
+            or text.startswith("no ")
+            or text.startswith("nope ")
+            or text.startswith("nah ")
+            or text.startswith("wrong ")
+            or text.startswith("not ")
+        ):
+            return False
+        engine = self._learned_engine()
+        key = _learned_normalize(message)
+        caps = (engine.store.load().get("capabilities") or {})
+        if key and isinstance(caps.get(key), dict):
+            return True
+        return engine.lookup_by_concept(message) is not None
 
     def _handle_learned_capability_confirmation(self, message: str, node_id: str) -> dict | None:
         pending = self._get_pending(node_id)

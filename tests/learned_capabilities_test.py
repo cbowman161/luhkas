@@ -458,6 +458,46 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         self.assertIn("Current result: custom Vault check: custom output", summary)
         self.assertNotIn("For now:", summary)
 
+    def test_new_learned_command_bypasses_previous_execution_review(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        cpu_cap = {
+            "intent": "vault_cpu_usage",
+            "description": "Vault CPU usage",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.9,
+            "inferred": {"topic": "cpu", "aspect": "usage"},
+            "execution": {"type": "bash", "command": "echo cpu usage", "required_facts": ["cpu"]},
+            "code_monkey_task": {"ok": False, "skipped": True},
+        }
+        disk_cap = {
+            "intent": "vault_disk_usage",
+            "description": "Vault disk usage",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.9,
+            "inferred": {"topic": "disk", "aspect": "usage"},
+            "execution": {"type": "bash", "command": "echo disk usage", "required_facts": ["disk"]},
+            "code_monkey_task": {"ok": False, "skipped": True},
+        }
+        engine.store.remember("cpu usage", cpu_cap)
+        engine.store.remember("disk usage", disk_cap)
+
+        first = runtime._handle_deterministic_presence_command("cpu usage", "scout")
+        self.assertIn("Learned command.", first["message"])
+        self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+        second = runtime._handle_deterministic_presence_command("disk usage", "scout")
+
+        self.assertIn("Learned command.", second["message"])
+        self.assertEqual(second["deterministic_source"], "learned_capability:vault_disk_usage")
+        caps = engine.store.all()["capabilities"]
+        self.assertIn("cpu usage", caps)
+        self.assertIn("disk usage", caps)
+        self.assertIsNone(caps["cpu usage"].get("alias_of"))
+        self.assertIsNone(caps["disk usage"].get("alias_of"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
