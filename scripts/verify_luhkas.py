@@ -36,6 +36,7 @@ class Verifier:
         self.run_check("production learned store audit", [self.python, "scripts/audit_learned_capabilities_store.py"])
         if self.args.live:
             self.run_check("live learned capability probes", [self.python, "scripts/live_learned_capabilities_probe.py"])
+            self.run_check("live learned review correction probe", [self.python, "scripts/live_learned_review_correction_probe.py"])
             self.run_check("live context E2E", [self.python, "scripts/live_context_e2e.py"])
             self.run_check("post-live learned store maintenance dry-run", [self.python, "scripts/maintain_learned_capabilities_store.py", "--dry-run"])
             self.run_check("post-live production learned store audit", [self.python, "scripts/audit_learned_capabilities_store.py"])
