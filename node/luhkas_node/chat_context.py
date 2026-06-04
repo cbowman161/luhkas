@@ -13,11 +13,14 @@ def build_presence_payload(message: str, entries: list[dict], node_id: str) -> d
     context = _chat_context(entries)
     clarification = _clarification(message, context)
     reply_context = _reply_context(message, context)
+    conversation_flow = _conversation_flow(message, context, reply_context, clarification)
     routing_intent = classify_request_target(message, node_id)
     payload = {
         "message": message,
         "node_id": node_id,
         "chat_context": context,
+        "recent_contexts": _recent_contexts(message, context),
+        "conversation_flow": conversation_flow,
         "routing_intent": routing_intent,
         "request_owner": routing_intent.get("request_owner"),
         "target_node": routing_intent.get("target_node"),
@@ -129,6 +132,46 @@ def _reply_context(message: str, context: list[dict]) -> dict | None:
     }
 
 
+def _conversation_flow(
+    message: str,
+    context: list[dict],
+    reply_context: dict | None,
+    clarification: dict | None,
+) -> dict:
+    if clarification:
+        return {"mode": "clarification", "uses_previous_turn": True}
+    if reply_context:
+        return {"mode": "followup", "uses_previous_turn": True}
+    return {"mode": "new_topic", "uses_previous_turn": False}
+
+
+def _recent_contexts(message: str, context: list[dict], limit: int = 5) -> list[dict]:
+    prior = list(context)
+    if prior and prior[-1].get("role") == "user" and str(prior[-1].get("text") or "").strip() == str(message or "").strip():
+        prior = prior[:-1]
+    contexts = []
+    pending_user = None
+    for entry in prior:
+        role = entry.get("role")
+        text = str(entry.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            pending_user = text
+        elif role == "assistant" and pending_user:
+            contexts.append({
+                "user": pending_user,
+                "assistant": text,
+            })
+            pending_user = None
+    if pending_user:
+        contexts.append({"user": pending_user, "assistant": ""})
+    recent = contexts[-limit:]
+    for idx, item in enumerate(recent, start=1):
+        item["index"] = idx
+    return recent
+
+
 def _looks_like_confirmation(message: str) -> bool:
     text = " ".join(str(message).casefold().split())
     return text in {
@@ -158,7 +201,29 @@ def _looks_like_contextual_reply(message: str) -> bool:
         text.startswith("why")
         or text.startswith("how")
         or text.startswith("what do you mean")
-        or text in {"what?", "why?", "how?", "which one", "that one", "do it"}
+        or text.startswith("what about")
+        or text.startswith("how about")
+        or text.startswith("and ")
+        or text.startswith("also ")
+        or text.startswith("then ")
+        or text.startswith("back to")
+        or text.startswith("go back to")
+        or text.startswith("same for")
+        or text in {
+            "what?",
+            "why?",
+            "how?",
+            "which one",
+            "that one",
+            "do it",
+            "go on",
+            "continue",
+            "tell me more",
+            "more",
+            "same",
+            "same thing",
+            "next one",
+        }
     ):
         return True
     references_previous = {

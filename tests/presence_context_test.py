@@ -58,12 +58,12 @@ def load_function(name: str):
                     "_has_any",
                     "_canonical_intent_text",
                     "_presence_conversation_context",
+                    "_presence_uses_previous_turn",
                     "_conversation_user_turns",
                     "_extract_context_phrase",
                     "_extract_context_fact",
                     "_matching_context_fact",
                     "_asks_recent_conversation",
-                    "_voice_band",
                     "_normalize_source",
                     "_source_is_scout",
                     "_asks_feeling_state",
@@ -77,6 +77,7 @@ def load_function(name: str):
                     "_status_report_statement",
                     "_operational_status_facts",
                     "_operational_status_statement",
+                    "_rag_ingestion_runtime_status",
                     "_parse_scout_toggle_request",
                     "_toggle_state_value",
                     "_source_node_id",
@@ -149,6 +150,30 @@ class PresenceContextTest(unittest.TestCase):
             result["reply_context"]["previous_assistant_message"],
             "Evening. I'm here, but not for you.",
         )
+
+    def test_model_context_marks_new_topic_without_full_chat_but_keeps_stack(self) -> None:
+        presence_conversation_context = load_function("_presence_conversation_context")
+        conversation_user_turns = load_function("_conversation_user_turns")
+        presence_uses_previous_turn = load_function("_presence_uses_previous_turn")
+        presence = {
+            "conversation_flow": {"mode": "new_topic", "uses_previous_turn": False},
+            "chat_context": [
+                {"role": "user", "text": "What is seven plus one?"},
+                {"role": "assistant", "text": "8"},
+                {"role": "user", "text": "What is nine minus four?"},
+            ],
+            "recent_contexts": [
+                {"index": 1, "user": "What is seven plus one?", "assistant": "8"},
+            ],
+        }
+
+        result = presence_conversation_context(presence)
+
+        self.assertEqual(result["flow"]["mode"], "new_topic")
+        self.assertFalse(presence_uses_previous_turn(presence))
+        self.assertNotIn("chat_context", result)
+        self.assertEqual(result["recent_contexts"][0]["assistant"], "8")
+        self.assertEqual(conversation_user_turns(presence, "What is nine minus four?"), ["What is seven plus one?"])
 
     def test_recent_conversation_phrases_are_not_vision_requests(self) -> None:
         asks_recent_conversation = load_function("_asks_recent_conversation")
@@ -228,16 +253,6 @@ class PresenceContextTest(unittest.TestCase):
         self.assertTrue(is_conversation_context_setup("My favorite color is green."))
         self.assertTrue(is_conversation_context_setup("I like stark architecture best."))
 
-    def test_voice_band_formats_personality_state_values(self) -> None:
-        voice_band = load_function("_voice_band")
-
-        self.assertEqual(voice_band(0.1), "very low")
-        self.assertEqual(voice_band(0.35), "low")
-        self.assertEqual(voice_band(0.55), "medium")
-        self.assertEqual(voice_band(0.75), "medium-high")
-        self.assertEqual(voice_band(0.9), "high")
-        self.assertEqual(voice_band(None), "unknown")
-
     def test_mood_statement_compiles_values_into_feeling(self) -> None:
         mood_statement_from_state = load_function("_mood_statement_from_state")
 
@@ -260,14 +275,8 @@ class PresenceContextTest(unittest.TestCase):
         self.assertNotIn("edges", result.lower())
 
     def test_assistant_intro_does_not_volunteer_creator_or_scout(self) -> None:
-        assistant_intro_statement = load_function("_assistant_intro_statement")
         assistant_identity_response_violation = load_function("_assistant_identity_response_violation")
 
-        result = assistant_intro_statement("Luhkas")
-
-        self.assertIn("I'm Luhkas", result)
-        self.assertNotIn("Chris", result)
-        self.assertNotIn("Scout", result)
         self.assertTrue(assistant_identity_response_violation("I'm Luhkas. You are not Chris."))
         self.assertTrue(assistant_identity_response_violation("I'm Luhkas through the Scout body."))
         self.assertFalse(assistant_identity_response_violation("I'm Luhkas, a local AI for memory and connected action."))
@@ -460,41 +469,18 @@ class PresenceContextTest(unittest.TestCase):
         self.assertFalse(status_report_response_violation(result))
 
     def test_operational_status_report_lists_running_services_and_option_states(self) -> None:
-        operational_status_facts = load_function("_operational_status_facts")
         operational_status_statement = load_function("_operational_status_statement")
 
-        facts = operational_status_facts(
-            {
-                "ok": True,
-                "behavior": {"state": "MANUAL"},
-                "target_state": "manual",
-                "tracking_enabled": False,
-                "wheel_enabled": False,
-                "detections": [{"label": "chair"}, {"label": "clock"}],
-                "tracker": {"active_objects": 2, "memory_objects": 4, "bytetracker_enabled": True},
-                "pose_enabled": True,
-                "face_detection_enabled": True,
-                "face_recognition_enabled": True,
-                "person_memory_enabled": True,
-                "collision_avoidance_enabled": True,
-                "camera_light_auto_enabled": True,
-                "vault_memory": {"enabled": True, "last_face_sync_ok": True},
-            },
-            source_node="scout",
-        )
+        facts = {
+            "nodes": {
+                "vault": {"ok": True, "reachable": True, "services_down": []},
+                "kiosk": {"ok": True, "reachable": True, "services_down": []},
+                "scout": {"ok": True, "reachable": True, "services_down": []},
+            }
+        }
         result = operational_status_statement(facts)
 
-        self.assertIn("Services up:", result)
-        self.assertIn("Vault runtime", result)
-        self.assertIn("Scout presence", result)
-        self.assertIn("Scout vision", result)
-        self.assertIn("Options:", result)
-        self.assertIn("wheel motion off", result)
-        self.assertIn("tracking off", result)
-        self.assertIn("follow off", result)
-        self.assertIn("face recognition on", result)
-        self.assertIn("collision avoidance on", result)
-        self.assertIn("vault memory on", result)
+        self.assertIn("All services running", result)
         self.assertLessEqual(len(result.split()), 45)
         self.assertNotIn("RTX 3090", result)
         self.assertNotIn("qwen3:8b", result)

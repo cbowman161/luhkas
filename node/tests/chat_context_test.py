@@ -29,6 +29,7 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(len(payload["chat_context"]), 22)
         self.assertEqual(payload["chat_context"][0]["text"], "old turn 0")
         self.assertEqual(payload["chat_context"][-1]["text"], "Why?")
+        self.assertLessEqual(len(payload["recent_contexts"]), 5)
 
     def test_short_followup_links_to_previous_assistant_message(self) -> None:
         payload = build_presence_payload(
@@ -42,6 +43,8 @@ class ChatContextTest(unittest.TestCase):
         )
 
         self.assertTrue(payload["conversation_continuity"])
+        self.assertEqual(payload["conversation_flow"]["mode"], "followup")
+        self.assertTrue(payload["conversation_flow"]["uses_previous_turn"])
         self.assertEqual(payload["reply_context"]["type"], "reply_to_previous_assistant")
         self.assertEqual(payload["reply_context"]["previous_user_message"], "Good evening")
         self.assertEqual(
@@ -61,6 +64,7 @@ class ChatContextTest(unittest.TestCase):
         )
 
         self.assertTrue(payload["clarification"])
+        self.assertEqual(payload["conversation_flow"]["mode"], "clarification")
         self.assertEqual(payload["clarified_request"], "memory usage")
         self.assertEqual(payload["routing_feedback"]["type"], "route_confirmation")
         self.assertEqual(payload["routing_feedback"]["previous_user_message"], "memory usage")
@@ -77,9 +81,56 @@ class ChatContextTest(unittest.TestCase):
         )
 
         self.assertTrue(payload["clarification"])
+        self.assertEqual(payload["conversation_flow"]["mode"], "clarification")
         self.assertEqual(payload["routing_feedback"]["type"], "route_correction")
         self.assertIn("memory usage", payload["clarified_request"])
         self.assertIn("Correction from user: no, I meant memory usage", payload["clarified_request"])
+
+    def test_unrelated_new_question_is_marked_new_topic(self) -> None:
+        payload = build_presence_payload(
+            "What is nine minus four?",
+            [
+                entry("user", "What is seven plus one?"),
+                entry("assistant", "8"),
+                entry("user", "What is nine minus four?"),
+            ],
+            "scout",
+        )
+
+        self.assertNotIn("reply_context", payload)
+        self.assertEqual(payload["conversation_flow"]["mode"], "new_topic")
+        self.assertFalse(payload["conversation_flow"]["uses_previous_turn"])
+        self.assertEqual(payload["recent_contexts"][-1]["user"], "What is seven plus one?")
+        self.assertEqual(payload["recent_contexts"][-1]["assistant"], "8")
+
+    def test_implicit_followup_is_marked_contextual(self) -> None:
+        payload = build_presence_payload(
+            "What about Jupiter?",
+            [
+                entry("user", "Tell me about Mars."),
+                entry("assistant", "Mars is a rocky planet."),
+                entry("user", "What about Jupiter?"),
+            ],
+            "scout",
+        )
+
+        self.assertTrue(payload["conversation_continuity"])
+        self.assertEqual(payload["conversation_flow"]["mode"], "followup")
+        self.assertEqual(payload["reply_context"]["previous_user_message"], "Tell me about Mars.")
+
+    def test_recent_context_stack_keeps_last_five_exchanges(self) -> None:
+        entries = []
+        for idx in range(7):
+            entries.append(entry("user", f"topic {idx}"))
+            entries.append(entry("assistant", f"answer {idx}"))
+        entries.append(entry("user", "go back to topic 3"))
+
+        payload = build_presence_payload("go back to topic 3", entries, "scout")
+
+        self.assertEqual(len(payload["recent_contexts"]), 5)
+        self.assertEqual(payload["recent_contexts"][0]["user"], "topic 2")
+        self.assertEqual(payload["recent_contexts"][-1]["assistant"], "answer 6")
+        self.assertEqual(payload["conversation_flow"]["mode"], "followup")
 
     def test_ui_chat_attempts_local_commands_before_vault(self) -> None:
         source = LUHKAS_NODE_SERVICE.read_text(encoding="utf-8")

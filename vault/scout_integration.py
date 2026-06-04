@@ -125,6 +125,30 @@ def _presence_conversation_context(presence_context: dict | None) -> dict:
     if not isinstance(presence_context, dict):
         return {}
     result = {}
+    flow = presence_context.get("conversation_flow")
+    if isinstance(flow, dict):
+        mode = str(flow.get("mode") or "").strip()
+        if mode:
+            result["flow"] = {
+                "mode": mode,
+                "uses_previous_turn": bool(flow.get("uses_previous_turn")),
+            }
+    recent_contexts = presence_context.get("recent_contexts")
+    if isinstance(recent_contexts, list):
+        clean_contexts = []
+        for item in recent_contexts[-5:]:
+            if not isinstance(item, dict):
+                continue
+            user = str(item.get("user") or "").strip()
+            assistant = str(item.get("assistant") or "").strip()
+            if user or assistant:
+                clean_contexts.append({
+                    "index": item.get("index"),
+                    "user": user,
+                    "assistant": assistant,
+                })
+        if clean_contexts:
+            result["recent_contexts"] = clean_contexts
     reply_context = presence_context.get("reply_context")
     if isinstance(reply_context, dict):
         result["reply_context"] = {
@@ -138,7 +162,12 @@ def _presence_conversation_context(presence_context: dict | None) -> dict:
             if reply_context.get(key)
         }
     chat_context = presence_context.get("chat_context")
-    if isinstance(chat_context, list):
+    include_chat_context = bool(
+        result.get("reply_context")
+        or result.get("flow", {}).get("uses_previous_turn")
+        or not result.get("flow")
+    )
+    if include_chat_context and isinstance(chat_context, list):
         full_chat = []
         for entry in chat_context:
             if not isinstance(entry, dict):
@@ -152,13 +181,29 @@ def _presence_conversation_context(presence_context: dict | None) -> dict:
     return result
 
 
+def _presence_uses_previous_turn(presence_context: dict | None) -> bool:
+    if not isinstance(presence_context, dict):
+        return False
+    flow = presence_context.get("conversation_flow")
+    if isinstance(flow, dict):
+        return bool(flow.get("uses_previous_turn"))
+    return bool(presence_context.get("conversation_continuity") or presence_context.get("reply_context"))
+
+
 def _conversation_user_turns(presence_context: dict | None, current_message: str | None = None) -> list[str]:
-    context = _presence_conversation_context(presence_context).get("chat_context") or []
+    conversation = _presence_conversation_context(presence_context)
+    context = conversation.get("chat_context") or []
     turns = [
         str(entry.get("text") or "").strip()
         for entry in context
         if entry.get("role") == "user" and str(entry.get("text") or "").strip()
     ]
+    if not turns:
+        turns = [
+            str(entry.get("user") or "").strip()
+            for entry in conversation.get("recent_contexts") or []
+            if str(entry.get("user") or "").strip()
+        ]
     current = str(current_message or "").strip()
     if current and turns and turns[-1] == current:
         turns = turns[:-1]
@@ -4505,6 +4550,11 @@ English:
         self_description = _identity_sentence(identity_name, identity_role)
         response_context = self.response_context(state)
         conversation_context = _presence_conversation_context(presence_context)
+        uses_previous_turn = (
+            _presence_uses_previous_turn(presence_context)
+            or bool(conversation_context.get("reply_context"))
+            or _asks_recent_conversation(_canonical_intent_text(message))
+        )
         # Convert stored 3rd-person facts to 2nd person before injecting so
         # the chat LLM never has to mentally map "the user" -> "you". The
         # small chat model has misread "the user's name is Chris" as being
@@ -4523,19 +4573,13 @@ English:
             world_hits = []
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
-        # Layer 2: always include recent conversation turns as continuity
-        # context, not just as a fallback when memory is empty. Without
-        # this, multi-turn exchanges feel transactional ("what's my
-        # name?" → factual answer with zero awareness that we were just
-        # discussing CPU). With it, the LLM can ground "and the next
-        # one?" against the previous turn's topic. The
-        # rejected-conflict-leakage risk the old comment described
-        # (e.g., "I work as an architect" → "no, keep teacher" → model
-        # still sees architect) is mitigated by (1) the memory_update
-        # confirmation flow scrubbing the rejected fact and (2) limiting
-        # recent_chat to a small window so old conflicts age out.
+        # Layer 2: recent_contexts is always available as a context stack, but
+        # recent_chat is only promoted as active continuity when the node marks
+        # this turn as a follow-up/clarification or the user asks about recent
+        # chat. That lets the user switch back to one of the last few contexts
+        # without making every new topic inherit the previous answer.
         chat_limit = 3 if recalled_facts else 5
-        recent_chat = self._recent_chat_for_recall(limit=chat_limit)
+        recent_chat = self._recent_chat_for_recall(limit=chat_limit) if uses_previous_turn else []
         # If we can't address by name, scrub primary_user out of
         # recent_chat too — once the model emits a bad "Your name is X"
         # reply, that text sits in recent_chat and reinforces itself on
@@ -4639,6 +4683,8 @@ For world-fact questions (NOT about the speaker — e.g. capitals, history, scie
   - Never blend world_knowledge with remembered_user_facts. Speaker questions use facts; world questions use world_knowledge.
 Answer in second person ("you", "your") when the source is about the speaker.
 If conversation_context.reply_context exists, treat the user message as a reply to previous_assistant_message.
+If conversation_context.flow.mode is "new_topic", answer the current user message independently and do not reuse prior answers unless the user explicitly asks about them.
+conversation_context.recent_contexts contains up to five recent user/assistant exchanges. Use it only when the current message asks to continue, compare, revise, or go back to one of those contexts; otherwise leave it alone.
 Do not mention Scout vision/tracking unless the user asks about vision or identity.
 Do not address the user by name/title unless identity_context permits it.
 If answering ACCURATELY would require seeing the live camera scene (e.g. questions about colors of nearby objects, who is in the room right now, what is on a specific surface in front of you), reply with EXACTLY the phrase "Would you like me to analyze the scene?" — do NOT guess from generic knowledge or invent details. This is the ONLY way to invoke scene analysis on the user's behalf; the next "yes" will run the full vision pipeline against the live camera.
