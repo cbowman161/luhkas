@@ -530,6 +530,91 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         self.assertEqual(Path(original["path"]).read_text(encoding="utf-8"), "print('network count')")
         self.assertEqual(Path(generated["path"]).read_text(encoding="utf-8"), "print('figlet version')")
 
+    def _seed_cpu_usage_cap(self, engine) -> None:
+        engine.store.remember("cpu usage", {
+            "intent": "vault_cpu_usage",
+            "description": "Vault CPU usage",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.9,
+            "inferred": {"topic": "cpu", "aspect": "usage"},
+            "execution": {"type": "bash", "command": "echo cpu usage", "required_facts": ["cpu"]},
+            "code_monkey_task": {"ok": False, "skipped": True},
+        })
+
+    def test_learned_status_bypasses_open_execution_review(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        self._seed_cpu_usage_cap(engine)
+        first = runtime._handle_deterministic_presence_command("cpu usage", "scout")
+        self.assertIn("Learned command.", first["message"])
+        self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+        status = runtime._handle_deterministic_presence_command("learned status", "scout")
+
+        self.assertEqual(status["deterministic_source"], "learned_growth_status")
+        self.assertIn("Learned growth status", status["message"])
+        self.assertIsNone(runtime._get_pending("scout"))
+        self.assertIn("cpu usage", engine.store.all()["capabilities"])
+
+    def test_fix_failed_learned_attempts_bypasses_open_execution_review(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        self._seed_cpu_usage_cap(engine)
+        proposal = {
+            "intent": "vault_system_info",
+            "description": "Vault disk usage",
+            "route": "learned_capability",
+            "target": "vault",
+            "confidence": 0.84,
+            "inferred": {"topic": "disk", "aspect": "usage"},
+            "planner": "code_monkey_single_recipe",
+        }
+        engine.store.remember_pending_code_monkey(
+            "check disk",
+            proposal,
+            {"ok": True, "task_id": "cm-task-1", "goal": "learn disk usage", "state": "queued"},
+        )
+        engine.store.update_pending_code_monkey("cm-task-1", {"state": "test_failed", "notified": True})
+        started = []
+
+        def _fake_spawn_async_learn(self, *, original_message, proposal, confirmed_by, node_id):
+            started.append((original_message, confirmed_by, node_id))
+
+        runtime._spawn_async_learn = types.MethodType(_fake_spawn_async_learn, runtime)
+        runtime._handle_deterministic_presence_command("cpu usage", "scout")
+
+        response = runtime._handle_deterministic_presence_command("fix failed learned attempts", "scout")
+
+        self.assertEqual(response["deterministic_source"], "learned_growth_fix")
+        self.assertEqual(started, [("check disk", "user_requested_failed_learn_retry", "scout")])
+        self.assertIsNone(runtime._get_pending("scout"))
+
+    def test_install_missing_learned_packages_bypasses_open_execution_review(self) -> None:
+        engine = self.make_engine()
+        runtime = fake_runtime(engine)
+        self._seed_cpu_usage_cap(engine)
+        runtime.event_log.write("learn:missing:1", "learn_needs_install", "missing figlet", {
+            "original_message": "show figlet",
+            "description": "Vault figlet version",
+            "missing_binary": "figlet",
+            "suggested_package": "figlet",
+        })
+        started = []
+
+        def _fake_spawn_async_install(self, package: str, node_id: str):
+            started.append((package, node_id))
+            return {}
+
+        runtime._spawn_async_install = types.MethodType(_fake_spawn_async_install, runtime)
+        runtime._handle_deterministic_presence_command("cpu usage", "scout")
+
+        response = runtime._handle_deterministic_presence_command("install missing learned packages", "scout")
+
+        self.assertEqual(response["deterministic_source"], "learned_growth_install_missing")
+        self.assertEqual(started, [("figlet", "scout")])
+        self.assertIsNone(runtime._get_pending("scout"))
+
     def test_learned_growth_status_reports_store_and_failures(self) -> None:
         engine = self.make_engine()
         runtime = fake_runtime(engine)

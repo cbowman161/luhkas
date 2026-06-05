@@ -2228,6 +2228,8 @@ class VaultRuntime:
         if _is_affirmative(message) or _is_denial(message):
             return False
         text = _command_text(message)
+        if self._is_review_bypass_command(text):
+            return True
         if (
             _is_correction_of_previous(message)
             or text.startswith("actually ")
@@ -2244,6 +2246,18 @@ class VaultRuntime:
         if key and isinstance(caps.get(key), dict):
             return True
         return engine.lookup_by_concept(message) is not None
+
+    def _is_review_bypass_command(self, text: str) -> bool:
+        """Commands that should run even if a learned-result review is open."""
+        if text in _UPDATES_COMMANDS or text in _JOBS_COMMANDS:
+            return True
+        if text in _CODE_MONKEY_HEALTH_COMMANDS or text in _AUDIT_CAPS_COMMANDS:
+            return True
+        if text in _LEARNED_STATUS_COMMANDS or text in _LEARNED_FIX_COMMANDS:
+            return True
+        if text in _LEARNED_INSTALL_MISSING_COMMANDS:
+            return True
+        return bool(text.startswith(_INSTALL_COMMAND_PREFIX))
 
     def _handle_learned_capability_confirmation(self, message: str, node_id: str) -> dict | None:
         pending = self._get_pending(node_id)
