@@ -530,7 +530,7 @@ class LearnedCapabilityStore:
 class LearnedCapabilityEngine:
     """Confirm, execute, and persist safe non-Scout deterministic recipes."""
 
-    VECTOR_MATCH_DISTANCE_MAX = float(os.environ.get("LEARNED_CAP_VECTOR_DISTANCE_MAX", "0.18"))
+    VECTOR_MATCH_DISTANCE_MAX = float(os.environ.get("LEARNED_CAP_VECTOR_DISTANCE_MAX", "0.44"))
 
     def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None, model=None, embedder=None):
         self.store = store or LearnedCapabilityStore()

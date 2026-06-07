@@ -26,7 +26,7 @@ _cache: dict | None = None
 _cache_mtime: float = 0.0
 _semantic_store = None
 _semantic_signature: tuple[float, int] | None = None
-_VECTOR_DISTANCE_MAX = float(os.environ.get("DETERMINISTIC_ROUTE_VECTOR_DISTANCE_MAX", "0.14"))
+_VECTOR_DISTANCE_MAX = float(os.environ.get("DETERMINISTIC_ROUTE_VECTOR_DISTANCE_MAX", "0.38"))
 
 
 def _normalize(text: str) -> str:
