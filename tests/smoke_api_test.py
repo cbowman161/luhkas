@@ -34,10 +34,16 @@ def _json_request(url: str, method: str = "GET", payload: dict | None = None) ->
 
 class _ServerCase(unittest.TestCase):
     def start_server(self, server: ThreadingHTTPServer) -> str:
+        server.daemon_threads = True
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
+
+        def cleanup() -> None:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.addCleanup(cleanup)
         host, port = server.server_address
         return f"http://{host}:{port}"
 

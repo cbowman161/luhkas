@@ -54,6 +54,19 @@ class FakeRegistry:
     def list(self):
         return list(self.capabilities)
 
+    def lookup_by_alias(self, normalized_text: str):
+        target = str(normalized_text or "").strip().lower().replace("_", " ")
+        for capability in self.capabilities:
+            names = [
+                capability.get("name"),
+                capability.get("description"),
+                *(capability.get("examples") or []),
+            ]
+            for name in names:
+                if str(name or "").strip().lower().replace("_", " ") == target:
+                    return capability
+        return None
+
 
 class FakeSkillRegistry:
     def list(self):
@@ -186,17 +199,48 @@ class FakeCommandAgent:
         return None
 
 
+class FakeClassroom:
+    def maybe_handle_turn(self, message: str, node_id: str):
+        return None
+
+
+class FakeChatSessions:
+    def get_active(self, node_id: str):
+        return None
+
+    def open_session(self, *args, **kwargs) -> None:
+        pass
+
+    def sweep_idle(self) -> None:
+        pass
+
+    def add_turn(self, *args, **kwargs) -> None:
+        pass
+
+    def record_route(self, *args, **kwargs) -> None:
+        pass
+
+
+class FakeScout:
+    active_identity = None
+
+
 def fake_runtime() -> VaultRuntime:
     runtime = VaultRuntime.__new__(VaultRuntime)
     runtime.registry = FakeRegistry()
     runtime.skill_registry = FakeSkillRegistry()
     runtime.blackboard = FakeBlackboard()
     runtime.router = FakeRouter()
+    runtime.scout = FakeScout()
     runtime.command_agent = FakeCommandAgent()
+    runtime.classroom = FakeClassroom()
+    runtime.chat_sessions = FakeChatSessions()
     runtime.node_registry = FakeNodeRegistry()
     runtime.active_task_id = None
     runtime._node_task_ids = {}
     runtime._current_node_id = "scout"
+    runtime._node_pendings = {}
+    runtime._node_pendings_lock = threading.RLock()
     runtime._async_job_lock = threading.Lock()
     runtime._active_learn_jobs = {}
     runtime._active_install_jobs = {}

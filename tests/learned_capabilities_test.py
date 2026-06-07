@@ -863,6 +863,7 @@ class SemanticCandidateTest(unittest.TestCase):
                 deterministic_router._semantic_store = old_semantic
                 deterministic_router._semantic_signature = old_signature
                 deterministic_router._VECTOR_DISTANCE_MAX = old_distance
+                deterministic_router.threading.Thread = old_thread
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
