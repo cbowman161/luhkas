@@ -52,6 +52,7 @@ def load_function(name: str):
             namespace = {}
             imports = [
                 ast.Import(names=[ast.alias(name="re")]),
+                ast.Import(names=[ast.alias(name="time")]),
             ]
             dependencies = [
                 function_nodes[dep]
@@ -83,6 +84,7 @@ def load_function(name: str):
                     "_operational_status_facts",
                     "_operational_status_statement",
                     "_rag_ingestion_runtime_status",
+                    "_rag_ingestion_state_is_fresh",
                     "_parse_scout_toggle_request",
                     "_toggle_state_value",
                     "_source_node_id",
