@@ -41,7 +41,11 @@ def load_function(name: str):
         node
         for node in module.body
         if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "SCOUT_TOGGLE_DEFINITIONS" for target in node.targets)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id in {"SCOUT_TOGGLE_DEFINITIONS", "_VISION_TRIGGER_PHRASES"}
+            for target in node.targets
+        )
     ]
     for node in module.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
@@ -84,6 +88,9 @@ def load_function(name: str):
                     "_source_node_id",
                     "_self_route",
                     "_looks_like_scout_action",
+                    "_looks_like_scout_hardware_command",
+                    "_has_vision_trigger",
+                    "_is_plain_general_question",
                     "_personality_preference_answer",
                     "_is_social_greeting",
                     "_is_conversation_context_setup",
@@ -397,6 +404,27 @@ class PresenceContextTest(unittest.TestCase):
                 self.assertIsNotNone(route)
                 self.assertTrue(route.get("deterministic"))
                 self.assertIn(route.get("route"), {"self_question", "greeting"})
+
+    def test_plain_world_questions_have_deterministic_fast_route(self) -> None:
+        fast_route_message = load_function("_fast_route_message")
+
+        for text in (
+            "What causes the tides?",
+            "Where is the Atacama Desert?",
+            "Who wrote The Origin of Species?",
+        ):
+            with self.subTest(text=text):
+                route = fast_route_message(text)
+                self.assertIsNotNone(route)
+                self.assertTrue(route.get("deterministic"))
+                self.assertEqual(route.get("route"), "general_question")
+
+    def test_plain_world_fast_route_preserves_vision_and_self_paths(self) -> None:
+        fast_route_message = load_function("_fast_route_message")
+
+        self.assertIsNone(fast_route_message("What do you see?"))
+        self.assertEqual(fast_route_message("What is your name?")["self_route"]["route"], "assistant_identity")
+        self.assertEqual(fast_route_message("Is tracking on?")["self_route"]["route"], "status")
 
     def test_broad_status_is_not_taken_as_direct_scout_action(self) -> None:
         looks_like_scout_action = load_function("_looks_like_scout_action")

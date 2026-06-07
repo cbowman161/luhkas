@@ -1425,6 +1425,20 @@ class ScoutVaultBridge:
             return result
 
     def _handle_message_impl(self, message: str, source=None, presence_context: dict | None = None, node_id: str = ""):
+        timing_start = time.perf_counter()
+        timing_mark = timing_start
+        timings: dict[str, object] = {}
+
+        def mark_timing(name: str) -> None:
+            nonlocal timing_mark
+            now = time.perf_counter()
+            timings[name] = round((now - timing_mark) * 1000.0, 2)
+            timing_mark = now
+
+        def finish_timings() -> dict[str, object]:
+            timings["total"] = round((time.perf_counter() - timing_start) * 1000.0, 2)
+            return dict(timings)
+
         actions = []
         source = _normalize_source(source)
         if _is_wakeword_only(message):
@@ -1513,6 +1527,7 @@ class ScoutVaultBridge:
 
         state = self.camera_state_for_node(node_id)
         self._adopt_identity_from_state(state, node_id=node_id)
+        mark_timing("camera_state")
 
         if _looks_like_scout_action(message) and not _asks_broad_status_report(_canonical_intent_text(message)):
             if _source_is_scout(source):
@@ -1682,6 +1697,12 @@ class ScoutVaultBridge:
                 source=source,
                 presence_context=presence_context,
             )
+            mark_timing("dispatch_route")
+            answer_provenance = self.build_answer_provenance(message, fast_route, state)
+            mark_timing("answer_provenance")
+            chat_timings = getattr(self, "_current_chat_timings_ms", None)
+            if isinstance(chat_timings, dict) and chat_timings:
+                timings["answer"] = chat_timings
             turn = {
                 "message": message,
                 "source": source,
@@ -1689,13 +1710,15 @@ class ScoutVaultBridge:
                 "response": response,
                 "active_identity": self.active_identity,
                 "actions": actions,
-                "answer_provenance": self.build_answer_provenance(message, fast_route, state),
+                "answer_provenance": answer_provenance,
+                "timings_ms": finish_timings(),
             }
             self.turns.append(turn)
             self.turns = self.turns[-30:]
             return {"ok": True, **turn}
 
         feedback = self.classify_response_feedback(message)
+        mark_timing("feedback_classification")
         if feedback.get("ok") and feedback.get("is_feedback"):
             feedback_kind = feedback.get("kind", "response_lesson")
             if feedback_kind == "temperature_update":
@@ -1730,11 +1753,13 @@ class ScoutVaultBridge:
             return {"ok": True, **turn}
 
         keywords = self.extract_message_keywords(message, presence_context)
+        mark_timing("keyword_extraction")
         if keywords.get("people") or keywords.get("nodes"):
             state = dict(state)
             state["_keywords"] = keywords
 
         route = self.route_message(message, state)
+        mark_timing("route_message")
         route.update(_presence_route_context(presence_context))
 
         scout_action_allowed = (
@@ -1782,6 +1807,12 @@ class ScoutVaultBridge:
             return {"ok": True, **turn}
 
         response = self._dispatch_route(message, route, state, actions, source=source, presence_context=presence_context)
+        mark_timing("dispatch_route")
+        answer_provenance = self.build_answer_provenance(message, route, state)
+        mark_timing("answer_provenance")
+        chat_timings = getattr(self, "_current_chat_timings_ms", None)
+        if isinstance(chat_timings, dict) and chat_timings:
+            timings["answer"] = chat_timings
         turn = {
             "message": message,
             "source": source,
@@ -1789,7 +1820,8 @@ class ScoutVaultBridge:
             "response": response,
             "active_identity": self.active_identity,
             "actions": actions,
-            "answer_provenance": self.build_answer_provenance(message, route, state),
+            "answer_provenance": answer_provenance,
+            "timings_ms": finish_timings(),
         }
         self.turns.append(turn)
         self.turns = self.turns[-30:]
@@ -1805,6 +1837,7 @@ class ScoutVaultBridge:
         presence_context: dict | None = None,
     ) -> str:
         """Execute the appropriate handler for an already-determined route."""
+        self._current_chat_timings_ms = {}
         if not route.get("ok"):
             return self.generate_response(
                 "routing_error", message, state, {"route": route}, max_tokens=100
@@ -2599,6 +2632,31 @@ Invalid previous response:
 {invalid_response}
 """
 
+    def _message_may_need_feedback_classifier(self, message: str) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        hint_terms = (
+            "wrong", "incorrect", "not what i asked", "not what i meant",
+            "too much", "too long", "too detailed", "more concise", "less detail",
+            "be more", "be less", "tone", "rude", "warmer", "blunt", "formal",
+            "next time", "from now on", "in future", "future answers",
+            "when i ask", "if i ask", "don't", "dont", "do not", "never", "always",
+            "prefer", "instead", "only asked", "source of truth", "use the node registry",
+            "registered nodes", "check the registered nodes", "cite", "citation",
+            "provenance", "answer style", "response style", "you should",
+        )
+        if any(term in lowered for term in hint_terms):
+            return True
+        if re.search(r"\b(?:answer|respond|reply|say|mention|include|avoid|use|check)\b.*\b(?:instead|next time|from now|future|when i ask|if i ask)\b", lowered):
+            return True
+        if "?" in text:
+            return False
+        if re.match(r"\s*(?:what|who|where|when|why|how|is|are|do|does|did|can|could|would|should|tell me|show me)\b", lowered):
+            return False
+        return False
+
     def classify_response_feedback(self, message: str):
         if _looks_like_ownership_question(message) or _asks_registry_source_followup(message):
             return {
@@ -2640,6 +2698,15 @@ Invalid previous response:
                 "confidence": 1.0,
                 "reason": "explicit response preference",
                 "attempts": 0,
+            }
+        if not self._message_may_need_feedback_classifier(message):
+            return {
+                "ok": True,
+                "is_feedback": False,
+                "confidence": 0.0,
+                "reason": "no feedback markers",
+                "attempts": 0,
+                "skipped_classifier": True,
             }
         prompt = f"""
 Decide whether the user message teaches the assistant how to respond or behave.
@@ -4622,8 +4689,24 @@ English:
         return bool(self._STEPWISE_FOLLOWUP_RE.search(message or ""))
 
     def answer_with_context(self, message: str, state: dict, presence_context: dict | None = None):
+        timing_start = time.perf_counter()
+        timing_mark = timing_start
+        timings: dict[str, float] = {}
+
+        def mark_timing(name: str) -> None:
+            nonlocal timing_mark
+            now = time.perf_counter()
+            timings[name] = round((now - timing_mark) * 1000.0, 2)
+            timing_mark = now
+
+        def finish_timing() -> None:
+            timings["total"] = round((time.perf_counter() - timing_start) * 1000.0, 2)
+            self._current_chat_timings_ms = dict(timings)
+
         arithmetic_answer = _simple_arithmetic_answer(message)
         if arithmetic_answer is not None:
+            mark_timing("arithmetic_short_circuit")
+            finish_timing()
             return arithmetic_answer
 
         identity_name = self.identity_profile.get("name")
@@ -4643,7 +4726,9 @@ English:
             identity_role = self._scrub_primary_user(identity_role, primary_user)
         self_description = _identity_sentence(identity_name, identity_role)
         response_context = self.response_context(state)
+        mark_timing("response_context")
         conversation_context = _presence_conversation_context(presence_context)
+        mark_timing("conversation_context")
         uses_previous_turn = (
             _presence_uses_previous_turn(presence_context)
             or bool(conversation_context.get("reply_context"))
@@ -4657,6 +4742,7 @@ English:
             self._third_to_second_person(r["content"])
             for r in self.recall_user_facts(message, top_k=5)
         ]
+        mark_timing("user_memory_recall")
         # World-knowledge lookup is identity-free. Skip the ~100-300ms
         # vector search entirely for messages that clearly ask about the
         # speaker — the prompt forbids the model from using world hits
@@ -4665,6 +4751,7 @@ English:
             world_hits = self.recall_world_knowledge(message, top_k=3)
         else:
             world_hits = []
+        mark_timing("world_rag")
         persist_result = getattr(self, "_current_persist_result", None) or {"stored": [], "already_known": []}
         facts_just_stored = [r["content"] for r in persist_result.get("stored", [])]
         # Layer 2: recent_contexts is always available as a context stack, but
@@ -4674,6 +4761,7 @@ English:
         # without making every new topic inherit the previous answer.
         chat_limit = 3 if recalled_facts else 5
         recent_chat = self._recent_chat_for_recall(limit=chat_limit) if uses_previous_turn else []
+        mark_timing("recent_chat")
         # If we can't address by name, scrub primary_user out of
         # recent_chat too — once the model emits a bad "Your name is X"
         # reply, that text sits in recent_chat and reinforces itself on
@@ -4783,6 +4871,7 @@ Do not mention Scout vision/tracking unless the user asks about vision or identi
 Do not address the user by name/title unless identity_context permits it.
 If answering ACCURATELY would require seeing the live camera scene (e.g. questions about colors of nearby objects, who is in the room right now, what is on a specific surface in front of you), reply with EXACTLY the phrase "Would you like me to analyze the scene?" — do NOT guess from generic knowledge or invent details. This is the ONLY way to invoke scene analysis on the user's behalf; the next "yes" will run the full vision pipeline against the live camera.
 """
+        mark_timing("prompt_build")
         try:
             # Bypass response_composer: its outer "Write the final user-facing
             # answer..." scaffold treats this prompt as data ("Facts:
@@ -4801,14 +4890,18 @@ If answering ACCURATELY would require seeing the live camera scene (e.g. questio
                 think=False,
                 allow_empty=True,
             ) or "").strip()
+            mark_timing("generate")
             text = _sanitize_generated_response(text) if text else ""
             if not text:
+                finish_timing()
                 return "I could not generate that cleanly."
             violation = self.response_policy_violation(text, state, "general_question")
             if violation:
                 fallback = self.cleanup_policy_failed_response(
                     "general_question", state, "policy violation"
                 )
+                mark_timing("policy_fallback")
+                finish_timing()
                 return fallback or "I could not generate that cleanly."
             # Strip fabricated Wikipedia citations. The chat model
             # sometimes adds "According to Wikipedia's X article" even
@@ -4817,8 +4910,12 @@ If answering ACCURATELY would require seeing the live camera scene (e.g. questio
             # model ignores the rule for high-confidence pretraining
             # facts. Better to scrub the cite than mislead the user.
             text = self._strip_unverified_wiki_citations(text)
+            mark_timing("postprocess")
+            finish_timing()
             return text
         except Exception as exc:
+            mark_timing("generate_error")
+            finish_timing()
             return f"I can hear you, but my local chat model is unavailable: {exc}"
 
     _UNVERIFIED_CITATION_PATTERNS = (
@@ -6099,6 +6196,15 @@ def _fast_route_message(message: str) -> dict | None:
             "attempts": 0,
             "deterministic": True,
         }
+    if _is_plain_general_question(text):
+        return {
+            "ok": True,
+            "route": "general_question",
+            "confidence": 0.94,
+            "reason": "plain factual or conversational question",
+            "attempts": 0,
+            "deterministic": True,
+        }
     if _asks_assistant_name(text):
         return _self_route("assistant_identity", "asks assistant name")
     if _asks_assistant_identity_topic(text):
@@ -6128,6 +6234,24 @@ def _fast_route_message(message: str) -> dict | None:
             "deterministic": True,
         }
     return None
+
+
+def _is_plain_general_question(text: str) -> bool:
+    if not text:
+        return False
+    if _has_vision_trigger(text) or _looks_like_scout_action(text) or _looks_like_scout_hardware_command(text):
+        return False
+    # Self-pronoun questions often mean identity, capability, status, or live
+    # scene analysis. Keep those on the richer router/self-route path.
+    if re.search(r"\b(you|your|yours|yourself)\b", text):
+        return False
+    if re.match(r"\b(?:what|who|where|when|why|which)\b", text):
+        return True
+    if re.match(r"\bhow\s+(?:do|does|did|is|are|was|were|can|would|should|many|much|long|far|old)\b", text):
+        return True
+    if re.match(r"\b(?:is|are|was|were|do|does|did)\s+(?:the|a|an|[a-z0-9])", text):
+        return True
+    return False
 
 
 def _is_social_greeting(text: str) -> bool:

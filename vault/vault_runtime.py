@@ -891,6 +891,27 @@ class VaultRuntime:
     def handle_presence(self, message: str, node_id: str = "scout", presence_context: dict | None = None):
         """Route a presence/chat message through the scout bridge and return an
         enriched response with the same shape as handle()."""
+        timing_start = time.perf_counter()
+        timing_mark = timing_start
+        timings: dict[str, float] = {}
+
+        def mark_timing(name: str) -> None:
+            nonlocal timing_mark
+            now = time.perf_counter()
+            timings[name] = round((now - timing_mark) * 1000.0, 2)
+            timing_mark = now
+
+        def attach_timings(response: dict | None) -> dict | None:
+            if not isinstance(response, dict):
+                return response
+            merged = dict(timings)
+            existing = response.get("timings_ms")
+            if isinstance(existing, dict):
+                merged["scout"] = existing
+            merged["total"] = round((time.perf_counter() - timing_start) * 1000.0, 2)
+            response["timings_ms"] = merged
+            return response
+
         self._touch_user_activity()
         self.active_task_id = self._node_task_ids.get(node_id)
         self._current_node_id = node_id
@@ -936,6 +957,7 @@ class VaultRuntime:
             self.chat_sessions.sweep_idle()
         except Exception as exc:
             log.warning("chat_sessions bookkeeping failed: %s", exc)
+        mark_timing("session_bookkeeping")
         # User-is-here signal: bump activity FIRST so the registry's
         # currently_active_node_ids() check sees this node as active,
         # then drain any deferred alerts onto this node's queue, then
@@ -963,10 +985,12 @@ class VaultRuntime:
                 capabilities=presence_context.get("node_capabilities") or {},
                 modules=presence_context.get("modules") or {},
             )
+        mark_timing("alerts_and_node_state")
         direct = self._handle_deterministic_presence_command(message, node_id)
+        mark_timing("deterministic_checks")
         if direct is not None:
             self.node_registry.update_activity(node_id, identity=None)
-            return direct
+            return attach_timings(direct)
         # Vision short-circuit: if a previous turn left us in
         # vision_full_analysis_confirmation, a yes here re-routes through
         # scout WITH force_full_vision so the heavy vision LLM runs.
@@ -996,7 +1020,7 @@ class VaultRuntime:
                     "result": {"original_message": pending.get("original_message")},
                     "learned": [],
                 })
-                return self._remember_active({
+                response = self._remember_active({
                     "mode": "direct",
                     "message": "OK, I won't run the full vision analysis.",
                     "active_task_id": self.active_task_id,
@@ -1005,6 +1029,7 @@ class VaultRuntime:
                     "compose": False,
                     "response_composed": True,
                 })
+                return attach_timings(response)
             else:
                 # Ambiguous → drop the pending and let the new message route
                 # normally; the short-circuit will re-arm if it's a vision ask.
@@ -1025,6 +1050,7 @@ class VaultRuntime:
             node_id=node_id,
             presence_context=presence_context,
         )
+        mark_timing("scout_handle_message")
         # If scout's analyze_vision dispatch short-circuited and asked the
         # user whether to do the heavy analysis, install the pending state
         # here so the user's next yes/no is routed correctly.
@@ -1092,7 +1118,8 @@ class VaultRuntime:
                 self.chat_sessions.record_route(node_id, phrase=message, route=route_name)
         except Exception as exc:
             log.warning("chat_sessions.record_route failed: %s", exc)
-        return self._enrich(result, node_id)
+        mark_timing("runtime_postprocess")
+        return attach_timings(self._enrich(result, node_id))
 
     def _handle_deterministic_presence_command(self, message: str, node_id: str) -> dict | None:
         """Run known capability/skill commands before Scout chat routing.
