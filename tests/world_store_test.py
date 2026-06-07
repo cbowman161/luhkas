@@ -17,8 +17,10 @@ class DeterministicEmbedder:
 
     def __init__(self, dim: int = 1024):
         self.dim = dim
+        self.calls = []
 
     def embed(self, text):
+        self.calls.append(text)
         if isinstance(text, list):
             return [self._one(t) for t in text]
         return self._one(text)
@@ -123,6 +125,53 @@ class WorldStoreRoundTrip(unittest.TestCase):
         self.assertFalse(first["duplicate"])
         self.assertTrue(second["duplicate"])
         self.assertEqual(first["asset_id"], second["asset_id"])
+
+    def test_vector_search_reuses_precomputed_embedding(self):
+        embedder = DeterministicEmbedder(self.text_dim)
+        self.store.upsert_wiki_article(article_id="enwiki:Mongolia", title="Mongolia")
+        self.store.add_wiki_chunks([
+            {
+                "article_id": "enwiki:Mongolia",
+                "title": "Mongolia",
+                "section_path": "Capital",
+                "chunk_idx": 0,
+                "content": "The capital of Mongolia is Ulaanbaatar.",
+                "content_hash": "h1",
+                "vector": embedder.embed("The capital of Mongolia is Ulaanbaatar."),
+            },
+        ])
+        query_vec = embedder.embed("The capital of Mongolia is Ulaanbaatar.")
+        calls_before = len(self.store.text_embedder.calls)
+
+        hits = self.store.search_wiki_vector(query_vec, top_k=1)
+
+        self.assertEqual(hits[0]["article_id"], "enwiki:Mongolia")
+        self.assertEqual(len(self.store.text_embedder.calls), calls_before)
+
+    def test_media_text_vector_search_reuses_precomputed_embedding(self):
+        embedder = DeterministicEmbedder(self.text_dim)
+        asset = self.store.add_media_asset(
+            path="/tmp/talk.mp3", kind="audio", sha256="aud-vector",
+            mime="audio/mpeg", duration_s=60.0,
+        )
+        self.store.add_media_text_chunks([
+            {
+                "asset_id": asset["asset_id"],
+                "modality": "transcript",
+                "start_s": 0.0,
+                "end_s": 30.0,
+                "content": "Hello world, this is a test recording.",
+                "vector": embedder.embed("Hello world, this is a test recording."),
+            },
+        ])
+        query_vec = embedder.embed("Hello world, this is a test recording.")
+        calls_before = len(self.store.text_embedder.calls)
+
+        hits = self.store.search_media_text_vector(query_vec, top_k=1)
+
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["asset_id"], asset["asset_id"])
+        self.assertEqual(len(self.store.text_embedder.calls), calls_before)
 
     def test_media_text_chunk_search(self):
         embedder = DeterministicEmbedder(self.text_dim)

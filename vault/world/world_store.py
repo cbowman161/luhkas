@@ -242,6 +242,24 @@ class WorldKnowledgeStore:
             )
         return self.add_wiki_chunks(chunks)
 
+    def search_wiki_vector(
+        self,
+        vector: list[float],
+        top_k: int = 5,
+        distance_max: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if not vector:
+            return []
+        with self._lock:
+            res = (
+                self._tables[WIKI_CHUNKS_TABLE]
+                .search(vector)
+                .metric("cosine")
+                .limit(top_k)
+                .to_list()
+            )
+        return _project_hits(res, distance_max, drop=("vector",))
+
     def search_wiki(
         self,
         query: str,
@@ -251,16 +269,11 @@ class WorldKnowledgeStore:
         query = (query or "").strip()
         if not query:
             return []
-        vec = self._embed_text(query)
-        with self._lock:
-            res = (
-                self._tables[WIKI_CHUNKS_TABLE]
-                .search(vec)
-                .metric("cosine")
-                .limit(top_k)
-                .to_list()
-            )
-        return _project_hits(res, distance_max, drop=("vector",))
+        return self.search_wiki_vector(
+            self._embed_text(query),
+            top_k=top_k,
+            distance_max=distance_max,
+        )
 
     # --- media ------------------------------------------------------------
 
@@ -347,6 +360,24 @@ class WorldKnowledgeStore:
             self._tables[MEDIA_IMAGE_VECS_TABLE].add(prepared)
         return {"ok": True, "added": len(prepared)}
 
+    def search_media_text_vector(
+        self,
+        vector: list[float],
+        top_k: int = 5,
+        distance_max: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if not vector:
+            return []
+        with self._lock:
+            res = (
+                self._tables[MEDIA_TEXT_CHUNKS_TABLE]
+                .search(vector)
+                .metric("cosine")
+                .limit(top_k)
+                .to_list()
+            )
+        return _project_hits(res, distance_max, drop=("vector",))
+
     def search_media_text(
         self,
         query: str,
@@ -356,16 +387,11 @@ class WorldKnowledgeStore:
         query = (query or "").strip()
         if not query:
             return []
-        vec = self._embed_text(query)
-        with self._lock:
-            res = (
-                self._tables[MEDIA_TEXT_CHUNKS_TABLE]
-                .search(vec)
-                .metric("cosine")
-                .limit(top_k)
-                .to_list()
-            )
-        return _project_hits(res, distance_max, drop=("vector",))
+        return self.search_media_text_vector(
+            self._embed_text(query),
+            top_k=top_k,
+            distance_max=distance_max,
+        )
 
     def search_media_image(
         self,

@@ -4120,18 +4120,25 @@ Output JSON only:
             return []
 
     def recall_world_knowledge(self, query: str, top_k: int = 3) -> list[dict]:
-        """Look up reference corpus (offline Wikipedia + media transcripts)
-        for world-fact context. Identity-free; safe to call on every general
-        question. Returns [] when the store is unavailable."""
+        """Look up reference corpus with one query embedding per turn.
+
+        The chat path needs this to be fast: bge-m3 embedding is usually the
+        dominant cost, so wiki + media retrieval must share the same vector
+        instead of embedding the same query twice.
+        """
         if not self.world_store:
+            return []
+        query = (query or "").strip()
+        if not query:
             return []
         try:
             from world.config import (
                 WORLD_MEDIA_TEXT_DISTANCE_MAX, WORLD_WIKI_DISTANCE_MAX,
             )
+            vector = self.world_store._embed_text(query)
             hits: list[dict] = []
-            for h in self.world_store.search_wiki(
-                query, top_k=top_k, distance_max=WORLD_WIKI_DISTANCE_MAX,
+            for h in self.world_store.search_wiki_vector(
+                vector, top_k=top_k, distance_max=WORLD_WIKI_DISTANCE_MAX,
             ):
                 hits.append({
                     "source": "wikipedia",
@@ -4141,20 +4148,35 @@ Output JSON only:
                     "distance": h.get("distance"),
                     "article_id": h.get("article_id"),
                 })
-            for h in self.world_store.search_media_text(
-                query, top_k=2, distance_max=WORLD_MEDIA_TEXT_DISTANCE_MAX,
-            ):
-                hits.append({
-                    "source": "media_vault",
-                    "asset_id": h.get("asset_id"),
-                    "modality": h.get("modality"),
-                    "snippet": (h.get("content") or "")[:600],
-                    "distance": h.get("distance"),
-                })
+            if self._world_media_text_available():
+                for h in self.world_store.search_media_text_vector(
+                    vector, top_k=2, distance_max=WORLD_MEDIA_TEXT_DISTANCE_MAX,
+                ):
+                    hits.append({
+                        "source": "media_vault",
+                        "asset_id": h.get("asset_id"),
+                        "modality": h.get("modality"),
+                        "snippet": (h.get("content") or "")[:600],
+                        "distance": h.get("distance"),
+                    })
             return hits
         except Exception as exc:
             print(f"[world_store] search failed: {exc}")
             return []
+
+    def _world_media_text_available(self) -> bool:
+        now = time.time()
+        cached = getattr(self, "_world_media_text_available_cache", None)
+        if isinstance(cached, tuple) and now - cached[0] < 60.0:
+            return bool(cached[1])
+        available = False
+        try:
+            table = self.world_store._tables.get("media_text_chunks")
+            available = bool(table and table.count_rows() > 0)
+        except Exception:
+            available = False
+        self._world_media_text_available_cache = (now, available)
+        return available
 
     ASSISTANT_MEMORY_IDENTITY = "assistant"
 
