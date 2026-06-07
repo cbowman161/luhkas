@@ -15,6 +15,11 @@ from code_monkey_client import CodeMonkeyClient
 from models import get_model
 from safety_policy import SafetyPolicy
 
+try:
+    from semantic_route_store import SemanticRouteStore
+except Exception:  # pragma: no cover - optional LanceDB sidecar
+    SemanticRouteStore = None
+
 
 DEFAULT_STORE = Path(__file__).parent / "data" / "learned_capabilities" / "capabilities.json"
 
@@ -525,7 +530,9 @@ class LearnedCapabilityStore:
 class LearnedCapabilityEngine:
     """Confirm, execute, and persist safe non-Scout deterministic recipes."""
 
-    def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None, model=None):
+    VECTOR_MATCH_DISTANCE_MAX = float(os.environ.get("LEARNED_CAP_VECTOR_DISTANCE_MAX", "0.18"))
+
+    def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None, model=None, embedder=None):
         self.store = store or LearnedCapabilityStore()
         self.safety = SafetyPolicy()
         self.scripts_dir = self.store.path.parent / "scripts"
@@ -535,6 +542,14 @@ class LearnedCapabilityEngine:
         # and aborted legitimate calls mid-retry. 60s is generous but bounded.
         self.code_monkey = code_monkey_client if code_monkey_client is not None else CodeMonkeyClient(timeout=60)
         self.model = model if model is not None else get_model("router")
+        self.embedder = embedder
+        self.semantic_store = None
+        self._semantic_sync_signature: tuple[float, int] | None = None
+        if embedder is not None and SemanticRouteStore is not None:
+            try:
+                self.semantic_store = SemanticRouteStore(embedder=embedder)
+            except Exception as exc:
+                print(f"[learned_capabilities] semantic index disabled: {exc}", flush=True)
         self._inference_cache: dict = {}
 
     def _infer_topic_and_aspect(self, text: str) -> tuple[str | None, str | None]:
@@ -783,6 +798,53 @@ class LearnedCapabilityEngine:
     def lookup(self, text: str) -> dict | None:
         return self.store.lookup(text)
 
+    def _sync_semantic_index(self) -> None:
+        store = self.semantic_store
+        if store is None:
+            return
+        try:
+            data = self.store.load()
+            caps = data.get("capabilities") or {}
+            signature = (self.store.path.stat().st_mtime if self.store.path.exists() else 0.0, len(caps))
+            if signature == self._semantic_sync_signature:
+                return
+            for key, cap in caps.items():
+                if isinstance(cap, dict):
+                    store.upsert_learned_capability(str(key), cap)
+            self._semantic_sync_signature = signature
+        except Exception as exc:
+            print(f"[learned_capabilities] semantic sync failed: {exc}", flush=True)
+
+    def lookup_by_vector(self, text: str) -> dict | None:
+        store = self.semantic_store
+        if store is None:
+            return None
+        self._sync_semantic_index()
+        try:
+            hits = store.search_learned_capabilities(text, top_k=3)
+        except Exception as exc:
+            print(f"[learned_capabilities] semantic search failed: {exc}", flush=True)
+            return None
+        if not hits:
+            return None
+        data = self.store.load()
+        caps = data.get("capabilities") or {}
+        for hit in hits:
+            dist = hit.get("distance")
+            if dist is None or float(dist) > self.VECTOR_MATCH_DISTANCE_MAX:
+                continue
+            key = str(hit.get("normalized_input") or hit.get("id") or "")
+            cap = caps.get(key)
+            if isinstance(cap, dict) and (cap.get("execution") or {}).get("type") in {"bash", "python_script"}:
+                cap = dict(cap)
+                cap["semantic_match"] = {
+                    "normalized_input": key,
+                    "distance": float(dist),
+                    "source": "vector_db",
+                }
+                return cap
+        return None
+
     def same_topic_caps(self, topic: str) -> list[dict]:
         """All caps stored under the given topic, ranked by hits then recency.
         Used to surface alternatives when the user proposes a *new* aspect
@@ -824,6 +886,9 @@ class LearnedCapabilityEngine:
 
         Returns None when no candidate matches.
         """
+        vector_cap = self.lookup_by_vector(text)
+        if vector_cap is not None:
+            return vector_cap
         topic, aspect = self._infer_topic_and_aspect(text)
         if topic is None:
             return None

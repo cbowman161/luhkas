@@ -292,7 +292,7 @@ class VaultRuntime:
         self.node_health_monitor.start()
         self.active_task_id = None
         self._last_active_node_id = "cli"
-        self.learned_capabilities = LearnedCapabilityEngine()
+        self.learned_capabilities = LearnedCapabilityEngine(embedder=getattr(self.scout, "embed_model", None))
         # Phase 1A shadow tracking — observational only, no behavior
         # change. Sessions persist to data/chat_sessions/{node_id}.jsonl
         # for the learning aggregator (Layer 3) to consume later. Disable
@@ -1812,7 +1812,7 @@ class VaultRuntime:
     def _learned_engine(self) -> LearnedCapabilityEngine:
         engine = getattr(self, "learned_capabilities", None)
         if engine is None:
-            engine = LearnedCapabilityEngine()
+            engine = LearnedCapabilityEngine(embedder=getattr(self.scout, "embed_model", None))
             self.learned_capabilities = engine
         return engine
 

@@ -698,5 +698,116 @@ class LearnedCapabilitiesTest(unittest.TestCase):
         self.assertIn("iotop", response["message"])
 
 
+
+try:
+    import lancedb  # noqa: F401
+except ImportError as exc:  # pragma: no cover
+    raise unittest.SkipTest("lancedb not installed; semantic route tests skipped") from exc
+
+import deterministic_router
+from semantic_route_store import SemanticRouteStore
+
+
+class SemanticFakeEmbedder:
+    dim = 1024
+
+    def embed(self, text):
+        text = " ".join(text) if isinstance(text, list) else str(text or "")
+        lowered = text.lower()
+        vec = [0.0] * self.dim
+        if any(term in lowered for term in ("cpu", "processor", "load")):
+            vec[0] = 1.0
+        elif any(term in lowered for term in ("disk", "drive", "storage")):
+            vec[1] = 1.0
+        elif any(term in lowered for term in ("light", "lamp", "illumination")):
+            vec[2] = 1.0
+        else:
+            vec[3] = 1.0
+        return vec
+
+
+class SemanticCandidateTest(unittest.TestCase):
+    def test_learned_capability_vector_candidate_executes_under_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LearnedCapabilityStore(Path(tmp) / "capabilities.json")
+            engine = TestLearnedCapabilityEngine(store, code_monkey_client=FakeCodeMonkeyClient(), model=None)
+            engine.semantic_store = SemanticRouteStore(
+                embedder=SemanticFakeEmbedder(),
+                path=Path(tmp) / "semantic.lance",
+            )
+            engine.VECTOR_MATCH_DISTANCE_MAX = 0.01
+            runtime = fake_runtime(engine)
+            store.remember("cpu usage", {
+                "intent": "vault_cpu_usage",
+                "description": "Vault CPU usage",
+                "route": "learned_capability",
+                "target": "vault",
+                "confidence": 0.9,
+                "inferred": {"topic": "cpu", "aspect": "usage"},
+                "execution": {"type": "bash", "command": "echo cpu usage", "required_facts": ["cpu"]},
+                "code_monkey_task": {"ok": False, "skipped": True},
+            })
+
+            response = runtime._handle_deterministic_presence_command("processor load", "scout")
+
+            self.assertIn("Learned command.", response["message"])
+            learned = response["data"]["learned_capability"]
+            self.assertEqual(learned["intent"], "vault_cpu_usage")
+            self.assertEqual(learned["semantic_match"]["source"], "vector_db")
+            self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+    def test_deterministic_route_vector_candidate_returns_confirmed_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = deterministic_router._PATH
+            old_cache = deterministic_router._cache
+            old_mtime = deterministic_router._cache_mtime
+            old_semantic = deterministic_router._semantic_store
+            old_signature = deterministic_router._semantic_signature
+            old_distance = deterministic_router._VECTOR_DISTANCE_MAX
+            old_thread = deterministic_router.threading.Thread
+
+            class _SyncThread:
+                def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+                    self.target = target
+                    self.args = args
+                    self.kwargs = kwargs or {}
+
+                def start(self):
+                    if self.target:
+                        self.target(*self.args, **self.kwargs)
+
+            try:
+                deterministic_router.threading.Thread = _SyncThread
+                deterministic_router._PATH = Path(tmp) / "deterministic_routes.json"
+                deterministic_router._cache = None
+                deterministic_router._cache_mtime = 0.0
+                deterministic_router._semantic_signature = None
+                deterministic_router._semantic_store = SemanticRouteStore(
+                    embedder=SemanticFakeEmbedder(),
+                    path=Path(tmp) / "semantic.lance",
+                )
+                deterministic_router._VECTOR_DISTANCE_MAX = 0.01
+                deterministic_router.learn("turn light on", {
+                    "ok": True,
+                    "route": "direction",
+                    "confidence": 0.95,
+                    "reason": "confirmed light command",
+                    "attempts": 0,
+                })
+
+                route = deterministic_router.lookup("enable lamp")
+
+                self.assertIsNotNone(route)
+                self.assertEqual(route["route"], "direction")
+                self.assertTrue(route["from_vector_cache"])
+                self.assertEqual(route["vector_match"]["normalized_input"], "turn light on")
+            finally:
+                deterministic_router._PATH = old_path
+                deterministic_router._cache = old_cache
+                deterministic_router._cache_mtime = old_mtime
+                deterministic_router._semantic_store = old_semantic
+                deterministic_router._semantic_signature = old_signature
+                deterministic_router._VECTOR_DISTANCE_MAX = old_distance
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
