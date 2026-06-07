@@ -531,6 +531,7 @@ class LearnedCapabilityEngine:
     """Confirm, execute, and persist safe non-Scout deterministic recipes."""
 
     VECTOR_MATCH_DISTANCE_MAX = float(os.environ.get("LEARNED_CAP_VECTOR_DISTANCE_MAX", "0.44"))
+    VECTOR_CONFIRM_DISTANCE_MAX = float(os.environ.get("LEARNED_CAP_VECTOR_CONFIRM_DISTANCE_MAX", "0.55"))
 
     def __init__(self, store: LearnedCapabilityStore | None = None, code_monkey_client=None, model=None, embedder=None):
         self.store = store or LearnedCapabilityStore()
@@ -815,10 +816,11 @@ class LearnedCapabilityEngine:
         except Exception as exc:
             print(f"[learned_capabilities] semantic sync failed: {exc}", flush=True)
 
-    def lookup_by_vector(self, text: str) -> dict | None:
+    def lookup_by_vector_candidate(self, text: str, *, max_distance: float | None = None) -> dict | None:
         store = self.semantic_store
         if store is None:
             return None
+        max_distance = self.VECTOR_MATCH_DISTANCE_MAX if max_distance is None else float(max_distance)
         self._sync_semantic_index()
         try:
             hits = store.search_learned_capabilities(text, top_k=3)
@@ -831,7 +833,7 @@ class LearnedCapabilityEngine:
         caps = data.get("capabilities") or {}
         for hit in hits:
             dist = hit.get("distance")
-            if dist is None or float(dist) > self.VECTOR_MATCH_DISTANCE_MAX:
+            if dist is None or float(dist) > max_distance:
                 continue
             key = str(hit.get("normalized_input") or hit.get("id") or "")
             cap = caps.get(key)
@@ -844,6 +846,9 @@ class LearnedCapabilityEngine:
                 }
                 return cap
         return None
+
+    def lookup_by_vector(self, text: str) -> dict | None:
+        return self.lookup_by_vector_candidate(text, max_distance=self.VECTOR_MATCH_DISTANCE_MAX)
 
     def same_topic_caps(self, topic: str) -> list[dict]:
         """All caps stored under the given topic, ranked by hits then recency.

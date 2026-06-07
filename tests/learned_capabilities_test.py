@@ -726,6 +726,23 @@ class SemanticFakeEmbedder:
         return vec
 
 
+class MediumSemanticFakeEmbedder(SemanticFakeEmbedder):
+    def embed(self, text):
+        import math
+
+        text = " ".join(text) if isinstance(text, list) else str(text or "")
+        lowered = text.lower()
+        vec = [0.0] * self.dim
+        if "processor" in lowered:
+            vec[0] = 0.53
+            vec[4] = math.sqrt(1.0 - vec[0] * vec[0])
+            return vec
+        if "cpu" in lowered:
+            vec[0] = 1.0
+            return vec
+        return super().embed(text)
+
+
 class SemanticCandidateTest(unittest.TestCase):
     def test_learned_capability_vector_candidate_executes_under_review(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -755,6 +772,44 @@ class SemanticCandidateTest(unittest.TestCase):
             self.assertEqual(learned["intent"], "vault_cpu_usage")
             self.assertEqual(learned["semantic_match"]["source"], "vector_db")
             self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+    def test_medium_vector_candidate_asks_then_records_alias_on_yes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LearnedCapabilityStore(Path(tmp) / "capabilities.json")
+            engine = TestLearnedCapabilityEngine(store, code_monkey_client=FakeCodeMonkeyClient(), model=None)
+            engine.semantic_store = SemanticRouteStore(
+                embedder=MediumSemanticFakeEmbedder(),
+                path=Path(tmp) / "semantic.lance",
+            )
+            engine.VECTOR_MATCH_DISTANCE_MAX = 0.40
+            engine.VECTOR_CONFIRM_DISTANCE_MAX = 0.55
+            runtime = fake_runtime(engine)
+            store.remember("cpu usage", {
+                "intent": "vault_cpu_usage",
+                "description": "Vault CPU usage",
+                "route": "learned_capability",
+                "target": "vault",
+                "confidence": 0.9,
+                "inferred": {"topic": "cpu", "aspect": "usage"},
+                "execution": {"type": "bash", "command": "echo cpu usage", "required_facts": ["cpu"]},
+                "code_monkey_task": {"ok": False, "skipped": True},
+            })
+
+            response = runtime._handle_deterministic_presence_command("processor workload", "scout")
+
+            self.assertIn("Did you mean Vault CPU usage?", response["message"])
+            pending = runtime._get_pending("scout")
+            self.assertEqual(pending["type"], "learned_semantic_match_confirmation")
+            candidate = response["data"]["learned_capability_candidate"]
+            self.assertGreater(candidate["semantic_match"]["distance"], engine.VECTOR_MATCH_DISTANCE_MAX)
+
+            confirmed = runtime._handle_deterministic_presence_command("yes", "scout")
+
+            self.assertIn("Learned command.", confirmed["message"])
+            self.assertTrue(confirmed["data"]["alias_recorded"])
+            self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+            caps = store.load()["capabilities"]
+            self.assertEqual(caps["processor workload"]["alias_of"], "cpu usage")
 
     def test_deterministic_route_vector_candidate_returns_confirmed_route(self):
         with tempfile.TemporaryDirectory() as tmp:

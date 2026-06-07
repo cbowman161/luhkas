@@ -1775,6 +1775,7 @@ class VaultRuntime:
     # handler — both code paths pick it up automatically.
     _PENDING_HANDLERS: dict[str, tuple[str, bool]] = {
         "learned_capability_confirmation": ("_handle_learned_capability_confirmation", False),
+        "learned_semantic_match_confirmation": ("_handle_learned_semantic_match_confirmation", False),
         "learned_execution_review":        ("_handle_learned_execution_review", False),
         "learned_install_confirmation":    ("_handle_learned_install_confirmation", False),
         "audit_merge_confirmation":        ("_handle_audit_merge_confirmation", False),
@@ -2669,6 +2670,93 @@ class VaultRuntime:
         # "unrelated" or anything else — let normal routing take over.
         return None
 
+    def _handle_learned_semantic_match_confirmation(self, message: str, node_id: str) -> dict | None:
+        pending = self._get_pending(node_id)
+        if not isinstance(pending, dict) or pending.get("type") != "learned_semantic_match_confirmation":
+            return None
+        if _is_denial(message):
+            self._clear_pending()
+            return self._remember_active({
+                "mode": "direct",
+                "message": "OK, I will not use that learned command.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_semantic_match_confirmation",
+                "compose": False,
+                "response_composed": True,
+            })
+        if not _is_affirmative(message):
+            self._clear_pending()
+            return None
+        learned = pending.get("capability") or {}
+        original = pending.get("original_message") or message
+        self._clear_pending()
+        if not isinstance(learned, dict) or not learned:
+            return None
+        return self._execute_learned_capability_response(
+            original,
+            node_id,
+            learned,
+            alias_source=learned,
+            deterministic_source="learned_semantic_match_confirmation",
+        )
+
+    def _execute_learned_capability_response(
+        self,
+        message: str,
+        node_id: str,
+        learned: dict,
+        *,
+        alias_source: dict | None = None,
+        deterministic_source: str | None = None,
+    ) -> dict:
+        engine = self._learned_engine()
+        result = engine.execute_capability(learned)
+        alias_recorded = False
+        if result.get("ok") and alias_source is not None:
+            stored_alias = engine.record_alias(message, alias_source)
+            if stored_alias is not None:
+                learned = stored_alias
+                alias_recorded = True
+        summary = engine.summarize_result(message, learned, result)
+        summary = f"Learned command. {summary}"
+        # Set a one-turn review state on EVERY successful learned-cap
+        # execution, regardless of how the cap was matched (exact-key hit,
+        # concept match, or user-confirmed semantic candidate).
+        if result.get("ok"):
+            cap_inferred = (
+                (alias_source or {}).get("inferred")
+                or learned.get("inferred")
+                or {}
+            )
+            if not cap_inferred.get("topic"):
+                cap_topic, cap_aspect = engine._cap_concept(alias_source or learned or {})
+                if cap_topic:
+                    cap_inferred = {"topic": cap_topic, "aspect": cap_aspect}
+            self._set_pending({
+                "type": "learned_execution_review",
+                "original_message": message,
+                "alias_key": _learned_normalize(message),
+                "executed_cap_intent": learned.get("intent"),
+                "executed_cap_description": learned.get("description"),
+                "executed_cap_inferred": cap_inferred,
+                "node_id": node_id,
+            })
+        return self._remember_active(self._attach_learned_capability_update({
+            "mode": "direct",
+            "message": summary,
+            "data": {
+                "learned_capability": learned,
+                "execution_result": result,
+                "alias_recorded": alias_recorded,
+            },
+            "active_task_id": self.active_task_id,
+            "deterministic": True,
+            "deterministic_source": deterministic_source or f"learned_capability:{learned.get('name') or learned.get('intent')}",
+            "compose": False,
+            "response_composed": True,
+        }))
+
     def _handle_learned_capability_request(self, message: str, node_id: str) -> dict | None:
         engine = self._learned_engine()
         learned = engine.lookup(message)
@@ -2679,55 +2767,32 @@ class VaultRuntime:
                 learned = concept
                 alias_source = concept
         if learned is not None:
-            result = engine.execute_capability(learned)
-            alias_recorded = False
-            if result.get("ok") and alias_source is not None:
-                stored_alias = engine.record_alias(message, alias_source)
-                if stored_alias is not None:
-                    learned = stored_alias
-                    alias_recorded = True
-            summary = engine.summarize_result(message, learned, result)
-            summary = f"Learned command. {summary}"
-            # Set a one-turn review state on EVERY successful learned-cap
-            # execution, regardless of how the cap was matched (exact-key
-            # hit OR concept-match-with-alias-recording). Without this the
-            # user could only correct on a phrase's first use, not on
-            # subsequent uses where lookup hit an existing key directly.
-            if result.get("ok"):
-                # Prefer the source cap's inferred (when concept-match), else
-                # the learned cap's own inferred, else derive from intent.
-                cap_inferred = (
-                    (alias_source or {}).get("inferred")
-                    or learned.get("inferred")
-                    or {}
-                )
-                if not cap_inferred.get("topic"):
-                    cap_topic, cap_aspect = engine._cap_concept(alias_source or learned or {})
-                    if cap_topic:
-                        cap_inferred = {"topic": cap_topic, "aspect": cap_aspect}
+            return self._execute_learned_capability_response(message, node_id, learned, alias_source=alias_source)
+        semantic_candidate = engine.lookup_by_vector_candidate(
+            message,
+            max_distance=engine.VECTOR_CONFIRM_DISTANCE_MAX,
+        )
+        if semantic_candidate is not None:
+            match = semantic_candidate.get("semantic_match") or {}
+            distance = match.get("distance")
+            if distance is not None and float(distance) > engine.VECTOR_MATCH_DISTANCE_MAX:
                 self._set_pending({
-                    "type": "learned_execution_review",
+                    "type": "learned_semantic_match_confirmation",
                     "original_message": message,
-                    "alias_key": _learned_normalize(message),
-                    "executed_cap_intent": learned.get("intent"),
-                    "executed_cap_description": learned.get("description"),
-                    "executed_cap_inferred": cap_inferred,
+                    "capability": semantic_candidate,
                     "node_id": node_id,
                 })
-            return self._remember_active(self._attach_learned_capability_update({
-                "mode": "direct",
-                "message": summary,
-                "data": {
-                    "learned_capability": learned,
-                    "execution_result": result,
-                    "alias_recorded": alias_recorded,
-                },
-                "active_task_id": self.active_task_id,
-                "deterministic": True,
-                "deterministic_source": f"learned_capability:{learned.get('name') or learned.get('intent')}",
-                "compose": False,
-                "response_composed": True,
-            }))
+                description = semantic_candidate.get("description") or semantic_candidate.get("intent") or "that learned command"
+                return self._remember_active({
+                    "mode": "direct",
+                    "message": f"Did you mean {description}?",
+                    "data": {"learned_capability_candidate": semantic_candidate},
+                    "active_task_id": self.active_task_id,
+                    "deterministic": True,
+                    "deterministic_source": "learned_semantic_match_confirmation",
+                    "compose": False,
+                    "response_composed": True,
+                })
         proposal = engine.propose(message)
         if proposal is None:
             return None
