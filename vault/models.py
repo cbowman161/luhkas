@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
+import threading
 
 import requests
 
@@ -40,6 +42,46 @@ OLLAMA_EMBED_URL = f"{OLLAMA_URL.rstrip('/')}/api/embed"
 import time as _time
 
 _last_ollama_activity_at: float = 0.0
+
+_EMBED_CACHE_TTL_S = 30.0
+_EMBED_CACHE_MAX = 128
+_embed_cache: OrderedDict[tuple[str, str], tuple[float, list]] = OrderedDict()
+_embed_cache_lock = threading.Lock()
+
+
+def _copy_embeddings(embeddings):
+    if not isinstance(embeddings, list):
+        return embeddings
+    return [list(row) if isinstance(row, list) else row for row in embeddings]
+
+
+def _embed_cache_get(model_name: str, text: str):
+    now = _time.monotonic()
+    key = (model_name, text)
+    with _embed_cache_lock:
+        cached = _embed_cache.get(key)
+        if cached is None:
+            return None
+        cached_at, embeddings = cached
+        if now - cached_at > _EMBED_CACHE_TTL_S:
+            _embed_cache.pop(key, None)
+            return None
+        _embed_cache.move_to_end(key)
+        return _copy_embeddings(embeddings)
+
+
+def _embed_cache_put(model_name: str, text: str, embeddings) -> None:
+    key = (model_name, text)
+    with _embed_cache_lock:
+        _embed_cache[key] = (_time.monotonic(), _copy_embeddings(embeddings))
+        _embed_cache.move_to_end(key)
+        while len(_embed_cache) > _EMBED_CACHE_MAX:
+            _embed_cache.popitem(last=False)
+
+
+def clear_embedding_cache() -> None:
+    with _embed_cache_lock:
+        _embed_cache.clear()
 
 
 def _bump_ollama_activity() -> None:
@@ -268,6 +310,10 @@ class EmbeddingModel:
         return VAULT_IMMEDIATE_KEEP_ALIVE
 
     def embed(self, text: str | list[str], timeout=120):
+        if isinstance(text, str):
+            cached = _embed_cache_get(self.model_name, text)
+            if cached is not None:
+                return cached
         _bump_ollama_activity()
         response = requests.post(
             OLLAMA_EMBED_URL,
@@ -280,7 +326,10 @@ class EmbeddingModel:
         )
         if response.status_code != 200:
             raise RuntimeError(f"Ollama embed error: {response.text}")
-        return response.json().get("embeddings", [])
+        embeddings = response.json().get("embeddings", [])
+        if isinstance(text, str):
+            _embed_cache_put(self.model_name, text, embeddings)
+        return embeddings
 
 
 def get_model(role: str):
