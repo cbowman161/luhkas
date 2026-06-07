@@ -13,9 +13,14 @@ from blackboard import Blackboard
 from background_manager import BackgroundManager
 from capability_registry import CapabilityRegistry
 from chat_sessions import ChatSessionManager
+from behavior_consolidator import BehaviorConsolidator
+from behavior_context import BehaviorContextBuilder
+from behavior_review import BehaviorReviewController
 from classroom import ClassroomController
+from feedback_capture import FeedbackCapture
 from identity_actions import IdentityActionsController
 from onboarding import OnboardingController
+from storage.behavior_store import BehaviorMemoryStore
 from onboarding_adapters import (
     NodeRegistryTTS,
     VaultFaceObserver,
@@ -321,6 +326,59 @@ class VaultRuntime:
             profile_store=VaultProfileStore(self.scout),
             name_extractor=_extract_introduction_name,
         )
+        # Behavior-feedback pipeline: capture-side detector writes
+        # user preferences/constraints/corrections to BehaviorMemoryStore;
+        # BehaviorContextBuilder retrieves them at chat-prompt
+        # construction time and feeds them into ResponseComposer.
+        # Both share the scout bridge's embedder (bge-m3 via Ollama),
+        # so this is best-effort — disabled cleanly if the embed model
+        # isn't reachable.
+        embedder = getattr(self.scout, "embed_model", None)
+        if embedder is not None:
+            try:
+                self.behavior_store = BehaviorMemoryStore(embedder=embedder)
+                self.feedback_capture = FeedbackCapture(self.behavior_store)
+                self.behavior_context_builder = BehaviorContextBuilder(self.behavior_store)
+                # The scout bridge owns the chat-compose call sites,
+                # so it needs the builder attached for retrieval.
+                self.scout.behavior_context_builder = self.behavior_context_builder
+                # Consolidate + review: the verifier uses the router
+                # role model (small + fast, used elsewhere for binary
+                # classification). Available via get_model -- if the
+                # router model isn't loaded, consolidator falls back
+                # to pre-filter-only results (verify=False path).
+                try:
+                    from models import get_model
+                    verifier_model = get_model("router")
+                except Exception as exc:
+                    log.warning("verifier model unavailable: %s", exc)
+                    verifier_model = None
+                self.behavior_consolidator = BehaviorConsolidator(
+                    self.behavior_store, model=verifier_model,
+                )
+                self.behavior_review = BehaviorReviewController(
+                    consolidator=self.behavior_consolidator,
+                    store=self.behavior_store,
+                    profile_store=self.onboarding.profile_store,
+                    tts=self.onboarding.tts,
+                    pending_set=self._behavior_pending_set,
+                    pending_get=self._behavior_pending_get,
+                    pending_clear=self._behavior_pending_clear,
+                )
+            except Exception as exc:
+                log.warning("behavior pipeline init failed: %s", exc)
+                self.behavior_store = None
+                self.feedback_capture = None
+                self.behavior_context_builder = None
+                self.behavior_consolidator = None
+                self.behavior_review = None
+        else:
+            self.behavior_store = None
+            self.feedback_capture = None
+            self.behavior_context_builder = None
+            self.behavior_consolidator = None
+            self.behavior_review = None
+
         # Identity actions controller — handles privileged verbal
         # intents (transfer primary user / unset primary user). Shares
         # the same FaceObserver/ProfileStore/TTSChannel adapters as
@@ -389,6 +447,102 @@ class VaultRuntime:
         self._refresh_awaiting_primary_user()
         if self._awaiting_primary_user:
             log.info("vault: primary user unset — awaiting_primary_user re-activated")
+
+    # ------------------------------------------------------------------
+    # Behavior-feedback context helpers
+    # ------------------------------------------------------------------
+    #
+    # These keep feedback_capture / behavior_context_builder cheap to
+    # call. Each returns None on miss so the downstream code can treat
+    # "no identity / no route / no prior response" as defaults.
+
+    def _current_speaker_identity(self, node_id: str) -> str | None:
+        """Best-effort speaker identity for this node. Pulled from the
+        active chat session (which the scout bridge stamps from
+        face-recognition state). None when unknown — behavior notes
+        fall back to global scope, which is the right default."""
+        try:
+            sess = self.chat_sessions.get_active(node_id)
+        except Exception:
+            return None
+        if sess is None:
+            return None
+        ident = getattr(sess, "identity", None)
+        if not ident:
+            return None
+        ident = str(ident).strip().lower()
+        return ident or None
+
+    def _current_active_route(self, node_id: str) -> str | None:
+        """The current route name for this node's active session, when
+        the session is mode-stamped (classroom / onboarding / etc.).
+        Returns the chat_session mode if set; None for default."""
+        try:
+            sess = self.chat_sessions.get_active(node_id)
+        except Exception:
+            return None
+        if sess is None:
+            return None
+        mode = getattr(sess, "mode", None)
+        if not mode or mode == "default":
+            return None
+        return str(mode)
+
+    # ------------------------------------------------------------------
+    # BehaviorReviewController pending-state plumbing
+    # ------------------------------------------------------------------
+    # Wraps the (node_id-less, _current_node_id-driven) _set_pending /
+    # _clear_pending so the review controller's callback signatures
+    # are explicit about node_id. _get_pending already takes node_id,
+    # so it's a thin pass-through.
+
+    def _behavior_pending_set(self, node_id: str, pending: dict) -> None:
+        self._set_pending(pending, node_id=node_id)
+
+    def _behavior_pending_get(self, node_id: str) -> dict | None:
+        return self._get_pending(node_id)
+
+    def _behavior_pending_clear(self, node_id: str) -> None:
+        prev = getattr(self, "_current_node_id", None)
+        self._current_node_id = node_id
+        try:
+            self._clear_pending()
+        finally:
+            self._current_node_id = prev
+
+    def _handle_behavior_conflict_resolution(self, message: str, node_id: str) -> dict | None:
+        """Dispatched from _PENDING_HANDLERS when the active pending
+        is type ``behavior_conflict_resolution``. Delegates to the
+        review controller, which advances or closes the queue."""
+        review = getattr(self, "behavior_review", None)
+        if review is None:
+            return None
+        return review.resolve_conflict(message, node_id)
+
+    def _last_response_text(self, node_id: str) -> str | None:
+        """The most recent assistant response text for this node, for
+        feedback-capture source_context on corrections. Best-effort —
+        retrieved from the chat session's recent_closed deque via the
+        scout bridge's per-node session tracking."""
+        try:
+            session = self.scout.get_session(node_id) if self.scout else None
+        except Exception:
+            return None
+        if session is None:
+            return None
+        turns = getattr(session, "turns", None)
+        if not turns:
+            return None
+        try:
+            last = turns[-1]
+        except IndexError:
+            return None
+        if not isinstance(last, dict):
+            return None
+        text = last.get("response") or last.get("message")
+        if not text:
+            return None
+        return str(text)[:600]
 
     def _start_onboarding_ticker(self) -> None:
         """Spin up a daemon thread that fires at ``VAULT_ONBOARDING_TICK_INTERVAL``
@@ -609,6 +763,41 @@ class VaultRuntime:
                 return self._remember_active(action_response)
         except Exception as exc:
             log.warning("identity_actions.try_handle failed: %s", exc)
+
+        # Behavior-feedback capture: "be more concise", "always confirm
+        # before deleting", "actually that was wrong". Stores to the
+        # behavior store + emits a short ack. Placed AFTER identity
+        # actions so "transfer primary user to Bob" can't be misread
+        # as a preference, but BEFORE classroom/planner so the user can
+        # tune behavior mid-conversation regardless of route.
+        try:
+            cap = getattr(self, "feedback_capture", None)
+            if cap is not None:
+                cap_resp = cap.maybe_capture(
+                    user_input,
+                    identity=self._current_speaker_identity(node_id),
+                    active_route=self._current_active_route(node_id),
+                    last_response=self._last_response_text(node_id),
+                )
+                if cap_resp is not None:
+                    cap_resp.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(cap_resp)
+        except Exception as exc:
+            log.warning("feedback_capture.maybe_capture failed: %s", exc)
+
+        # Behavior review intent: "review my preferences",
+        # "consolidate preferences", "audit preferences". Runs the
+        # consolidator and surfaces the first verified conflict as a
+        # pending decision, or replies "no conflicts" cleanly.
+        try:
+            review = getattr(self, "behavior_review", None)
+            if review is not None:
+                review_resp = review.try_handle_review_intent(user_input, node_id)
+                if review_resp is not None:
+                    review_resp.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(review_resp)
+        except Exception as exc:
+            log.warning("behavior_review.try_handle_review_intent failed: %s", exc)
 
         # If the active session is in classroom mode, route the turn
         # through the controller. It handles exit/pause phrases
@@ -969,6 +1158,33 @@ class VaultRuntime:
                 return self._remember_active(action_response)
         except Exception as exc:
             log.warning("identity_actions.try_handle (presence) failed: %s", exc)
+
+        # Behavior-feedback capture — same dispatch as handle().
+        try:
+            cap = getattr(self, "feedback_capture", None)
+            if cap is not None:
+                cap_resp = cap.maybe_capture(
+                    message,
+                    identity=self._current_speaker_identity(node_id),
+                    active_route=self._current_active_route(node_id),
+                    last_response=self._last_response_text(node_id),
+                )
+                if cap_resp is not None:
+                    cap_resp.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(cap_resp)
+        except Exception as exc:
+            log.warning("feedback_capture.maybe_capture (presence) failed: %s", exc)
+
+        # Behavior review intent — same dispatch as handle().
+        try:
+            review = getattr(self, "behavior_review", None)
+            if review is not None:
+                review_resp = review.try_handle_review_intent(message, node_id)
+                if review_resp is not None:
+                    review_resp.setdefault("active_task_id", self.active_task_id)
+                    return self._remember_active(review_resp)
+        except Exception as exc:
+            log.warning("behavior_review.try_handle_review_intent (presence) failed: %s", exc)
 
         # Active classroom session intercept — same as in handle(). Lets
         # exit phrases and on-topic chat run before any other deterministic
@@ -1537,6 +1753,7 @@ class VaultRuntime:
         "audit_merge_confirmation":        ("_handle_audit_merge_confirmation", False),
         "memory_update_confirmation":      ("_handle_memory_update_confirmation", False),
         "classroom_subject_prompt":        ("_handle_classroom_subject_prompt", True),
+        "behavior_conflict_resolution":    ("_handle_behavior_conflict_resolution", False),
     }
 
     def _try_pending_handler(self, message: str, node_id: str,
@@ -2825,6 +3042,23 @@ class VaultRuntime:
             ]
         except Exception:
             recent = []
+        # Pull behavior preferences relevant to the deterministic
+        # answer so the final phrasing honors them (e.g. "be brief"
+        # applies even when the runtime, not the user, originated the
+        # message). Identity comes from the active chat session.
+        behavior_context = None
+        behavior_apply = None
+        try:
+            bc_builder = getattr(self, "behavior_context_builder", None)
+            if bc_builder is not None:
+                behavior_context = bc_builder.build(
+                    query=message,
+                    identity=self._current_speaker_identity(node_id),
+                    active_route=self._current_active_route(node_id),
+                )
+                behavior_apply = bc_builder.apply
+        except Exception as exc:
+            log.warning("_compose_runtime_message behavior context build failed: %s", exc)
         return composer.compose(
             response_type="runtime_direct",
             user_message="",
@@ -2842,4 +3076,6 @@ class VaultRuntime:
             options={"num_predict": 90, "temperature": 0.62, "top_p": 0.9},
             validator=lambda text: scout.response_policy_violation(text, {"ok": True}, "runtime_direct"),
             sanitizer=_sanitize_generated_response,
+            behavior_context=behavior_context,
+            behavior_apply=behavior_apply,
         )

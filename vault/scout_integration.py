@@ -3042,6 +3042,7 @@ Do not mention provenance unless asked.
             for turn in self.turns[-8:]
             if str(turn.get("response") or "").strip()
         ]
+        behavior_context, behavior_apply = self._build_behavior_context(message, state)
         return self.response_composer.compose(
             response_type=response_type,
             user_message=message,
@@ -3053,7 +3054,45 @@ Do not mention provenance unless asked.
             validator=lambda text: self.response_policy_violation(text, state, response_type),
             sanitizer=_sanitize_generated_response,
             required_terms=required_terms,
+            behavior_context=behavior_context,
+            behavior_apply=behavior_apply,
         )
+
+    def _build_behavior_context(self, query: str, state):
+        """Shared helper: build a behavior context + apply callback for
+        a compose() call. Returns ``(None, None)`` when no builder is
+        attached or retrieval fails — falsy contexts inject nothing,
+        so callers without an active behavior store still work."""
+        bc_builder = getattr(self, "behavior_context_builder", None)
+        if bc_builder is None:
+            return None, None
+        try:
+            ctx = bc_builder.build(
+                query=query or "",
+                identity=self._behavior_identity_for_state(state),
+                active_route=state.get("active_route") if isinstance(state, dict) else None,
+            )
+            return ctx, bc_builder.apply
+        except Exception as exc:
+            print(f"[scout_integration] behavior_context build failed: {exc}", flush=True)
+            return None, None
+
+    def _behavior_identity_for_state(self, state) -> str | None:
+        """Identity (lowercased) for behavior-note retrieval. Pulled
+        from the chat state's identity_context if present; None means
+        global-only retrieval. Tolerant of missing fields — never
+        raises into the compose path."""
+        if not isinstance(state, dict):
+            return None
+        ident_ctx = state.get("identity_context")
+        if isinstance(ident_ctx, dict):
+            ident = ident_ctx.get("identity") or ident_ctx.get("primary_user")
+            if ident:
+                return str(ident).strip().lower() or None
+        ident = state.get("identity") or state.get("active_identity")
+        if ident:
+            return str(ident).strip().lower() or None
+        return None
 
     def _varied_fallback(self, fallback: str, recent: list[str]) -> str:
         return self.response_composer.varied_fallback(fallback, recent)
@@ -3398,6 +3437,7 @@ STRICT WORD RULES:
             for turn in self.turns[-8:]
             if str(turn.get("response") or "").strip()
         ]
+        behavior_context, behavior_apply = self._build_behavior_context(message, state)
         return self.response_composer.compose(
             response_type=response_type,
             user_message=message,
@@ -3409,6 +3449,8 @@ STRICT WORD RULES:
             validator=lambda text: self.response_policy_violation(text, state, response_type),
             sanitizer=_sanitize_generated_response,
             required_terms=required_terms,
+            behavior_context=behavior_context,
+            behavior_apply=behavior_apply,
         )
 
     def generate_response(
@@ -3505,6 +3547,10 @@ STRICT WORD RULES:
         *,
         options: dict | None = None,
     ):
+        # Use the legacy prompt as the behavior-retrieval query — there
+        # is no user_message at this call site, so the prompt is the
+        # best available signal for "what notes are topically relevant."
+        behavior_context, behavior_apply = self._build_behavior_context(prompt, state)
         return self.response_composer.compose(
             response_type=response_type,
             user_message="",
@@ -3520,6 +3566,8 @@ STRICT WORD RULES:
             options=self.chat_options(options),
             validator=lambda text: self.response_policy_violation(text, state, response_type),
             sanitizer=_sanitize_generated_response,
+            behavior_context=behavior_context,
+            behavior_apply=behavior_apply,
         )
 
     def cleanup_policy_failed_response(self, response_type: str, state: dict, violation: str):

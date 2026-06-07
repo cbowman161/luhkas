@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 from streaming import get_stream_sink
+
+
+if TYPE_CHECKING:  # pragma: no cover
+    from behavior_context import BehaviorContext, BehaviorContextBuilder
 
 
 FALLBACK_PREFIX = "Fallback response:"
@@ -32,9 +37,29 @@ class ResponseComposer:
         validator=None,
         sanitizer=None,
         required_terms: tuple[str, ...] = (),
+        behavior_context: "BehaviorContext | None" = None,
+        behavior_apply=None,
     ) -> str:
+        """``behavior_context``: optional user-preference notes to
+        prepend to the prompt as a system-style preamble. Built by
+        :class:`behavior_context.BehaviorContextBuilder` from the
+        behavior store; falsy/None contexts inject nothing.
+
+        ``behavior_apply``: optional callable taking
+        ``BehaviorContext``; if a non-fallback response is returned,
+        it gets called so the caller can bump ``apply_count`` on the
+        notes that actually contributed to a real response (fallbacks
+        don't count — the model didn't honor the preferences if it
+        produced an empty/rejected output)."""
         recent = [str(item).strip() for item in (recent_responses or []) if str(item).strip()]
         prompt = self._prompt(response_type, user_message, facts, recent)
+        if behavior_context and getattr(behavior_context, "text", ""):
+            # Preferences land BEFORE the contract: contract is
+            # non-negotiable; preferences are guidance the model can
+            # weight against the contract. Prepending also keeps the
+            # preferences earlier in the context window — important for
+            # short num_predict budgets.
+            prompt = f"{behavior_context.text}\n\n{prompt}"
         if contract:
             prompt = f"{prompt}\n\nNon-negotiable response contract:\n{contract}\n"
         try:
@@ -76,7 +101,11 @@ class ResponseComposer:
                         f"{len(parts)} tokens: {stream_exc}",
                         flush=True,
                     )
-                return "".join(parts).strip() or self.fallback(fallback, "empty model response")
+                streamed = "".join(parts).strip()
+                if streamed:
+                    _fire_behavior_apply(behavior_apply, behavior_context)
+                    return streamed
+                return self.fallback(fallback, "empty model response")
             # Sync path: full validation as before.
             text = self.model.generate(
                 prompt,
@@ -97,6 +126,7 @@ class ResponseComposer:
                 violation = validator(text)
                 if violation:
                     return self.clean_fallback(fallback, recent)
+            _fire_behavior_apply(behavior_apply, behavior_context)
             return text
         except Exception as exc:
             return self.fallback(fallback, str(exc))
@@ -175,3 +205,20 @@ Rules:
         if options:
             merged.update(options)
         return merged
+
+
+def _fire_behavior_apply(callback, context):
+    """Fire the apply callback iff both are present and the context
+    actually carried notes. Errors are swallowed — apply-count
+    bookkeeping must not crash a successful response."""
+    if callback is None or context is None:
+        return
+    if not getattr(context, "note_ids", None):
+        return
+    try:
+        callback(context)
+    except Exception:
+        # Telemetry isn't worth a user-visible failure. The retrieve
+        # path already logged the prior step; consolidation will
+        # tolerate stale apply_counts.
+        pass
