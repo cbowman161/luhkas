@@ -37,7 +37,12 @@ from node_health_monitor import NodeHealthMonitor
 from node_registry import NodeRegistry
 from planner import Planner
 from router import Router
-from scout_integration import ScoutVaultBridge, _sanitize_generated_response, _extract_introduction_name
+from scout_integration import (
+    ScoutVaultBridge,
+    _extract_introduction_name,
+    _is_conversation_context_setup,
+    _sanitize_generated_response,
+)
 from skill_registry import SkillRegistry
 from tts_formatter import format_for_tts
 
@@ -2364,9 +2369,20 @@ class VaultRuntime:
         )
         intent = intent_info.get("intent")
 
-        if intent in {"affirm", "unrelated"}:
-            # Affirm = user is happy with the cap; unrelated = moved on.
-            # Either way, close the review window and stop intercepting.
+        if intent == "affirm":
+            self._clear_pending()
+            return self._remember_active({
+                "mode": "direct",
+                "message": "Got it.",
+                "active_task_id": self.active_task_id,
+                "deterministic": True,
+                "deterministic_source": "learned_execution_review",
+                "compose": False,
+                "response_composed": True,
+            })
+
+        if intent == "unrelated":
+            # User moved on; close the review window and let normal routing handle the turn.
             self._clear_pending()
             return None
 
@@ -2758,6 +2774,8 @@ class VaultRuntime:
         }))
 
     def _handle_learned_capability_request(self, message: str, node_id: str) -> dict | None:
+        if _is_conversation_context_setup(message):
+            return None
         engine = self._learned_engine()
         learned = engine.lookup(message)
         alias_source = None

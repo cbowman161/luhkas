@@ -743,6 +743,18 @@ class MediumSemanticFakeEmbedder(SemanticFakeEmbedder):
         return super().embed(text)
 
 
+class ContextPhraseSemanticFakeEmbedder(SemanticFakeEmbedder):
+    def embed(self, text):
+        text = " ".join(text) if isinstance(text, list) else str(text or "")
+        lowered = text.lower()
+        vec = [0.0] * self.dim
+        if "test phrase" in lowered or "kernel" in lowered or lowered.strip() == "yes":
+            vec[0] = 1.0
+        else:
+            vec[1] = 1.0
+        return vec
+
+
 class SemanticCandidateTest(unittest.TestCase):
     def test_learned_capability_vector_candidate_executes_under_review(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -772,6 +784,64 @@ class SemanticCandidateTest(unittest.TestCase):
             self.assertEqual(learned["intent"], "vault_cpu_usage")
             self.assertEqual(learned["semantic_match"]["source"], "vector_db")
             self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+    def test_context_setup_phrase_bypasses_semantic_learned_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LearnedCapabilityStore(Path(tmp) / "capabilities.json")
+            engine = TestLearnedCapabilityEngine(store, code_monkey_client=FakeCodeMonkeyClient(), model=None)
+            engine.semantic_store = SemanticRouteStore(
+                embedder=ContextPhraseSemanticFakeEmbedder(),
+                path=Path(tmp) / "semantic.lance",
+            )
+            engine.VECTOR_MATCH_DISTANCE_MAX = 0.01
+            engine.VECTOR_CONFIRM_DISTANCE_MAX = 0.55
+            runtime = fake_runtime(engine)
+            store.remember("kernel version", {
+                "intent": "vault_kernel_version",
+                "description": "Vault kernel version",
+                "route": "learned_capability",
+                "target": "vault",
+                "confidence": 0.9,
+                "inferred": {"topic": "kernel", "aspect": "version"},
+                "execution": {"type": "bash", "command": "uname -r", "required_facts": ["kernel"]},
+                "code_monkey_task": {"ok": False, "skipped": True},
+            })
+
+            response = runtime._handle_learned_capability_request("The test phrase is heliotrope canyon.", "scout")
+
+            self.assertIsNone(response)
+            self.assertIsNone(runtime._get_pending("scout"))
+
+    def test_execution_review_yes_is_consumed_before_semantic_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LearnedCapabilityStore(Path(tmp) / "capabilities.json")
+            engine = TestLearnedCapabilityEngine(store, code_monkey_client=FakeCodeMonkeyClient(), model=None)
+            engine.semantic_store = SemanticRouteStore(
+                embedder=ContextPhraseSemanticFakeEmbedder(),
+                path=Path(tmp) / "semantic.lance",
+            )
+            engine.VECTOR_MATCH_DISTANCE_MAX = 0.01
+            engine.VECTOR_CONFIRM_DISTANCE_MAX = 0.55
+            runtime = fake_runtime(engine)
+            store.remember("kernel version", {
+                "intent": "vault_kernel_version",
+                "description": "Vault kernel version",
+                "route": "learned_capability",
+                "target": "vault",
+                "confidence": 0.9,
+                "inferred": {"topic": "kernel", "aspect": "version"},
+                "execution": {"type": "bash", "command": "uname -r", "required_facts": ["kernel"]},
+                "code_monkey_task": {"ok": False, "skipped": True},
+            })
+            runtime._handle_deterministic_presence_command("kernel version", "scout")
+            self.assertEqual(runtime._get_pending("scout")["type"], "learned_execution_review")
+
+            response = runtime._handle_deterministic_presence_command("yes", "scout")
+
+            self.assertEqual(response["message"], "Got it.")
+            self.assertEqual(response["deterministic_source"], "learned_execution_review")
+            self.assertNotIn("Did you mean", response["message"])
+            self.assertIsNone(runtime._get_pending("scout"))
 
     def test_medium_vector_candidate_asks_then_records_alias_on_yes(self):
         with tempfile.TemporaryDirectory() as tmp:
