@@ -23,6 +23,16 @@ fi
 
 echo "[audio_node] configuring RaspAudio MIC ULTRA 3 / WM8960 card ${CARD}"
 
+CAPTURE_VOLUME="${AUDIO_CAPTURE_VOLUME:-70%}"
+ADC_PCM_VOLUME="${AUDIO_ADC_PCM_VOLUME:-70%}"
+ALC_FUNCTION="${AUDIO_ALC_FUNCTION:-Stereo}"
+ALC_MODE="${AUDIO_ALC_MODE:-Limiter}"
+ALC_TARGET="${AUDIO_ALC_TARGET:-8}"
+ALC_MAX_GAIN="${AUDIO_ALC_MAX_GAIN:-3}"
+ALC_MIN_GAIN="${AUDIO_ALC_MIN_GAIN:-0}"
+NOISE_GATE="${AUDIO_NOISE_GATE:-off}"
+NOISE_GATE_THRESHOLD="${AUDIO_NOISE_GATE_THRESHOLD:-4}"
+
 # Onboard microphones are wired through LINPUT1/RINPUT1 on the MIC ULTRA 3.
 amixer -c "$CARD" sset "Left Boost Mixer LINPUT1" on >/dev/null
 amixer -c "$CARD" sset "Left Boost Mixer LINPUT2" off >/dev/null
@@ -44,9 +54,18 @@ amixer -c "$CARD" sset "Right Input Mixer Boost" on >/dev/null
 amixer -c "$CARD" cset numid=41 0 >/dev/null
 amixer -c "$CARD" sset "ADC High Pass Filter" on >/dev/null
 
-# Requested final capture gain.
-amixer -c "$CARD" sset Capture 100% >/dev/null
-amixer -c "$CARD" sset "ADC PCM" 100% >/dev/null
+# Speech recognition is much more sensitive to clipping than playback.
+# The old 100%/100% path put both capture stages at +30dB, which is
+# enough to flatten loud syllables and make Vosk choose the wrong words.
+amixer -c "$CARD" sset Capture "$CAPTURE_VOLUME" >/dev/null
+amixer -c "$CARD" sset "ADC PCM" "$ADC_PCM_VOLUME" >/dev/null
+amixer -c "$CARD" sset "ALC Function" "$ALC_FUNCTION" >/dev/null
+amixer -c "$CARD" sset "ALC Mode" "$ALC_MODE" >/dev/null
+amixer -c "$CARD" sset "ALC Target" "$ALC_TARGET" >/dev/null
+amixer -c "$CARD" sset "ALC Max Gain" "$ALC_MAX_GAIN" >/dev/null
+amixer -c "$CARD" sset "ALC Min Gain" "$ALC_MIN_GAIN" >/dev/null
+amixer -c "$CARD" sset "Noise Gate Threshold" "$NOISE_GATE_THRESHOLD" >/dev/null
+amixer -c "$CARD" sset "Noise Gate" "$NOISE_GATE" >/dev/null
 
 # Speaker path.
 amixer -c "$CARD" sset Playback 100% >/dev/null

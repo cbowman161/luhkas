@@ -32,20 +32,39 @@ Default port `5004`. Endpoints:
 | `AUDIO_PRESENCE_URL` | `http://127.0.0.1:5002/presence/message` | where transcripts are posted |
 | `AUDIO_SOURCE` | `audio_node` | tag attached to outbound transcripts |
 
+### RaspAudio MIC ULTRA 3 / WM8960 tuning
+
+When the WM8960 HAT is detected, `node/scripts/start_audio.sh` runs
+`audio_node/configure_raspiaudio_mic_ultra_3.sh` before starting capture.
+The capture defaults are intentionally below maximum gain because clipped
+speech makes offline STT much less accurate.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `AUDIO_CAPTURE_VOLUME` | `70%` | WM8960 `Capture` gain |
+| `AUDIO_ADC_PCM_VOLUME` | `70%` | WM8960 `ADC PCM` gain |
+| `AUDIO_ALC_FUNCTION` | `Stereo` | automatic level/limiter channel mode |
+| `AUDIO_ALC_MODE` | `Limiter` | `Limiter` keeps loud syllables from clipping |
+| `AUDIO_ALC_TARGET` | `8` | limiter target level |
+| `AUDIO_ALC_MAX_GAIN` | `3` | maximum automatic gain |
+| `AUDIO_ALC_MIN_GAIN` | `0` | minimum automatic gain |
+| `AUDIO_NOISE_GATE` | `off` | optional hardware noise gate |
+| `AUDIO_NOISE_GATE_THRESHOLD` | `4` | gate threshold used if enabled |
+
 ### Vosk STT
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `AUDIO_VOSK_MODEL` | `~/.vosk-model` | path to extracted Vosk model |
+| `AUDIO_VOSK_MODEL` | auto-detects `~/.local/share/luhkas/audio_node/vosk-model-en-us-0.22-lgraph`, else `~/.vosk-model` | path to extracted Vosk model |
 | `AUDIO_STT_RATE` | `16000` | capture sample rate |
 
 Install:
 
 ```bash
 pip install vosk
-# Small English model (~50 MB):
-curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o /tmp/m.zip
-unzip -q /tmp/m.zip -d ~ && mv ~/vosk-model-small-en-us-0.15 ~/.vosk-model
+# Better real-time English model (~128 MB):
+curl -L https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip -o /tmp/m.zip
+unzip -q /tmp/m.zip -d ~/.local/share/luhkas/audio_node
 ```
 
 ### espeak-ng TTS

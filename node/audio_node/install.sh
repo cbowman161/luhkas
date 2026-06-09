@@ -3,7 +3,7 @@
 #   * alsa-utils (arecord/aplay), espeak-ng fallback TTS)
 #   * an audio_node-owned Python venv with Vosk STT and Piper TTS
 #   * dtoverlay for the audio HAT (RaspAudio Mic Ultra 3 uses WM8960)
-#   * Vosk small-en STT model at ~/.vosk-model
+#   * Vosk English STT model
 #
 # Idempotent. Run as root; orchestrator/firstboot supplies NODE_USER.
 
@@ -19,9 +19,9 @@ USER_HOME="$(getent passwd "$NODE_USER" | cut -d: -f6)"
 BOOT_CONFIG="/boot/firmware/config.txt"
 AUDIO_OVERLAY="${AUDIO_OVERLAY:-wm8960-soundcard}"
 AUDIO_VENV="${AUDIO_VENV:-${USER_HOME}/.local/share/luhkas/audio_node/venv}"
-VOSK_MODEL_URL="${VOSK_MODEL_URL:-https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip}"
-VOSK_MODEL_NAME="${VOSK_MODEL_NAME:-vosk-model-small-en-us-0.15}"
-VOSK_MODEL_DEST="${USER_HOME}/.vosk-model"
+VOSK_MODEL_URL="${VOSK_MODEL_URL:-https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip}"
+VOSK_MODEL_NAME="${VOSK_MODEL_NAME:-vosk-model-en-us-0.22-lgraph}"
+VOSK_MODEL_DEST="${VOSK_MODEL_DEST:-${USER_HOME}/.local/share/luhkas/audio_node/${VOSK_MODEL_NAME}}"
 PIPER_VOICE_URL="${PIPER_VOICE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium/en_US-joe-medium.onnx}"
 PIPER_VOICE_CONFIG_URL="${PIPER_VOICE_CONFIG_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium/en_US-joe-medium.onnx.json}"
 PIPER_VOICE_DEST="${PIPER_VOICE_DEST:-${USER_HOME}/.local/share/luhkas/audio_node/piper/en_US-joe-medium.onnx}"
@@ -64,7 +64,7 @@ if [ -f "$BOOT_CONFIG" ]; then
   fi
 fi
 
-# Vosk small-en model. Create the tmp dir AS the node user so the subsequent
+# Vosk English model. Create the tmp dir AS the node user so the subsequent
 # curl/unzip (also as that user) can write to it. mktemp -d run by root
 # produces a 700 dir owned by root.
 if [ ! -d "$VOSK_MODEL_DEST" ]; then
