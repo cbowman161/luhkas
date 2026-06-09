@@ -291,6 +291,18 @@ def _maybe_dispatch_buffer(
     return chunk, remaining
 
 
+def _append_stream_display_text(existing: str, chunk: str) -> str:
+    existing = (existing or "").strip()
+    chunk = (chunk or "").strip()
+    if not existing:
+        return chunk
+    if not chunk:
+        return existing
+    if chunk[0] in ".,!?;:)]}":
+        return existing + chunk
+    return existing + " " + chunk
+
+
 def _stream_presence_to_tts(
     stream_url: str,
     payload: dict,
@@ -330,6 +342,7 @@ def _stream_presence_to_tts(
     speech_buffer = ""
     final_text = ""
     spoken_anything = False
+    displayed_text = ""
     saw_terminal = False
     try:
         for raw_line in upstream:
@@ -348,7 +361,12 @@ def _stream_presence_to_tts(
                 chunk, speech_buffer = _maybe_dispatch_buffer(speech_buffer)
                 if chunk:
                     _start_tts(tts, chunk)
-                    if not spoken_anything:
+                    if _is_output_muted():
+                        displayed_text = _append_stream_display_text(displayed_text, chunk)
+                        if displayed_text:
+                            update_state({"latest_assistant": {"text": displayed_text, "source": "presence", "timestamp": time.time()}})
+                            _notify_ui_event(event_url, {"type": "assistant_message", "text": displayed_text, "source": "presence"})
+                    elif not spoken_anything:
                         _notify_ui_event(
                             event_url,
                             {"type": "assistant_message", "text": chunk},
@@ -371,14 +389,19 @@ def _stream_presence_to_tts(
                 to_speak = tail if tail else (final_text if not spoken_anything else "")
                 if to_speak:
                     _start_tts(tts, to_speak)
-                    if not spoken_anything:
+                    if _is_output_muted():
+                        displayed_text = _append_stream_display_text(displayed_text, to_speak)
+                        if displayed_text:
+                            update_state({"latest_assistant": {"text": displayed_text, "source": "presence", "timestamp": time.time()}})
+                            _notify_ui_event(event_url, {"type": "assistant_message", "text": displayed_text, "source": "presence"})
+                    elif not spoken_anything:
                         _notify_ui_event(
                             event_url,
                             {"type": "assistant_message", "text": to_speak},
                         )
                     spoken_anything = True
                     speech_buffer = ""
-                if final_text and _is_output_muted():
+                if final_text and _is_output_muted() and final_text != displayed_text:
                     update_state({"latest_assistant": {"text": final_text, "source": "presence", "timestamp": time.time()}})
                     _notify_ui_event(event_url, {"type": "assistant_message", "text": final_text, "source": "presence"})
                 break
