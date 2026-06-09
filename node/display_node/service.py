@@ -76,15 +76,24 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
   .hud{position:fixed;z-index:4;pointer-events:none;color:currentColor;text-shadow:0 0 14px currentColor;transition:color 0.8s ease}
   #brand{top:5vh;left:50%;transform:translateX(-50%);font-size:clamp(13px,1.4vw,20px);letter-spacing:0.55em;font-weight:600;opacity:0.62}
   #state{top:9.5vh;left:50%;transform:translateX(-50%);font-size:clamp(10px,1.05vw,15px);letter-spacing:0.4em;opacity:0.55}
-  #cap-user{position:fixed;bottom:15vh;left:5vw;right:5vw;text-align:center;font-size:clamp(13px,1.4vw,20px);opacity:0.45;letter-spacing:0.08em;min-height:1.4em}
-  #cap-assistant{position:fixed;bottom:6vh;left:5vw;right:5vw;text-align:center;font-size:clamp(22px,3vw,48px);font-weight:600;line-height:1.1;min-height:1.4em;letter-spacing:0.03em;text-shadow:0 0 22px currentColor;color:currentColor;transition:bottom 0.3s ease,font-size 0.3s ease,padding 0.3s ease,background 0.3s ease}
-  /* Mute mode: the bottom of the screen becomes a high-contrast caption
-     panel so the user can read what would have been spoken. The face
-     animation stays, but we anchor + expand the assistant caption,
-     show a MUTED badge, and pulse a thin border so it's obvious the
-     output channel changed. */
-  body.muted #cap-assistant{bottom:0;left:0;right:0;padding:3vh 6vw 4vh;background:rgba(0,0,0,0.78);border-top:2px solid currentColor;font-size:clamp(28px,3.5vw,56px);opacity:1;min-height:18vh;display:flex;align-items:center;justify-content:center;text-shadow:0 0 30px currentColor,0 2px 4px #000}
-  body.muted #cap-user{bottom:21vh;opacity:0.65}
+  #conversation-modal{position:fixed;z-index:7;left:50%;top:50%;width:min(78vw,980px);max-height:min(64vh,620px);transform:translate(-50%,-44%) scale(0.98);padding:clamp(18px,2.4vw,30px);border:1px solid rgba(0,212,255,0.58);border-radius:8px;background:rgba(0,10,16,0.58);box-shadow:0 0 32px rgba(0,212,255,0.26),inset 0 0 28px rgba(0,212,255,0.08);backdrop-filter:blur(10px) saturate(1.25);opacity:0;pointer-events:none;transition:opacity 0.22s ease,transform 0.22s ease;color:currentColor;text-shadow:0 0 18px currentColor}
+  body.muted #conversation-modal{opacity:1;transform:translate(-50%,-50%) scale(1)}
+  .conversation-row{display:grid;grid-template-columns:minmax(72px,0.18fr) 1fr;gap:clamp(12px,1.5vw,20px);align-items:start}
+  .conversation-row+.conversation-row{margin-top:clamp(16px,2.2vw,26px);padding-top:clamp(14px,1.8vw,22px);border-top:1px solid rgba(0,212,255,0.22)}
+  .conversation-label{font-size:clamp(11px,1vw,14px);font-weight:700;letter-spacing:0.22em;text-transform:uppercase;opacity:0.62;line-height:1.6;white-space:nowrap}
+  .conversation-text{min-height:1.35em;font-size:clamp(18px,2.1vw,34px);font-weight:600;line-height:1.22;letter-spacing:0;overflow-wrap:anywhere;color:rgba(232,252,255,0.96);text-shadow:0 0 18px currentColor,0 2px 5px #000}
+  #cap-user{font-size:clamp(14px,1.5vw,22px);font-weight:500;color:rgba(198,246,255,0.82)}
+  #cap-assistant{max-height:38vh;overflow:hidden}
+  #conversation-modal:not(.has-user) #user-row{display:none}
+  #conversation-modal:not(.has-assistant) #assistant-row{display:none}
+  body:not(.muted) #conversation-modal{display:block}
+  @media (max-width:700px){
+    #conversation-modal{left:5vw;right:5vw;top:52%;width:auto;transform:translateY(-44%) scale(0.98);max-height:68vh;padding:18px}
+    body.muted #conversation-modal{transform:translateY(-50%) scale(1)}
+    .conversation-row{grid-template-columns:1fr;gap:6px}
+    .conversation-label{font-size:11px}
+    .conversation-text{font-size:clamp(18px,5vw,27px)}
+  }
   #mute-badge{position:fixed;top:5vh;right:5vw;font-size:clamp(11px,1.1vw,16px);letter-spacing:0.4em;font-weight:600;padding:0.4em 0.9em;border:1px solid currentColor;border-radius:0.3em;opacity:0;transition:opacity 0.3s ease;pointer-events:none;z-index:6}
   body.muted #mute-badge{opacity:0.85}
   @keyframes mute-pulse{0%,100%{box-shadow:0 0 0 0 currentColor}50%{box-shadow:0 0 14px 2px currentColor}}
@@ -101,8 +110,16 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
 <div class="hud" id="brand">L  U  H  K  A  S</div>
 <div class="hud" id="state">connecting</div>
 <div class="hud" id="mute-badge">M U T E D</div>
-<div id="cap-user"></div>
-<div id="cap-assistant"></div>
+<section id="conversation-modal" aria-live="polite" aria-label="Muted conversation">
+  <div class="conversation-row" id="user-row">
+    <div class="conversation-label">Heard</div>
+    <div class="conversation-text" id="cap-user"></div>
+  </div>
+  <div class="conversation-row" id="assistant-row">
+    <div class="conversation-label">LUHKAS</div>
+    <div class="conversation-text" id="cap-assistant"></div>
+  </div>
+</section>
 <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
 <script>
 (() => {
@@ -393,9 +410,14 @@ _PRESENCE_FACE_HTML = r"""<!doctype html>
       }
       setColor(COLORS[s] || COLORS.OFFLINE);
       document.getElementById('state').textContent = s;
-      document.getElementById('cap-user').textContent = d.latest_user || '';
-      document.getElementById('cap-assistant').textContent = d.latest_assistant || '';
-      // Toggle the bottom caption panel when audio output is muted.
+      const userText = d.latest_user || '';
+      const assistantText = d.latest_assistant || '';
+      const conversationModal = document.getElementById('conversation-modal');
+      document.getElementById('cap-user').textContent = userText;
+      document.getElementById('cap-assistant').textContent = assistantText;
+      conversationModal.classList.toggle('has-user', !!userText);
+      conversationModal.classList.toggle('has-assistant', !!assistantText);
+      // Toggle the translucent conversation modal when audio output is muted.
       document.body.classList.toggle('muted', !!d.output_muted);
       if (d.eye_target && typeof d.eye_target.x_norm === 'number' && typeof d.eye_target.y_norm === 'number') {
         eyeTarget = d.eye_target;
