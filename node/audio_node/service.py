@@ -96,7 +96,12 @@ def _is_noise_transcript(text: str) -> tuple[bool, str]:
 
 def _contains_audio_wakeword(text: str) -> bool:
     words = set(_words(text))
-    return bool(words & _WAKEWORD_VARIANTS) or _is_audio_wakeword_only(text)
+    phrase = _normalized_phrase(text)
+    return (
+        bool(words & _WAKEWORD_VARIANTS)
+        or _is_audio_wakeword_only(text)
+        or any(variant in phrase for variant in _WAKE_PHRASE_VARIANTS if " " in variant)
+    )
 _tts_lock = threading.Lock()
 _tts_speaking = threading.Event()
 # Generation counter for queue-drain. Bumping it invalidates any _speak
@@ -127,7 +132,7 @@ _WAKE_PHRASE_VARIANTS = {
     phrase.strip().casefold()
     for phrase in os.environ.get(
         "AUDIO_WAKE_PHRASE_VARIANTS",
-        "luhkas,luhkus,lucas,lukas,loukas,hey luhkas,hey lucas,okay luhkas,they say",
+        "luhkas,luhkus,lucas,lukas,loukas,look as,the look as,hey luhkas,hey lucas,hey look as,okay luhkas,okay look as,they say",
     ).split(",")
     if phrase.strip()
 }
