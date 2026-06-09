@@ -114,6 +114,7 @@ _tts_generation = 0
 _output_muted_lock = threading.Lock()
 _output_muted = False
 _hardware_mute_lock = threading.Lock()
+_hardware_volume_restore: dict[tuple[str, str], str] = {}
 _tts_text_lock = threading.Lock()
 _tts_current_text = ""
 _tts_last_started_at = 0.0
@@ -769,6 +770,11 @@ def _hardware_mute_controls() -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _hardware_volume_controls() -> list[str]:
+    raw = os.environ.get("AUDIO_OUTPUT_MUTE_VOLUME_CONTROLS", "Speaker")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _run_hardware_mute_command(command: str, muted: bool) -> bool:
     if not command:
         return False
@@ -790,6 +796,47 @@ def _run_hardware_mute_command(command: str, muted: bool) -> bool:
         return False
 
 
+def _read_control_playback_volume(amixer: str, card: str, control: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [amixer, "-c", card, "sget", control],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except Exception:
+        return None
+    stdout = getattr(result, "stdout", "") or ""
+    matches = re.findall(r"\bPlayback\s+(\d+)\b", stdout)
+    return matches[-1] if matches else None
+
+
+def _apply_hardware_volume_mute(amixer: str, card: str, muted: bool) -> None:
+    fallback_unmute = os.environ.get("AUDIO_OUTPUT_UNMUTE_VOLUME", "100%")
+    for control in _hardware_volume_controls():
+        key = (card, control)
+        if muted:
+            if key not in _hardware_volume_restore:
+                current = _read_control_playback_volume(amixer, card, control)
+                if current:
+                    _hardware_volume_restore[key] = current
+            value = "0%"
+        else:
+            value = _hardware_volume_restore.pop(key, None) or fallback_unmute
+        try:
+            subprocess.run(
+                [amixer, "-q", "-c", card, "sset", control, value],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+                check=False,
+            )
+        except Exception as exc:
+            log.debug("amixer volume mute failed for %s on card %s: %s", control, card, exc)
+
+
 def _apply_hardware_output_mute(muted: bool) -> None:
     """Best-effort ALSA mute for the physical output path.
 
@@ -806,6 +853,8 @@ def _apply_hardware_output_mute(muted: bool) -> None:
         amixer = os.environ.get("AUDIO_AMIXER_BIN", "amixer")
         card = _output_device_card()
         state = "mute" if muted else "unmute"
+        if muted:
+            _apply_hardware_volume_mute(amixer, card, muted)
         for control in _hardware_mute_controls():
             try:
                 subprocess.run(
@@ -817,6 +866,8 @@ def _apply_hardware_output_mute(muted: bool) -> None:
                 )
             except Exception as exc:
                 log.debug("amixer mute failed for %s on card %s: %s", control, card, exc)
+        if not muted:
+            _apply_hardware_volume_mute(amixer, card, muted)
 
 
 def _speak(tts, text: str, my_gen: int | None = None) -> None:
