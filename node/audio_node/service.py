@@ -20,12 +20,14 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import subprocess
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -111,6 +113,7 @@ _tts_generation = 0
 # display can render captions in place of audio.
 _output_muted_lock = threading.Lock()
 _output_muted = False
+_hardware_mute_lock = threading.Lock()
 _tts_text_lock = threading.Lock()
 _tts_current_text = ""
 _tts_last_started_at = 0.0
@@ -747,6 +750,75 @@ def _cancel_queued_tts(tts) -> None:
         pass
 
 
+def _output_device_card() -> str:
+    configured = os.environ.get("AUDIO_WM8960_CARD", "").strip()
+    if configured:
+        return configured
+    device = os.environ.get("AUDIO_OUTPUT_DEVICE", "")
+    match = re.search(r"\bCARD=([^,]+)", device)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?:^|:)CARD=([^,]+)", device)
+    if match:
+        return match.group(1)
+    return os.environ.get("AUDIO_ALSA_CARD", "default")
+
+
+def _hardware_mute_controls() -> list[str]:
+    raw = os.environ.get("AUDIO_OUTPUT_MUTE_CONTROLS", "Speaker,Playback,PCM,Master")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _run_hardware_mute_command(command: str, muted: bool) -> bool:
+    if not command:
+        return False
+    try:
+        subprocess.run(
+            shlex.split(command.format(
+                muted="1" if muted else "0",
+                state="mute" if muted else "unmute",
+                card=_output_device_card(),
+            )),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            check=False,
+        )
+        return True
+    except Exception as exc:
+        log.debug("hardware mute command failed: %s", exc)
+        return False
+
+
+def _apply_hardware_output_mute(muted: bool) -> None:
+    """Best-effort ALSA mute for the physical output path.
+
+    App-level mute prevents LUHKAS from queueing more TTS and interrupts
+    current playback. On the kiosk HAT we also ask ALSA to mute the speaker
+    controls so a physical mute button truly silences the output device.
+    """
+    if os.environ.get("AUDIO_HARDWARE_MUTE_ENABLE", "1").lower() in ("0", "false", "no", ""):
+        return
+    with _hardware_mute_lock:
+        command = os.environ.get("AUDIO_OUTPUT_MUTE_COMMAND", "").strip()
+        if command and _run_hardware_mute_command(command, muted):
+            return
+        amixer = os.environ.get("AUDIO_AMIXER_BIN", "amixer")
+        card = _output_device_card()
+        state = "mute" if muted else "unmute"
+        for control in _hardware_mute_controls():
+            try:
+                subprocess.run(
+                    [amixer, "-q", "-c", card, "sset", control, state],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.0,
+                    check=False,
+                )
+            except Exception as exc:
+                log.debug("amixer mute failed for %s on card %s: %s", control, card, exc)
+
+
 def _speak(tts, text: str, my_gen: int | None = None) -> None:
     # If this _speak was queued behind speech that has since been cancelled
     # (gen bump), bail before holding the lock — keeps the queue drained.
@@ -777,6 +849,8 @@ def _speak(tts, text: str, my_gen: int | None = None) -> None:
                 # streaming "redo" fires after several chunks). Check each
                 # iteration so we abandon the remaining chunks.
                 if my_gen is not None and my_gen != _current_tts_generation():
+                    break
+                if _is_output_muted():
                     break
                 chunk = chunk.strip()
                 if not chunk:
@@ -817,6 +891,7 @@ def _set_output_muted(muted: bool, tts) -> bool:
         _output_muted = muted
     if muted and tts is not None:
         _cancel_queued_tts(tts)
+    _apply_hardware_output_mute(muted)
     update_state({"audio": {"output_muted": muted, "output_muted_at": time.time()}})
     return muted
 
